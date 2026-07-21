@@ -4,15 +4,26 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN = ROOT / "app" / "main.py"
+CANDIDATES = (
+    ROOT / "app" / "main.py",
+    ROOT / "app" / "course_studio_entry.py",
+)
 IMPORT_LINE = "from app.course_builder import router as course_builder_router"
 INCLUDE_LINE = "app.include_router(course_builder_router)"
 
 
-def insert_after_fastapi_creation(text: str) -> str:
+def _add_import(text: str) -> str:
+    if IMPORT_LINE in text:
+        return text
+    future = re.match(r"from __future__ import [^\n]+\n", text)
+    position = future.end() if future else 0
+    return text[:position] + "\n" + IMPORT_LINE + "\n" + text[position:]
+
+
+def _insert_after_fastapi_creation(text: str) -> str | None:
     match = re.search(r"(?m)^\s*app\s*=\s*FastAPI\s*\(", text)
     if not match:
-        raise RuntimeError("No se encontró la creación de FastAPI en app/main.py")
+        return None
     opening = text.find("(", match.start())
     depth = 0
     in_string: str | None = None
@@ -38,17 +49,28 @@ def insert_after_fastapi_creation(text: str) -> str:
     raise RuntimeError("No se pudo determinar el final de FastAPI(...)")
 
 
-def main() -> None:
-    text = MAIN.read_text(encoding="utf-8")
-    if IMPORT_LINE not in text:
-        future = re.match(r"from __future__ import [^\n]+\n", text)
-        position = future.end() if future else 0
-        text = text[:position] + "\n" + IMPORT_LINE + "\n" + text[position:]
+def _patch(path: Path) -> bool:
+    if not path.exists():
+        return False
+    text = _add_import(path.read_text(encoding="utf-8"))
     if INCLUDE_LINE not in text:
-        text = insert_after_fastapi_creation(text)
-    MAIN.write_text(text, encoding="utf-8")
-    compile(text, str(MAIN), "exec")
-    print("Constructor CRUD de cursos instalado correctamente.")
+        inserted = _insert_after_fastapi_creation(text)
+        if inserted is not None:
+            text = inserted
+        elif re.search(r"(?m)^\s*app\s*=", text):
+            text = text.rstrip() + "\n\n" + INCLUDE_LINE + "\n"
+        else:
+            raise RuntimeError(f"No se encontró la aplicación FastAPI en {path}")
+    path.write_text(text, encoding="utf-8")
+    compile(text, str(path), "exec")
+    return True
+
+
+def main() -> None:
+    patched = [str(path.relative_to(ROOT)) for path in CANDIDATES if _patch(path)]
+    if not patched:
+        raise RuntimeError("No se encontró ninguna entrada de NEXUS EDU XR para instalar Course Builder.")
+    print("Constructor CRUD instalado en: " + ", ".join(patched))
 
 
 if __name__ == "__main__":
