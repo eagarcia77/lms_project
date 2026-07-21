@@ -7,80 +7,92 @@
 
 Plataforma de educación en línea inspirada en Blackboard Ultra, integrada con Google Workspace y preparada para realidad virtual, realidad aumentada y contenido 3D.
 
-## Acceso obligatorio
+## Acceso y seguridad
 
-Los cursos, el panel académico, Google Hub y los laboratorios XR requieren una sesión válida. El usuario puede:
+- Inicio de sesión con Google OAuth 2.0.
+- Registro e inicio de sesión con una cuenta NEXUS local.
+- Cierre de sesión visible y cierre de todas las sesiones.
+- Recuperación y restablecimiento de contraseña mediante enlace seguro.
+- Contraseñas locales protegidas mediante `scrypt` con sal aleatoria.
+- Protección de rutas académicas, controles de sesión y registro de eventos de seguridad.
 
-- entrar con su cuenta de Google;
-- crear una cuenta NEXUS con nombre, correo y contraseña;
-- iniciar sesión posteriormente con su cuenta local;
-- conectar o desconectar Google Workspace desde la plataforma;
-- cerrar completamente su sesión.
+## Course Studio
 
-Las contraseñas locales se almacenan mediante `scrypt` con sal aleatoria y no se guardan como texto legible. Las rutas académicas de la API responden con `401` cuando no existe una sesión autorizada.
+El área **Diseñador de cursos** permite:
 
-## Funciones
+- crear cursos propios;
+- crear y ordenar módulos;
+- crear Google Docs y Google Slides desde un módulo;
+- guardar en la base de datos el identificador y enlace del archivo dentro del módulo donde se creó;
+- crear asignaciones con instrucciones, puntuación y fecha límite;
+- crear foros de discusión y publicar respuestas;
+- crear exámenes de Google Forms con preguntas de selección múltiple y respuesta corta;
+- crear eventos de Google Calendar con videoconferencia de Google Meet;
+- mantener todos los recursos organizados dentro del curso.
 
-- Cursos, módulos, actividades, anuncios, progreso y analítica.
-- Registro local e inicio de sesión con Google OAuth 2.0.
-- Google Classroom, Drive, Calendar y Meet.
-- Laboratorio AR con `<model-viewer>`.
-- Laboratorio VR con A-Frame y WebXR.
+Los archivos de Docs, Slides y Forms permanecen en el Google Drive del usuario conectado. El editor de Google se abre en una pestaña segura y NEXUS conserva el enlace en el módulo.
+
+## Otras funciones
+
+- Panel académico, anuncios, progreso y analítica.
+- Google Classroom, Drive y Calendar.
+- Laboratorios AR con `<model-viewer>`.
+- Laboratorios VR con A-Frame y WebXR.
 - PWA, diseño adaptable y navegación accesible.
 - FastAPI, SQLite para desarrollo y PostgreSQL en Render.
-- Docker y pruebas automáticas en GitHub Actions.
+- Docker y pruebas automáticas con GitHub Actions.
 
-## Ejecutar localmente
+## Google Cloud requerido
 
-```powershell
-Copy-Item .env.example .env
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python tools/apply_source_overlay.py
-uvicorn app.main:app --reload
-```
+Activa estas APIs:
 
-Abre `http://localhost:8000`. Sin una sesión, la página principal redirige a `/login`.
+1. Google Classroom API.
+2. Google Drive API.
+3. Google Docs API.
+4. Google Slides API.
+5. Google Forms API.
+6. Google Calendar API.
 
-## Desplegar en Render
-
-`render.yaml` administra:
-
-1. el servicio Docker `nexus-edu-xr-eagarcia77`;
-2. PostgreSQL `nexus-edu-xr-db`;
-3. `DATABASE_URL`, `SESSION_SECRET` y cookies HTTPS;
-4. las variables de Google OAuth;
-5. el endpoint de salud `/healthz`.
-
-En un Blueprint existente, abre **Blueprints → nexus-edu-xr → Syncs** y ejecuta **Manual sync** para aplicar la nueva base de datos.
-
-## Activar Google
-
-En Google Cloud activa Classroom API, Drive API y Calendar API. Crea un cliente OAuth de tipo **Web application** y registra:
+URI OAuth autorizada para Render:
 
 ```text
 https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
 ```
 
-En Render añade:
+Variables en Render:
 
 ```text
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 ```
 
-`GOOGLE_WORKSPACE_DOMAIN` es opcional para una institución que desee limitar las cuentas a su propio dominio.
+Los usuarios que ya habían conectado Google deben cerrar sesión y autorizar nuevamente la aplicación para aceptar los permisos de Docs, Slides y Forms. Consulta `docs/GOOGLE_SETUP.md`.
 
-## Validación
+## Construcción y despliegue
 
-```powershell
-python tools/apply_source_overlay.py
-pip install -r requirements.txt pytest
-$env:PYTHONPATH="."
-pytest -q
-node --check app/static/app.js
-node --check app/static/auth.js
+El Dockerfile aplica, en orden:
+
+```text
+tools/apply_v3.py
+tools/apply_course_studio_package.py
+tools/apply_course_studio.py
 ```
 
-Esta entrega es un MVP. Antes de usar información académica real deben añadirse verificación de correo, recuperación de contraseña, administración de roles, cifrado persistente de tokens, auditoría, copias de seguridad, migraciones y revisión institucional de privacidad y accesibilidad.
+Render despliega automáticamente los cambios de `main`. El endpoint de salud es `/healthz`.
+
+## Desarrollo local
+
+```powershell
+Copy-Item .env.example .env
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python tools/apply_v3.py
+python tools/apply_course_studio_package.py
+python tools/apply_course_studio.py
+pip install -r requirements.txt
+uvicorn app.course_studio_entry:app --reload
+```
+
+## Estado del proyecto
+
+NEXUS EDU XR continúa siendo un MVP. Antes de manejar información académica institucional deben completarse administración avanzada de roles, migraciones formales, copias de seguridad, cifrado persistente de tokens, centro de calificaciones, auditoría institucional, revisión de privacidad, verificación OAuth y pruebas de accesibilidad.
