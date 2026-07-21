@@ -13,8 +13,10 @@ jobs:
       - run: python tools/apply_v3.py
       - run: python tools/apply_course_studio_package.py
       - run: python tools/apply_course_studio.py
+      - run: python tools/install_course_builder.py
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall -q app
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
-      - run: PYTHONPATH=. python -c "from app.course_studio_entry import app; assert any(getattr(r, 'path', '') == '/course-studio' for r in app.routes)"
+      - run: PYTHONPATH=. python -c "from app.main import app; paths=[getattr(r,'path','') for r in app.routes]; assert '/course-studio' in paths; assert '/course-studio/courses' in paths"
+      - run: PYTHONPATH=. python -c "from app.course_studio_entry import app; paths=[getattr(r,'path','') for r in app.routes]; assert '/course-studio' in paths; assert '/course-studio/courses' in paths"
