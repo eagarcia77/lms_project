@@ -3,7 +3,7 @@
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/eagarcia77/lms_project)
 
 **Repositorio:** https://github.com/eagarcia77/lms_project  
-**Aplicación prevista en Render:** https://nexus-edu-xr-eagarcia77.onrender.com
+**URL objetivo en Render:** https://nexus-edu-xr-eagarcia77.onrender.com
 
 MVP de una plataforma de educación en línea inspirada en la claridad de Blackboard Ultra, integrada con Google Workspace y preparada para realidad virtual, realidad aumentada y contenido 3D.
 
@@ -69,14 +69,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 El repositorio incluye `render.yaml`, Docker y el endpoint de salud `/healthz`.
 
 1. Pulsa **Deploy to Render** al inicio de este README.
-2. Conecta tu cuenta de GitHub con Render.
+2. Inicia sesión en Render y autoriza el acceso al repositorio.
 3. Confirma el Blueprint `nexus-edu-xr-eagarcia77`.
-4. Para iniciar en modo demostración, deja vacías las variables opcionales de Google.
-5. Para activar Google Workspace, añade `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` y, si aplica, `GOOGLE_WORKSPACE_DOMAIN`.
-6. En Google Cloud registra esta URI autorizada:
+4. El primer despliegue funciona en modo demostración sin credenciales de Google.
+5. Para activar Google Workspace, añade en Render `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` y, si aplica, `GOOGLE_WORKSPACE_DOMAIN`.
+6. Configura `GOOGLE_REDIRECT_URI` con este valor y regístralo también en Google Cloud:
 
 ```text
 https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
 ```
 
-Render desplegará automáticamente los cambios de `main` cuando las pruebas de GitHub Actions finalicen correctamente.
+Render desplegará automáticamente cada cambio publicado en la rama `main`.
