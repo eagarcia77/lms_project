@@ -7,7 +7,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PARTS = ROOT / ".course-studio-v4"
+PARTS = ROOT / ".course-studio-v4b"
 EXPECTED_SHA256 = "fde996ee97927d5a558ac571ffd19742a7a8b73fc6248610e647d4cfcd815d08"
 
 
