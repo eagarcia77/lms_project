@@ -10,8 +10,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python tools/apply_source_overlay.py
-      - run: python tools/fix_frontend_bindings.py
+      - run: python tools/apply_v3.py
       - run: pip install -r requirements.txt pytest
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
