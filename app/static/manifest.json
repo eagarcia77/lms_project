@@ -1,0 +1,12 @@
+{
+  "name": "NEXUS EDU XR",
+  "short_name": "NEXUS XR",
+  "description": "Plataforma educativa inmersiva integrada con Google Workspace.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F3F7F5",
+  "theme_color": "#007B5F",
+  "icons": [
+    {"src": "/static/assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+  ]
+}

@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: nexus-edu-xr-eagarcia77
+    runtime: docker
+    plan: free
+    region: virginia
+    branch: main
+    autoDeployTrigger: checksPass
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_NAME
+        value: NEXUS EDU XR
+      - key: APP_ENV
+        value: production
+      - key: APP_BASE_URL
+        value: https://nexus-edu-xr-eagarcia77.onrender.com
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
+      - key: GOOGLE_WORKSPACE_DOMAIN
+        sync: false
