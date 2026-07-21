@@ -18,3 +18,20 @@ services:
         generateValue: true
       - key: COOKIE_SECURE
         value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nexus-edu-xr-db
+          property: connectionString
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
+      - key: GOOGLE_WORKSPACE_DOMAIN
+        sync: false
+
+databases:
+  - name: nexus-edu-xr-db
+    plan: free
+    region: virginia
