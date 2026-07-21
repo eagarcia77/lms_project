@@ -25,7 +25,7 @@ def patch_javascript(path: Path) -> set[str]:
     text = path.read_text(encoding="utf-8")
     original = text
 
-    # A missing optional control must not prevent the whole LMS from loading.
+    # Missing optional controls must never stop the whole LMS from loading.
     text = re.sub(
         r'(\$\(\s*["\']#[A-Za-z0-9_-]+["\']\s*\))\.addEventListener',
         r'\1?.addEventListener',
@@ -33,6 +33,11 @@ def patch_javascript(path: Path) -> set[str]:
     )
     text = re.sub(
         r'(document\.querySelector\(\s*["\'][^"\']+["\']\s*\))\.addEventListener',
+        r'\1?.addEventListener',
+        text,
+    )
+    text = re.sub(
+        r'(document\.getElementById\(\s*["\'][^"\']+["\']\s*\))\.addEventListener',
         r'\1?.addEventListener',
         text,
     )
@@ -44,9 +49,15 @@ def patch_javascript(path: Path) -> set[str]:
 
 
 def patch_html(required_ids: set[str]) -> None:
+    """Add fallbacks only when standalone HTML files exist.
+
+    The authenticated application renders its pages through server templates,
+    so not finding HTML inside app/static is valid and must not fail Docker.
+    """
     html_files = list(STATIC.glob("*.html"))
     if not html_files:
-        raise RuntimeError("No se encontró la interfaz HTML después de aplicar el código fuente.")
+        print("No hay HTML estático; la interfaz autenticada usa plantillas del servidor.")
+        return
 
     for path in html_files:
         text = path.read_text(encoding="utf-8")
