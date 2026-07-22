@@ -16,6 +16,7 @@ jobs:
       - run: test -f tools/apply_course_studio.py
       - run: python tools/apply_course_studio.py
       - run: python tools/install_course_builder.py
+      - run: python tools/fix_course_builder_response_types.py
       - run: python -m compileall -q app
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
