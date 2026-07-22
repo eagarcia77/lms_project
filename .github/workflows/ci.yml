@@ -20,4 +20,4 @@ jobs:
       - run: python -m compileall -q app
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
-      - run: PYTHONPATH=. python -c "from app.main import app; routes={(getattr(r,'path',''),','.join(sorted(getattr(r,'methods',[]) or []))) for r in app.routes}; assert any(path == '/course-studio' for path,_ in routes); assert any(path == '/course-studio/courses' and 'POST' in methods for path,methods in routes)"
+      - run: PYTHONPATH=. python -c "from app.main import app; routes={(getattr(r,'path',''),','.join(sorted(getattr(r,'methods',[]) or []))) for r in app.routes}; assert any(path == '/course-studio' for path,_ in routes); assert any(path == '/course-studio/courses' and 'POST' in methods for path,methods in routes); assert all(getattr(r,'response_model',None) is None for r in app.routes if str(getattr(r,'path','')).startswith('/course-studio'))"
