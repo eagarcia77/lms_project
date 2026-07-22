@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Entrada estable de producción para NEXUS EDU XR.
 
-Carga la aplicación principal generada por los instaladores y registra Course
-Builder al final, después de retirar las rutas antiguas de Course Studio. Esto
-evita depender de modificaciones textuales a ``app.main`` durante Docker build.
+Carga la aplicación principal generada por los instaladores y sustituye las rutas
+antiguas de Course Studio por las rutas CRUD de Course Builder. Las rutas se
+insertan directamente en el enrutador activo para evitar diferencias de
+``include_router`` entre las versiones generadas durante Docker build.
 """
 
 from app.course_builder import router as course_builder_router
@@ -19,17 +20,32 @@ def _is_legacy_course_route(route: object) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in COURSE_PREFIXES)
 
 
-# Las rutas se evalúan en orden. Retiramos primero la versión anterior para que
-# los formularios CRUD sean los que atiendan todas las solicitudes del estudio.
-app.router.routes = [route for route in app.router.routes if not _is_legacy_course_route(route)]
-app.include_router(course_builder_router)
+def _route_snapshot(routes: list[object]) -> list[tuple[str, set[str]]]:
+    return [
+        (
+            str(getattr(route, "path", "")),
+            set(getattr(route, "methods", set()) or set()),
+        )
+        for route in routes
+    ]
+
+
+# Guardamos las rutas del constructor antes de modificar la aplicación principal.
+builder_routes = list(course_builder_router.routes)
+if not builder_routes:
+    raise RuntimeError("Course Builder fue importado, pero su APIRouter no contiene rutas.")
+
+# Las rutas se evalúan en orden. Retiramos primero la versión anterior y luego
+# añadimos directamente los objetos APIRoute ya construidos por Course Builder.
+app.router.routes = [
+    route for route in app.router.routes if not _is_legacy_course_route(route)
+]
+app.router.routes.extend(builder_routes)
+app.openapi_schema = None
 
 
 def _validate_course_routes() -> None:
-    routes = [
-        (str(getattr(route, "path", "")), set(getattr(route, "methods", set()) or set()))
-        for route in app.routes
-    ]
+    routes = _route_snapshot(list(app.router.routes))
     required = {
         ("/course-studio", "GET"),
         ("/course-studio/courses", "POST"),
@@ -43,7 +59,24 @@ def _validate_course_routes() -> None:
         if not any(route_path == path and method in methods for route_path, methods in routes)
     ]
     if missing:
-        raise RuntimeError("Faltan rutas obligatorias de Course Builder: " + ", ".join(missing))
+        available = ", ".join(
+            f"{'/'.join(sorted(methods)) or '-'} {path}"
+            for path, methods in routes
+            if path.startswith(COURSE_PREFIXES)
+        ) or "ninguna"
+        raise RuntimeError(
+            "Faltan rutas obligatorias de Course Builder: "
+            + ", ".join(missing)
+            + ". Rutas disponibles: "
+            + available
+        )
+
+    registered = [
+        f"{'/'.join(sorted(methods))} {path}"
+        for path, methods in routes
+        if path.startswith(COURSE_PREFIXES)
+    ]
+    print("Course Builder registrado: " + " | ".join(registered))
 
 
 _validate_course_routes()
