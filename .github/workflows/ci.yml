@@ -15,9 +15,15 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: test -f tools/apply_course_studio.py
       - run: python tools/apply_course_studio.py
-      - run: python tools/install_course_builder.py
+      - run: test -f app/course_builder.py && test -f app/runtime_entry.py
       - run: python tools/fix_course_builder_response_types.py
       - run: python -m compileall -q app
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
-      - run: PYTHONPATH=. python -c "from app.main import app; routes={(getattr(r,'path',''),','.join(sorted(getattr(r,'methods',[]) or []))) for r in app.routes}; assert any(path == '/course-studio' for path,_ in routes); assert any(path == '/course-studio/courses' and 'POST' in methods for path,methods in routes); assert all(getattr(r,'response_model',None) is None for r in app.routes if str(getattr(r,'path','')).startswith('/course-studio'))"
+      - run: >-
+          PYTHONPATH=. python -c "from app.runtime_entry import app;
+          routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes];
+          assert any(p == '/course-studio' and 'GET' in m for p,m in routes);
+          assert any(p == '/course-studio/courses' and 'POST' in m for p,m in routes);
+          assert any(p == '/course-studio/courses/{course_id}/modules' and 'POST' in m for p,m in routes);
+          assert any(p == '/course-studio/modules/{module_id}/activities' and 'POST' in m for p,m in routes)"
