@@ -20,9 +20,11 @@ jobs:
       - run: python tools/patch_admin_console_v2.py
       - run: python tools/apply_admin_console.py
       - run: python tools/apply_authoring_v5.py
+      - run: python tools/patch_authoring_v5_security.py
       - run: python -m compileall -q app tools
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
+      - run: grep -q "setPublishSettings" app/admin_authoring_v4.py && grep -q "def sanitize_html" app/admin_authoring_v4.py
       - name: Validate Course Studio V5 routes
         env:
           NEXUS_SESSION_SECRET: build-verification-secret-change-in-production
