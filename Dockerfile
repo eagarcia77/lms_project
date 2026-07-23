@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
+RUN python -m py_compile tools/*.py
 RUN python tools/apply_v3.py
 RUN python tools/apply_course_studio_package.py
 RUN pip install --no-cache-dir -r requirements.txt
