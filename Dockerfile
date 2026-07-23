@@ -18,6 +18,7 @@ RUN python tools/patch_admin_console_v2.py
 RUN python tools/apply_admin_console.py
 RUN python tools/apply_authoring_v5.py
 RUN python tools/patch_authoring_v5_security.py
+RUN python tools/patch_authoring_v6_padding.py
 RUN python tools/apply_authoring_v6.py
 RUN chmod +x start_runtime.sh
 RUN python -m compileall -q app tools
