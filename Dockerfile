@@ -16,6 +16,7 @@ RUN python tools/fix_course_builder_response_types.py
 RUN python tools/patch_admin_console_v2.py
 RUN python tools/apply_admin_console.py
 RUN python tools/apply_authoring_studio.py
+RUN python tools/migrate_authoring_schema.py
 RUN python tools/fix_authoring_content_save.py
 RUN chmod +x start_runtime.sh
 RUN python -m compileall -q app
