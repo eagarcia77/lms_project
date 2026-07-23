@@ -16,6 +16,7 @@ RUN python tools/fix_course_builder_response_types.py
 RUN python tools/patch_admin_console_v2.py
 RUN python tools/apply_admin_console.py
 RUN python tools/apply_authoring_studio.py
+RUN python tools/fix_authoring_content_save.py
 RUN chmod +x start_runtime.sh
 RUN python -m compileall -q app
 RUN NEXUS_SESSION_SECRET=build-verification-secret-change-in-production python -c "from app.runtime_entry import app; routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes]; assert any(p == '/course-studio' and 'GET' in m for p,m in routes); assert any(p == '/course-studio/courses' and 'POST' in m for p,m in routes); assert any(p == '/admin/login' and 'GET' in m for p,m in routes); assert any(p == '/admin/courses' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}/modules' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/modules/{module_id}/items' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/items/{item_id}/preview' and 'GET' in m for p,m in routes)"
