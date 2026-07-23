@@ -16,10 +16,10 @@ RUN test -f app/course_builder.py && test -f app/runtime_entry.py
 RUN python tools/fix_course_builder_response_types.py
 RUN python tools/patch_admin_console_v2.py
 RUN python tools/apply_admin_console.py
-RUN python tools/apply_authoring_v3.py
+RUN python tools/apply_authoring_v5.py
 RUN chmod +x start_runtime.sh
-RUN python -m compileall -q app
-RUN NEXUS_SESSION_SECRET=build-verification-secret-change-in-production python -c "from app.runtime_entry import app; routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes]; assert any(p == '/course-studio' and 'GET' in m for p,m in routes); assert any(p == '/course-studio/courses' and 'POST' in m for p,m in routes); assert any(p == '/admin/login' and 'GET' in m for p,m in routes); assert any(p == '/admin/courses' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}/modules' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/modules/{module_id}/items/new' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/modules/{module_id}/items' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/items/{item_id}/preview' and 'GET' in m for p,m in routes)"
+RUN python -m compileall -q app tools
+RUN NEXUS_SESSION_SECRET=build-verification-secret-change-in-production python -c "from app.runtime_entry import app; routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes]; required=[('/admin/login','GET'),('/admin/courses','GET'),('/admin/authoring','GET'),('/admin/authoring/courses','POST'),('/admin/authoring/courses/{course_id}','GET'),('/admin/authoring/courses/{course_id}/modules','POST'),('/admin/authoring/courses/{course_id}/ai-plan','POST'),('/admin/authoring/modules/{module_id}/items/new','GET'),('/admin/authoring/modules/{module_id}/items','POST'),('/admin/authoring/modules/{module_id}/google','POST'),('/admin/authoring/modules/{module_id}/odf/{kind}','GET'),('/admin/authoring/items/{item_id}/forum','GET'),('/admin/authoring/items/{item_id}/preview','GET')]; missing=[f'{m} {p}' for p,m in required if not any(rp==p and m in methods for rp,methods in routes)]; assert not missing, missing"
 
 EXPOSE 8000
 CMD ["./start_runtime.sh"]
