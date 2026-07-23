@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
-RUN python -m py_compile tools/*.py
+RUN python -m py_compile tools/*.py app/*.py
 RUN python tools/apply_v3.py
 RUN python tools/apply_course_studio_package.py
 RUN pip install --no-cache-dir -r requirements.txt
@@ -16,10 +16,7 @@ RUN test -f app/course_builder.py && test -f app/runtime_entry.py
 RUN python tools/fix_course_builder_response_types.py
 RUN python tools/patch_admin_console_v2.py
 RUN python tools/apply_admin_console.py
-RUN python tools/apply_authoring_studio.py
-RUN python tools/migrate_authoring_schema.py
-RUN python tools/fix_authoring_editor_page.py
-RUN python tools/fix_authoring_content_save.py
+RUN python tools/apply_authoring_v3.py
 RUN chmod +x start_runtime.sh
 RUN python -m compileall -q app
 RUN NEXUS_SESSION_SECRET=build-verification-secret-change-in-production python -c "from app.runtime_entry import app; routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes]; assert any(p == '/course-studio' and 'GET' in m for p,m in routes); assert any(p == '/course-studio/courses' and 'POST' in m for p,m in routes); assert any(p == '/admin/login' and 'GET' in m for p,m in routes); assert any(p == '/admin/courses' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/courses/{course_id}/modules' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/modules/{module_id}/items/new' and 'GET' in m for p,m in routes); assert any(p == '/admin/authoring/modules/{module_id}/items' and 'POST' in m for p,m in routes); assert any(p == '/admin/authoring/items/{item_id}/preview' and 'GET' in m for p,m in routes)"
