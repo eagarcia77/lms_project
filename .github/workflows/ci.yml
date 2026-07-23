@@ -24,6 +24,7 @@ jobs:
       - run: python tools/apply_admin_console.py
       - run: python tools/apply_authoring_v5.py
       - run: python tools/patch_authoring_v5_security.py
+      - run: python tools/patch_authoring_v6_padding.py
       - run: python tools/apply_authoring_v6.py
       - run: python -m compileall -q app tools
       - run: PYTHONPATH=. pytest -q
