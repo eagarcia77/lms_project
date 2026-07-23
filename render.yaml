@@ -38,6 +38,14 @@ services:
         value: https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
       - key: GOOGLE_WORKSPACE_DOMAIN
         sync: false
+      - key: AI_BASE_URL
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: llama3.2
+      - key: AI_API_STYLE
+        value: openai
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
