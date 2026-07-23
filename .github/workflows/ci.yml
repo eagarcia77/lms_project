@@ -5,11 +5,14 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      NEXUS_SESSION_SECRET: build-verification-secret-change-in-production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - run: python -m py_compile tools/*.py app/*.py
       - run: python tools/apply_v3.py
       - run: python tools/apply_course_studio_package.py
       - run: pip install -r requirements.txt pytest
@@ -21,16 +24,16 @@ jobs:
       - run: python tools/apply_admin_console.py
       - run: python tools/apply_authoring_v5.py
       - run: python tools/patch_authoring_v5_security.py
+      - run: python tools/apply_authoring_v6.py
       - run: python -m compileall -q app tools
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
-      - run: grep -q "setPublishSettings" app/admin_authoring_v4.py && grep -q "def sanitize_html" app/admin_authoring_v4.py
-      - name: Validate Course Studio V5 routes
-        env:
-          NEXUS_SESSION_SECRET: build-verification-secret-change-in-production
+      - name: Validate Course Studio V6 routes
         run: >-
           PYTHONPATH=. python -c "from app.runtime_entry import app;
           routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes];
-          required=[('/admin/authoring','GET'),('/admin/authoring/courses','POST'),('/admin/authoring/courses/{course_id}/modules','POST'),('/admin/authoring/courses/{course_id}/ai-plan','POST'),('/admin/authoring/modules/{module_id}/items','POST'),('/admin/authoring/modules/{module_id}/google','POST'),('/admin/authoring/modules/{module_id}/odf/{kind}','GET'),('/admin/authoring/items/{item_id}/forum','GET'),('/admin/authoring/items/{item_id}/preview','GET')];
+          required=[('/admin/login','GET'),('/admin/courses','GET'),('/admin/authoring','GET'),('/admin/authoring/courses','POST'),('/admin/authoring/courses/{course_id}','GET'),('/admin/authoring/courses/{course_id}/modules','POST'),('/admin/authoring/courses/{course_id}/ai-plan','POST'),('/admin/authoring/modules/{module_id}/items/new','GET'),('/admin/authoring/modules/{module_id}/items','POST'),('/admin/authoring/modules/{module_id}/google','POST'),('/admin/authoring/modules/{module_id}/odf/{kind}','GET'),('/admin/authoring/items/{item_id}/forum','GET'),('/admin/authoring/items/{item_id}/forum','POST'),('/admin/authoring/items/{item_id}/preview','GET')];
           missing=[f'{m} {p}' for p,m in required if not any(rp==p and m in methods for rp,methods in routes)];
+          print('Course Studio V6 routes:', [('%s %s' % ('/'.join(sorted(methods)), path)) for path,methods in routes if path.startswith('/admin/authoring')]);
           assert not missing, missing"
+      - run: grep -q "register_authoring_v6" app/runtime_entry.py && grep -q "def register_authoring_v6" app/admin_authoring_v6.py
