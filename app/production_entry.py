@@ -3,14 +3,15 @@ from __future__ import annotations
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
 La consola administrativa se registra sobre la aplicación principal. El Studio
-unificado y su Centro de Innovación se construyen primero en una aplicación
-FastAPI temporal y luego sus rutas se incorporan a la aplicación final. Esto
-evita colisiones con rutas o instaladores heredados durante la construcción.
+unificado, el Centro de Innovación y el Portal Administrativo Integral se
+incorporan a la misma aplicación FastAPI y comparten usuarios, permisos,
+navegación, datos y diagnóstico.
 """
 
 from fastapi import FastAPI
 
 from app.admin_console import register_admin_console
+from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
 from app.innovation_hub import register_innovation_hub
 from app.main import app
@@ -48,6 +49,11 @@ def _register_unified_studio() -> None:
     app.openapi_schema = None
 
 
+def _register_integrated_portal() -> None:
+    register_admin_portal(app)
+    app.openapi_schema = None
+
+
 def _validate() -> None:
     snapshot = [
         (_path(route), set(getattr(route, "methods", set()) or set()))
@@ -56,6 +62,7 @@ def _validate() -> None:
     required = {
         ("/healthz", "GET"),
         ("/course-studio", "GET"),
+        ("/admin", "GET"),
         ("/admin/login", "GET"),
         ("/admin/courses", "GET"),
         ("/admin/system", "GET"),
@@ -95,7 +102,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system"))
+        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
@@ -104,4 +111,5 @@ def _validate() -> None:
 
 _register_administration()
 _register_unified_studio()
+_register_integrated_portal()
 _validate()
