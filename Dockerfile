@@ -18,11 +18,13 @@ RUN mkdir -p /tmp/nexus-overlay/app \
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python tools/patch_google_workspace_scopes.py
 RUN python tools/patch_admin_navigation.py
+RUN python tools/fix_unified_authoring_templates.py
 RUN test -f app/unified_authoring.py \
     && test -f app/production_entry.py \
     && test -f app/admin_authoring_v6.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
+    && test -f tools/fix_unified_authoring_templates.py \
     && test -f tools/validate_runtime_dependencies.py \
     && test -f tools/validate_unified_routes.py \
     && test -f tools/smoke_test_admin_flow.py
@@ -30,6 +32,7 @@ RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
     tools/patch_admin_navigation.py \
+    tools/fix_unified_authoring_templates.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py \
     tools/smoke_test_admin_flow.py
