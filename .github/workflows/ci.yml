@@ -21,6 +21,7 @@ jobs:
       - run: python tools/fix_course_builder_response_types.py
       - run: python tools/patch_admin_console_v2.py
       - run: python tools/apply_admin_console.py
+      - run: python tools/patch_google_workspace_scopes.py
       - run: test -f app/unified_authoring.py && test -f app/production_entry.py && test -f app/admin_authoring_v6.py
       - run: python -m compileall -q app tools
       - run: PYTHONPATH=. pytest -q
@@ -34,3 +35,4 @@ jobs:
           print('Unified routes:', [('%s %s' % ('/'.join(sorted(methods)), path)) for path,methods in routes if path.startswith(('/admin/authoring','/course-studio'))]);
           assert not missing, missing"
       - run: grep -q "def register_unified_authoring" app/unified_authoring.py && grep -q "register_unified_authoring" app/production_entry.py
+      - run: grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py
