@@ -5,8 +5,13 @@ from app.production_entry import app
 REQUIRED = {
     ("/healthz", "GET"),
     ("/course-studio", "GET"),
+    ("/admin", "GET"),
     ("/admin/login", "GET"),
     ("/admin/courses", "GET"),
+    ("/admin/users", "GET"),
+    ("/admin/enrollments", "GET"),
+    ("/admin/audit", "GET"),
+    ("/admin/backup", "GET"),
     ("/admin/system", "GET"),
     ("/admin/system/health", "GET"),
     ("/admin/authoring", "GET"),
@@ -49,14 +54,14 @@ def main() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/admin/authoring", "/admin/system", "/course-studio"))
+        if path.startswith(("/admin", "/course-studio"))
     ]
     missing = [
         f"{method} {path}"
         for path, method in sorted(REQUIRED)
         if not any(route_path == path and method in methods for route_path, methods in snapshot)
     ]
-    print("Rutas unificadas registradas:", flush=True)
+    print("Rutas de la plataforma integral registradas:", flush=True)
     for route in registered:
         print(f"  - {route}", flush=True)
     if missing:
@@ -64,7 +69,7 @@ def main() -> None:
         for route in missing:
             print(f"  - {route}", flush=True)
         raise SystemExit(1)
-    print(f"Validación completada: {len(REQUIRED)} rutas obligatorias disponibles.", flush=True)
+    print(f"Validación completada: {len(REQUIRED)} rutas integradas disponibles.", flush=True)
 
 
 if __name__ == "__main__":
