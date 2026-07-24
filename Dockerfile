@@ -6,10 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
-# Preserve the consolidated authoring and administration layers while applying
-# the authenticated V3 base package.
+# Preserve the consolidated authoring, innovation and administration layers
+# while applying the authenticated V3 base package.
 RUN mkdir -p /tmp/nexus-overlay/app \
-    && cp app/unified_authoring.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
     && cp /tmp/nexus-overlay/app/* app/ \
@@ -20,6 +20,7 @@ RUN python tools/patch_google_workspace_scopes.py
 RUN python tools/patch_admin_navigation.py
 RUN python tools/fix_unified_authoring_templates.py
 RUN test -f app/unified_authoring.py \
+    && test -f app/innovation_hub.py \
     && test -f app/production_entry.py \
     && test -f app/admin_authoring_v6.py \
     && test -f app/admin_console.py \
@@ -44,6 +45,7 @@ RUN PYTHONPATH=. python tools/smoke_test_admin_flow.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q 'href="/admin/authoring"' app/admin_console.py \
+    && grep -q 'href="/admin/authoring/innovation"' app/admin_console.py \
     && grep -q 'href="/admin/system"' app/admin_console.py
 
 EXPOSE 8000
