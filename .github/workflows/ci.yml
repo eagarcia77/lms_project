@@ -6,7 +6,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      NEXUS_SESSION_SECRET: build-verification-secret-change-in-production
+      SESSION_SECRET: build-verification-session-secret-change-in-production
+      NEXUS_SESSION_SECRET: build-verification-admin-secret-change-in-production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
