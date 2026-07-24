@@ -66,8 +66,12 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q '"/admin/roles"' app/admin_portal.py \
     && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
     && grep -q 'id="admin-access"' app/static/index.html \
+    && grep -q '20260724-admin-access-v4' app/static/index.html \
+    && grep -q '20260724-admin-access-v4' app/static/sw.js \
+    && grep -q 'url.pathname.startsWith("/api/")' app/static/sw.js \
     && grep -q 'updateAdminAccess' app/static/app.js \
-    && grep -q '/api/admin/access' app/home_admin_access.py
+    && grep -q '/api/admin/access' app/home_admin_access.py \
+    && grep -q 'platform_session' app/home_admin_access.py
 
 EXPOSE 8000
 CMD ["./start_runtime.sh"]
