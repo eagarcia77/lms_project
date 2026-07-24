@@ -1,25 +1,45 @@
 from __future__ import annotations
 
-"""Entrada única de producción para NEXUS EDU XR.
+"""Entrada única y determinista de producción para NEXUS EDU XR.
 
-Carga la aplicación base y registra una sola experiencia de autoría:
-NEXUS Unified Course Studio. Las rutas antiguas de Course Builder y
-Course Studio se eliminan dentro del registrador unificado.
+La consola administrativa se registra sobre la aplicación principal. El Studio
+unificado se construye primero en una aplicación FastAPI temporal y luego sus
+rutas se incorporan a la aplicación final. Esto evita colisiones con rutas o
+instaladores heredados durante la construcción de Docker.
 """
+
+from fastapi import FastAPI
 
 from app.admin_console import register_admin_console
 from app.main import app
 from app.unified_authoring import register_unified_authoring
+
+AUTHORING_PREFIXES = ("/admin/authoring", "/course-studio", "/course-builder")
 
 
 def _path(route: object) -> str:
     return str(getattr(route, "path", ""))
 
 
-def _register() -> None:
+def _is_authoring_route(route: object) -> bool:
+    path = _path(route)
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in AUTHORING_PREFIXES)
+
+
+def _register_admin_console() -> None:
     if not any(_path(route) == "/admin/login" for route in app.router.routes):
         register_admin_console(app)
-    register_unified_authoring(app)
+
+
+def _register_unified_studio() -> None:
+    isolated = FastAPI(title="NEXUS Unified Authoring Router")
+    register_unified_authoring(isolated)
+    routes = [route for route in isolated.router.routes if _is_authoring_route(route)]
+    if not routes:
+        raise RuntimeError("El Studio unificado no produjo rutas para registrar.")
+
+    app.router.routes = [route for route in app.router.routes if not _is_authoring_route(route)]
+    app.router.routes.extend(routes)
     app.openapi_schema = None
 
 
@@ -59,12 +79,13 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/admin"))
+        if path.startswith(("/course-studio", "/admin/authoring"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
         raise RuntimeError("Faltan rutas unificadas: " + ", ".join(missing))
 
 
-_register()
+_register_admin_console()
+_register_unified_studio()
 _validate()
