@@ -3,15 +3,16 @@ from __future__ import annotations
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
 La consola administrativa se registra sobre la aplicación principal. El Studio
-unificado se construye primero en una aplicación FastAPI temporal y luego sus
-rutas se incorporan a la aplicación final. Esto evita colisiones con rutas o
-instaladores heredados durante la construcción de Docker.
+unificado y su Centro de Innovación se construyen primero en una aplicación
+FastAPI temporal y luego sus rutas se incorporan a la aplicación final. Esto
+evita colisiones con rutas o instaladores heredados durante la construcción.
 """
 
 from fastapi import FastAPI
 
 from app.admin_console import register_admin_console
 from app.admin_system import register_admin_system
+from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.unified_authoring import register_unified_authoring
 
@@ -37,6 +38,7 @@ def _register_administration() -> None:
 def _register_unified_studio() -> None:
     isolated = FastAPI(title="NEXUS Unified Authoring Router")
     register_unified_authoring(isolated)
+    register_innovation_hub(isolated)
     routes = [route for route in isolated.router.routes if _is_authoring_route(route)]
     if not routes:
         raise RuntimeError("El Studio unificado no produjo rutas para registrar.")
@@ -75,6 +77,15 @@ def _validate() -> None:
         ("/admin/authoring/items/{item_id}/forum", "GET"),
         ("/admin/authoring/items/{item_id}/forum", "POST"),
         ("/admin/authoring/items/{item_id}/preview", "GET"),
+        ("/admin/authoring/innovation", "GET"),
+        ("/admin/authoring/innovation/courses/{course_id}", "GET"),
+        ("/admin/authoring/innovation/modules/{module_id}", "GET"),
+        ("/admin/authoring/innovation/modules/{module_id}/ai", "POST"),
+        ("/admin/authoring/innovation/modules/{module_id}/xr", "POST"),
+        ("/admin/authoring/innovation/modules/{module_id}/tool", "POST"),
+        ("/admin/authoring/innovation/courses/{course_id}/publish", "POST"),
+        ("/admin/authoring/innovation/courses/{course_id}/duplicate", "POST"),
+        ("/admin/authoring/innovation/courses/{course_id}/export", "GET"),
     }
     missing = [
         f"{method} {path}"
