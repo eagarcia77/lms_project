@@ -24,8 +24,9 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python tools/patch_google_workspace_scopes.py
       - run: python tools/patch_admin_navigation.py
-      - run: test -f app/unified_authoring.py && test -f app/production_entry.py && test -f app/admin_authoring_v6.py && test -f app/admin_console.py && test -f app/admin_system.py && test -f tools/validate_runtime_dependencies.py && test -f tools/validate_unified_routes.py && test -f tools/smoke_test_admin_flow.py
-      - run: python -m py_compile app/*.py tools/patch_google_workspace_scopes.py tools/patch_admin_navigation.py tools/validate_runtime_dependencies.py tools/validate_unified_routes.py tools/smoke_test_admin_flow.py
+      - run: python tools/fix_unified_authoring_templates.py
+      - run: test -f app/unified_authoring.py && test -f app/production_entry.py && test -f app/admin_authoring_v6.py && test -f app/admin_console.py && test -f app/admin_system.py && test -f tools/fix_unified_authoring_templates.py && test -f tools/validate_runtime_dependencies.py && test -f tools/validate_unified_routes.py && test -f tools/smoke_test_admin_flow.py
+      - run: python -m py_compile app/*.py tools/patch_google_workspace_scopes.py tools/patch_admin_navigation.py tools/fix_unified_authoring_templates.py tools/validate_runtime_dependencies.py tools/validate_unified_routes.py tools/smoke_test_admin_flow.py
       - run: python tools/validate_runtime_dependencies.py
       - run: PYTHONPATH=. python tools/validate_unified_routes.py
       - run: PYTHONPATH=. python tools/smoke_test_admin_flow.py
