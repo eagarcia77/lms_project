@@ -2,10 +2,10 @@ from __future__ import annotations
 
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
-La consola administrativa, la gestión de roles, el Studio unificado, el Centro
-de Innovación y el Portal Administrativo Integral se incorporan a la misma
-aplicación FastAPI y comparten usuarios, permisos, navegación, datos y
-diagnóstico.
+La consola administrativa, la gestión de roles, el acceso administrativo desde
+la portada, el Studio unificado, el Centro de Innovación y el Portal
+Administrativo Integral se incorporan a la misma aplicación FastAPI y comparten
+usuarios, permisos, navegación, datos y diagnóstico.
 """
 
 from fastapi import FastAPI
@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.home_admin_access import register_home_admin_access
 from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.role_management import register_role_management
@@ -36,6 +37,7 @@ def _register_administration() -> None:
     if not any(_path(route) == "/admin/system" for route in app.router.routes):
         register_admin_system(app)
     register_role_management(app)
+    register_home_admin_access(app)
 
 
 def _register_unified_studio() -> None:
@@ -63,6 +65,7 @@ def _validate() -> None:
     ]
     required = {
         ("/healthz", "GET"),
+        ("/api/admin/access", "GET"),
         ("/course-studio", "GET"),
         ("/admin", "GET"),
         ("/admin/login", "GET"),
@@ -115,7 +118,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
+        if path.startswith(("/course-studio", "/api/admin", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
