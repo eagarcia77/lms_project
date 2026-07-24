@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 DB_PATH = Path('/tmp/nexus-home-admin-button-test.db')
 if DB_PATH.exists():
@@ -21,9 +22,39 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.production_entry import app  # noqa: E402
 
 
+REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
 def expect(response, status: int, label: str) -> None:
     if response.status_code != status:
-        raise RuntimeError(f'{label}: se esperaba {status} y se recibió {response.status_code}: {response.text[:500]}')
+        raise RuntimeError(
+            f'{label}: se esperaba {status} y se recibió {response.status_code}: '
+            f'{response.text[:500]}'
+        )
+
+
+def validate_home_entry(client: TestClient) -> None:
+    """Validate either a public homepage or the intended authentication redirect."""
+    response = client.get('/')
+    if response.status_code == 200:
+        return
+    if response.status_code not in REDIRECT_STATUSES:
+        raise RuntimeError(
+            'entrada principal: se esperaba 200 o una redirección de autenticación '
+            f'y se recibió {response.status_code}: {response.text[:500]}'
+        )
+
+    location = response.headers.get('location', '').strip()
+    parsed = urlparse(location)
+    if not location or parsed.scheme or parsed.netloc or not location.startswith('/'):
+        raise RuntimeError(f'La portada produjo una redirección externa o inválida: {location!r}.')
+
+    destination = client.get(location, follow_redirects=True)
+    if destination.status_code != 200:
+        raise RuntimeError(
+            f'El destino de acceso {location!r} no respondió correctamente: '
+            f'{destination.status_code}: {destination.text[:500]}'
+        )
 
 
 def main() -> None:
@@ -47,7 +78,8 @@ def main() -> None:
         if public_access.json().get('allowed') is not False:
             raise RuntimeError('Un visitante anónimo pudo ver el acceso administrativo.')
 
-        expect(client.get('/'), 200, 'portada pública')
+        validate_home_entry(client)
+
         login = client.post(
             '/admin/login',
             data={
@@ -79,7 +111,11 @@ def main() -> None:
         if after_logout.json().get('allowed') is not False:
             raise RuntimeError('El botón administrativo permaneció autorizado después de cerrar sesión.')
 
-    print('Botón de administración validado: oculto para visitantes y visible únicamente para administradores.', flush=True)
+    print(
+        'Botón de administración validado: portada pública o protegida, oculto para visitantes '
+        'y visible únicamente para administradores.',
+        flush=True,
+    )
 
 
 if __name__ == '__main__':
