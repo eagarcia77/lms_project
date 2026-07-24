@@ -2,10 +2,10 @@ from __future__ import annotations
 
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
-La consola administrativa se registra sobre la aplicación principal. El Studio
-unificado, el Centro de Innovación y el Portal Administrativo Integral se
-incorporan a la misma aplicación FastAPI y comparten usuarios, permisos,
-navegación, datos y diagnóstico.
+La consola administrativa, la gestión de roles, el Studio unificado, el Centro
+de Innovación y el Portal Administrativo Integral se incorporan a la misma
+aplicación FastAPI y comparten usuarios, permisos, navegación, datos y
+diagnóstico.
 """
 
 from fastapi import FastAPI
@@ -15,6 +15,7 @@ from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
 from app.innovation_hub import register_innovation_hub
 from app.main import app
+from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
 
 AUTHORING_PREFIXES = ("/admin/authoring", "/course-studio", "/course-builder")
@@ -34,6 +35,7 @@ def _register_administration() -> None:
         register_admin_console(app)
     if not any(_path(route) == "/admin/system" for route in app.router.routes):
         register_admin_system(app)
+    register_role_management(app)
 
 
 def _register_unified_studio() -> None:
@@ -67,6 +69,17 @@ def _validate() -> None:
         ("/admin/courses", "GET"),
         ("/admin/system", "GET"),
         ("/admin/system/health", "GET"),
+        ("/admin/roles", "GET"),
+        ("/admin/users", "GET"),
+        ("/admin/users", "POST"),
+        ("/admin/users/{user_id}/role", "POST"),
+        ("/admin/users/{user_id}/status", "POST"),
+        ("/admin/users/{user_id}/force-password-reset", "POST"),
+        ("/admin/enrollments", "GET"),
+        ("/admin/enrollments", "POST"),
+        ("/admin/enrollments/{enrollment_id}/role", "POST"),
+        ("/admin/enrollments/{enrollment_id}/status", "POST"),
+        ("/admin/enrollments/{enrollment_id}/delete", "POST"),
         ("/admin/authoring", "GET"),
         ("/admin/authoring/courses", "POST"),
         ("/admin/authoring/courses/{course_id}", "GET"),
@@ -102,7 +115,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system", "/admin"))
+        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
