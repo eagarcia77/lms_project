@@ -29,7 +29,7 @@ def expect(response, status: int, label: str) -> None:
 
 def assert_portal(response, label: str) -> None:
     expect(response, 200, label)
-    required = ('Administración integral', 'Panel general', 'Diseño académico', 'Innovación IA/XR', 'Sistema')
+    required = ('Administración integral', 'Panel general', 'Diseño académico', 'Innovación IA/XR', 'Roles y permisos', 'Sistema')
     missing = [text for text in required if text not in response.text]
     if missing:
         raise RuntimeError(f'{label}: faltan elementos del portal integrado: {missing}')
@@ -51,6 +51,7 @@ def main() -> None:
 
         assert_portal(client.get('/admin/authoring'), 'Course Studio integrado')
         assert_portal(client.get('/admin/authoring/innovation'), 'Innovación integrada')
+        assert_portal(client.get('/admin/roles'), 'Roles integrados')
         assert_portal(client.get('/admin/users'), 'Usuarios integrados')
         assert_portal(client.get('/admin/enrollments'), 'Matrículas integradas')
         assert_portal(client.get('/admin/audit'), 'Auditoría integrada')
@@ -84,7 +85,7 @@ def main() -> None:
 
         expect(client.get('/admin/logout'), 303, 'cierre de sesión')
 
-    print('Portal integrado validado: panel, diseño, innovación, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
+    print('Portal integrado validado: panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
 
 
 if __name__ == '__main__':
