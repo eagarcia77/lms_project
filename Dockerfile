@@ -29,7 +29,8 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/fix_unified_authoring_templates.py \
     && test -f tools/validate_runtime_dependencies.py \
     && test -f tools/validate_unified_routes.py \
-    && test -f tools/smoke_test_admin_flow.py
+    && test -f tools/smoke_test_admin_flow.py \
+    && test -f tools/smoke_test_integrated_portal.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
@@ -37,12 +38,14 @@ RUN python -m py_compile app/*.py \
     tools/fix_unified_authoring_templates.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py \
-    tools/smoke_test_admin_flow.py
+    tools/smoke_test_admin_flow.py \
+    tools/smoke_test_integrated_portal.py
 RUN python tools/validate_runtime_dependencies.py
 RUN SESSION_SECRET=build-verification-session-secret-change-in-production \
     NEXUS_SESSION_SECRET=build-verification-admin-secret-change-in-production \
     PYTHONPATH=. python tools/validate_unified_routes.py
 RUN PYTHONPATH=. python tools/smoke_test_admin_flow.py
+RUN PYTHONPATH=. python tools/smoke_test_integrated_portal.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
