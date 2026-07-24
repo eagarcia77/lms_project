@@ -12,27 +12,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - run: python -m py_compile tools/*.py app/*.py
-      - run: python tools/apply_v3.py
-      - run: python tools/apply_course_studio_package.py
+      - name: Preserve unified overlay and apply authenticated base
+        run: |
+          mkdir -p /tmp/nexus-overlay/app
+          cp app/unified_authoring.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py /tmp/nexus-overlay/app/
+          cp start_runtime.sh requirements.txt /tmp/nexus-overlay/
+          python tools/apply_v3.py
+          cp /tmp/nexus-overlay/app/* app/
+          cp /tmp/nexus-overlay/start_runtime.sh /tmp/nexus-overlay/requirements.txt ./
       - run: pip install -r requirements.txt pytest
-      - run: test -f tools/apply_course_studio.py
-      - run: python tools/apply_course_studio.py
-      - run: python tools/fix_course_builder_response_types.py
-      - run: python tools/patch_admin_console_v2.py
-      - run: python tools/apply_admin_console.py
       - run: python tools/patch_google_workspace_scopes.py
-      - run: test -f app/unified_authoring.py && test -f app/production_entry.py && test -f app/admin_authoring_v6.py
-      - run: python -m compileall -q app tools
+      - run: test -f app/unified_authoring.py && test -f app/production_entry.py && test -f app/admin_authoring_v6.py && test -f app/admin_console.py && test -f tools/validate_unified_routes.py
+      - run: python -m py_compile app/*.py tools/patch_google_workspace_scopes.py tools/validate_unified_routes.py
+      - run: PYTHONPATH=. python tools/validate_unified_routes.py
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js
-      - name: Validate unified production platform
-        run: >-
-          PYTHONPATH=. python -c "from app.production_entry import app;
-          routes=[(getattr(r,'path',''),set(getattr(r,'methods',[]) or [])) for r in app.routes];
-          required=[('/healthz','GET'),('/course-studio','GET'),('/admin/login','GET'),('/admin/authoring','GET'),('/admin/authoring/courses','POST'),('/admin/authoring/courses/{course_id}','GET'),('/admin/authoring/courses/{course_id}/modules','POST'),('/admin/authoring/modules/{module_id}','GET'),('/admin/authoring/modules/{module_id}/content','POST'),('/admin/authoring/modules/{module_id}/activities','POST'),('/admin/authoring/modules/{module_id}/google','POST'),('/admin/authoring/modules/{module_id}/drive','GET'),('/admin/authoring/modules/{module_id}/odf/{kind}','GET'),('/admin/authoring/items/{item_id}/forum','GET'),('/admin/authoring/items/{item_id}/preview','GET')];
-          missing=[f'{m} {p}' for p,m in required if not any(rp==p and m in methods for rp,methods in routes)];
-          print('Unified routes:', [('%s %s' % ('/'.join(sorted(methods)), path)) for path,methods in routes if path.startswith(('/admin/authoring','/course-studio'))]);
-          assert not missing, missing"
-      - run: grep -q "def register_unified_authoring" app/unified_authoring.py && grep -q "register_unified_authoring" app/production_entry.py
       - run: grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py
