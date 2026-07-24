@@ -24,17 +24,20 @@ RUN test -f app/unified_authoring.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
     && test -f tools/validate_runtime_dependencies.py \
-    && test -f tools/validate_unified_routes.py
+    && test -f tools/validate_unified_routes.py \
+    && test -f tools/smoke_test_admin_flow.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
     tools/patch_admin_navigation.py \
     tools/validate_runtime_dependencies.py \
-    tools/validate_unified_routes.py
+    tools/validate_unified_routes.py \
+    tools/smoke_test_admin_flow.py
 RUN python tools/validate_runtime_dependencies.py
 RUN SESSION_SECRET=build-verification-session-secret-change-in-production \
     NEXUS_SESSION_SECRET=build-verification-admin-secret-change-in-production \
     PYTHONPATH=. python tools/validate_unified_routes.py
+RUN PYTHONPATH=. python tools/smoke_test_admin_flow.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q 'href="/admin/authoring"' app/admin_console.py \
