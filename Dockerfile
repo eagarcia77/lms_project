@@ -32,7 +32,9 @@ RUN python -m py_compile app/*.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py
 RUN python tools/validate_runtime_dependencies.py
-RUN NEXUS_SESSION_SECRET=build-verification-secret-change-in-production PYTHONPATH=. python tools/validate_unified_routes.py
+RUN SESSION_SECRET=build-verification-session-secret-change-in-production \
+    NEXUS_SESSION_SECRET=build-verification-admin-secret-change-in-production \
+    PYTHONPATH=. python tools/validate_unified_routes.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q 'href="/admin/authoring"' app/admin_console.py \
