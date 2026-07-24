@@ -4,6 +4,7 @@ from app.production_entry import app
 
 REQUIRED = {
     ("/healthz", "GET"),
+    ("/api/admin/access", "GET"),
     ("/course-studio", "GET"),
     ("/admin", "GET"),
     ("/admin/login", "GET"),
@@ -63,7 +64,7 @@ def main() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/admin", "/course-studio"))
+        if path.startswith(("/api/admin", "/admin", "/course-studio"))
     ]
     missing = [
         f"{method} {path}"
