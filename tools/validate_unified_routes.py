@@ -26,6 +26,15 @@ REQUIRED = {
     ("/admin/authoring/items/{item_id}/forum", "GET"),
     ("/admin/authoring/items/{item_id}/forum", "POST"),
     ("/admin/authoring/items/{item_id}/preview", "GET"),
+    ("/admin/authoring/innovation", "GET"),
+    ("/admin/authoring/innovation/courses/{course_id}", "GET"),
+    ("/admin/authoring/innovation/modules/{module_id}", "GET"),
+    ("/admin/authoring/innovation/modules/{module_id}/ai", "POST"),
+    ("/admin/authoring/innovation/modules/{module_id}/xr", "POST"),
+    ("/admin/authoring/innovation/modules/{module_id}/tool", "POST"),
+    ("/admin/authoring/innovation/courses/{course_id}/publish", "POST"),
+    ("/admin/authoring/innovation/courses/{course_id}/duplicate", "POST"),
+    ("/admin/authoring/innovation/courses/{course_id}/export", "GET"),
 }
 
 
