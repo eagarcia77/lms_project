@@ -1,46 +1,101 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "app" / "static" / "app.js"
-MARKER = "NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND"
+MARKER = "NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V2"
 
-RENDER_FUNCTION = r'''function renderCourses() {
-  // NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND
-  $("#course-grid").innerHTML = state.courses.map(c => {
-    const edit = c.can_edit
-      ? `<a class="button secondary course-edit-link" data-edit-course href="${c.edit_url || `/admin/authoring/courses/${c.id}`}">Editar curso</a>`
-      : "";
-    return `<article class="course-card" data-course-id="${c.id}" tabindex="0" role="button" aria-label="Abrir ${c.title}"><div class="course-band" style="--accent:${c.accent};background:${c.accent}"></div><div class="course-body"><span class="course-code">${c.code}${c.xr_enabled ? " · XR" : ""}</span><h2>${c.title}</h2><p>${c.description}</p><div class="course-meta"><span>${c.module_count} módulos</span><span>${c.activity_count} actividades</span><span>${c.progress}%</span></div><div class="progress" style="--accent:${c.accent};--progress:${c.progress}%"><i></i></div>${edit}</div></article>`;
-  }).join("");
-  $$('[data-edit-course]').forEach(link => link.addEventListener('click', event => event.stopPropagation()));
-  $$(".course-card").forEach(card => {
-    const open = event => {
-      if (event?.target instanceof Element && event.target.closest('[data-edit-course]')) return;
-      openCourse(Number(card.dataset.courseId));
-    };
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") open(event);
+ENHANCEMENT = r'''
+// NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V2
+(function () {
+  function nexusCatalogState() {
+    return typeof state === "object" && state ? state : {};
+  }
+
+  function nexusCanCreateCourses() {
+    const me = nexusCatalogState().me || {};
+    return Boolean(me.isAdmin || me.isInstructor);
+  }
+
+  function nexusCourseById(id) {
+    const courses = Array.isArray(nexusCatalogState().courses)
+      ? nexusCatalogState().courses
+      : [];
+    return courses.find(course => Number(course.id) === Number(id)) || null;
+  }
+
+  function nexusEnhanceCourseCards() {
+    document.querySelectorAll(".course-card[data-course-id]").forEach(card => {
+      const course = nexusCourseById(card.dataset.courseId);
+      const existing = card.querySelector("[data-edit-course]");
+
+      if (!course || !course.can_edit) {
+        if (existing) existing.remove();
+        return;
+      }
+      if (existing) return;
+
+      const link = document.createElement("a");
+      link.className = "button secondary course-edit-link";
+      link.setAttribute("data-edit-course", "true");
+      link.href = course.edit_url || `/admin/authoring/courses/${course.id}`;
+      link.textContent = "Editar curso";
+      link.addEventListener("click", event => event.stopPropagation());
+      (card.querySelector(".course-body") || card).appendChild(link);
     });
-  });
-}
-'''
+  }
 
-NEW_COURSE_HANDLER = r'''  const newCourseButton = $("#new-course-button");
-  newCourseButton?.addEventListener("click", () => {
-    if (state.me?.isAdmin || state.me?.isInstructor) {
+  function nexusSyncNewCourseButton() {
+    const button = document.querySelector("#new-course-button");
+    if (button) button.hidden = !nexusCanCreateCourses();
+  }
+
+  function nexusRefreshCourseControls() {
+    nexusEnhanceCourseCards();
+    nexusSyncNewCourseButton();
+  }
+
+  if (typeof renderCourses === "function" && !renderCourses.__nexusUnifiedCatalog) {
+    const originalRenderCourses = renderCourses;
+    const wrappedRenderCourses = function (...args) {
+      const result = originalRenderCourses.apply(this, args);
+      Promise.resolve().then(nexusRefreshCourseControls);
+      return result;
+    };
+    wrappedRenderCourses.__nexusUnifiedCatalog = true;
+    renderCourses = wrappedRenderCourses;
+  }
+
+  document.addEventListener("click", event => {
+    const target = event.target instanceof Element ? event.target.closest("#new-course-button") : null;
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (nexusCanCreateCourses()) {
       location.href = "/course-studio";
       return;
     }
-    toast("Solo administradores académicos e instructores pueden crear cursos.");
-  });'''
+    if (typeof toast === "function") {
+      toast("Solo administradores académicos e instructores pueden crear cursos.");
+    }
+  }, true);
 
-ROLE_VISIBILITY = r'''
-    const newCourseButton = $("#new-course-button");
-    if (newCourseButton) newCourseButton.hidden = !(state.me.isAdmin || state.me.isInstructor);
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", nexusRefreshCourseControls, { once: true });
+  } else {
+    nexusRefreshCourseControls();
+  }
+
+  const observer = new MutationObserver(() => nexusRefreshCourseControls());
+  const startObserver = () => {
+    if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+  };
+  if (document.body) startObserver();
+  else document.addEventListener("DOMContentLoaded", startObserver, { once: true });
+
+  window.nexusEnhanceCourseCatalog = nexusRefreshCourseControls;
+})();
 '''
 
 
@@ -49,35 +104,27 @@ def main() -> None:
     changes = 0
 
     if MARKER not in source:
-        pattern = re.compile(r"function renderCourses\(\) \{.*?\n\}\n\nasync function openCourse", re.DOTALL)
-        match = pattern.search(source)
-        if not match:
-            raise RuntimeError("No se encontró renderCourses() en app.js.")
-        source = source[: match.start()] + RENDER_FUNCTION + "\nasync function openCourse" + source[match.end() :]
-        changes += 1
-
-    old_handler = '  $("#new-course-button").addEventListener("click", () => toast("El diseñador visual de cursos se incorpora en la siguiente fase."));'
-    if NEW_COURSE_HANDLER not in source:
-        if old_handler not in source:
-            raise RuntimeError("No se encontró el controlador anterior de Nuevo curso.")
-        source = source.replace(old_handler, NEW_COURSE_HANDLER, 1)
-        changes += 1
-
-    role_anchor = '    $(".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
-    if ROLE_VISIBILITY.strip() not in source:
-        if role_anchor not in source:
-            role_anchor = '    $(".profile-text small").textContent = "Cuenta conectada";'
-        if role_anchor not in source:
-            raise RuntimeError("No se encontró el bloque del perfil para controlar Nuevo curso.")
-        source = source.replace(role_anchor, role_anchor + ROLE_VISIBILITY, 1)
+        source = source.rstrip() + "\n\n" + ENHANCEMENT.strip() + "\n"
         changes += 1
 
     TARGET.write_text(source, encoding="utf-8")
-    compile_markers = (MARKER, "/course-studio", "data-edit-course", "state.me?.isInstructor")
-    missing = [marker for marker in compile_markers if marker not in source]
+
+    required = (
+        MARKER,
+        'location.href = "/course-studio"',
+        "data-edit-course",
+        "nexusCanCreateCourses",
+        "nexusEnhanceCourseCatalog",
+    )
+    missing = [marker for marker in required if marker not in source]
     if missing:
         raise RuntimeError(f"Integración visual de cursos incompleta: {missing}")
-    print(f"Portada conectada a Course Studio; cambios: {changes}.", flush=True)
+
+    print(
+        "Portada conectada a Course Studio sin depender de renderCourses(); "
+        f"cambios: {changes}.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
