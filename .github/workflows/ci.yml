@@ -30,8 +30,9 @@ jobs:
       - run: python tools/patch_home_admin_button.py
       - run: python tools/patch_course_catalog_frontend.py
       - run: python tools/bump_course_editor_cache.py
+      - run: python tools/stabilize_browser_runtime.py
       - run: python tools/fix_unified_authoring_templates.py
-      - run: test -f app/course_management.py && test -f app/unified_course_catalog.py && test -f app/quality_center.py && test -f app/production_entry.py && test -f tools/patch_course_catalog_frontend.py && test -f tools/patch_quality_navigation.py && test -f tools/bump_course_editor_cache.py && test -f tools/smoke_test_course_editing.py && test -f tools/smoke_test_quality_center.py
+      - run: test -f app/course_management.py && test -f app/unified_course_catalog.py && test -f app/quality_center.py && test -f app/production_entry.py && test -f tools/patch_course_catalog_frontend.py && test -f tools/patch_quality_navigation.py && test -f tools/bump_course_editor_cache.py && test -f tools/stabilize_browser_runtime.py && test -f tools/smoke_test_course_editing.py && test -f tools/smoke_test_quality_center.py && test -f tools/smoke_test_browser_stability.py
       - run: python -m py_compile app/*.py tools/*.py
       - run: python tools/validate_runtime_dependencies.py
       - run: PYTHONPATH=. python tools/validate_unified_routes.py
@@ -42,6 +43,7 @@ jobs:
       - run: PYTHONPATH=. python tools/smoke_test_home_admin_button.py
       - run: PYTHONPATH=. python tools/smoke_test_course_editing.py
       - run: PYTHONPATH=. python tools/smoke_test_quality_center.py
+      - run: PYTHONPATH=. python tools/smoke_test_browser_stability.py
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js && node --check app/static/sw.js
-      - run: grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND' app/static/app.js && grep -q '20260724-course-edit-v5' app/static/index.html && grep -q '20260724-course-edit-v5' app/static/sw.js && grep -q '/admin/authoring/courses/{course_id}/update' app/production_entry.py && grep -q '/admin/quality/report.json' app/production_entry.py && grep -q 'Creación y edición unificada' app/course_management.py && grep -q 'Portada y Course Studio conectados' app/unified_course_catalog.py && grep -q 'Centro de Calidad Académica' app/quality_center.py
+      - run: grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V3' app/static/app.js && grep -q '20260725-browser-stability-v7' app/static/index.html && grep -q '20260725-browser-stability-v7' app/static/sw.js && grep -q 'NEXUS_BROWSER_STABILITY_NETWORK_ONLY' app/static/sw.js && grep -q '/admin/authoring/courses/{course_id}/update' app/production_entry.py && grep -q '/admin/quality/report.json' app/production_entry.py && grep -q 'Creación y edición unificada' app/course_management.py && grep -q 'Portada y Course Studio conectados' app/unified_course_catalog.py && grep -q 'Centro de Calidad Académica' app/quality_center.py
