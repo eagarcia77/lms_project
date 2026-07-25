@@ -1,0 +1,70 @@
+name: Staging Quality Gate
+
+on:
+  push:
+    branches: [staging]
+  pull_request:
+    branches: [staging]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-quality-gate:
+    name: Build, tests and runtime smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the exact Render Docker image
+        run: docker build --tag nexus-edu-xr-staging-ci:${{ github.sha }} .
+
+      - name: Start isolated staging container
+        run: |
+          docker run --detach \
+            --name nexus-staging-ci \
+            --publish 8000:8000 \
+            --env PORT=8000 \
+            --env APP_ENV=staging \
+            --env RELEASE_CHANNEL=staging \
+            --env COOKIE_SECURE=false \
+            --env DATABASE_URL=sqlite:////tmp/nexus-staging-runtime.db \
+            --env SESSION_SECRET=staging-runtime-session-secret-at-least-thirty-two-characters \
+            --env NEXUS_SESSION_SECRET=staging-runtime-admin-secret-at-least-thirty-two-characters \
+            --env NEXUS_BOOTSTRAP_ADMIN_EMAIL=staging.ci@example.com \
+            --env NEXUS_BOOTSTRAP_ADMIN_PASSWORD=Staging-CI-Password-2026! \
+            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador de pruebas' \
+            nexus-edu-xr-staging-ci:${{ github.sha }}
+
+      - name: Wait for application health
+        run: |
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:8000/healthz > /tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs nexus-staging-ci
+          exit 1
+
+      - name: Validate key runtime routes
+        run: |
+          curl --fail --silent http://127.0.0.1:8000/healthz
+          curl --fail --silent --output /tmp/admin-login.html http://127.0.0.1:8000/admin/login
+          grep -qi 'NEXUS' /tmp/admin-login.html
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker logs nexus-staging-ci || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm --force nexus-staging-ci || true
