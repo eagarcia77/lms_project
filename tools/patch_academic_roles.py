@@ -131,41 +131,48 @@ def patch_portal() -> int:
 
 def patch_profile() -> int:
     source = SCRIPT_FILE.read_text(encoding="utf-8")
-    desired_statement = '$('.replace("'", '"') + '".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
-    # Keep the literal easy to validate and avoid depending on the previous label.
-    desired_statement = '$(".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
-    if desired_statement in source:
+    desired = '$(".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
+    if desired in source:
         return 0
 
-    # Replace any existing assignment to the profile subtitle, regardless of its
-    # current wording or indentation.
     subtitle_pattern = re.compile(
         r'(?m)^(?P<indent>\s*)\$\(["\']\.profile-text small["\']\)\.textContent\s*=\s*[^;]+;\s*$'
     )
-    match = subtitle_pattern.search(source)
-    if match:
-        indent = match.group("indent")
-        source = subtitle_pattern.sub(indent + desired_statement, source, count=1)
+    subtitle_match = subtitle_pattern.search(source)
+    if subtitle_match:
+        indent = subtitle_match.group("indent")
+        source = subtitle_pattern.sub(indent + desired, source, count=1)
         SCRIPT_FILE.write_text(source, encoding="utf-8")
         return 1
 
-    # Some generated frontends omit the subtitle assignment. Insert it directly
-    # after the profile name is populated, preserving the existing indentation.
     name_pattern = re.compile(
         r'(?m)^(?P<indent>\s*)\$\(["\']\.profile-text strong["\']\)\.textContent\s*=\s*[^;]+;\s*$'
     )
     name_match = name_pattern.search(source)
     if name_match:
         indent = name_match.group("indent")
-        insertion = name_match.group(0) + "\n" + indent + desired_statement
+        insertion = name_match.group(0) + "\n" + indent + desired
         source = source[: name_match.start()] + insertion + source[name_match.end() :]
         SCRIPT_FILE.write_text(source, encoding="utf-8")
         return 1
 
-    raise RuntimeError(
-        "No se encontró un punto seguro del perfil para mostrar el rol académico. "
-        "Se esperaba una asignación a .profile-text small o .profile-text strong."
-    )
+    marker = "NEXUS_ACADEMIC_ROLE_PROFILE_FALLBACK"
+    if marker not in source:
+        fallback = r'''
+// NEXUS_ACADEMIC_ROLE_PROFILE_FALLBACK
+if (typeof updateGoogleIdentity === "function") {
+  const nexusOriginalUpdateGoogleIdentity = updateGoogleIdentity;
+  updateGoogleIdentity = async function (...args) {
+    const result = await nexusOriginalUpdateGoogleIdentity(...args);
+    const subtitle = document.querySelector(".profile-text small");
+    if (subtitle) subtitle.textContent = state.me?.platformRoleLabel || "Cuenta conectada";
+    return result;
+  };
+}
+'''
+        SCRIPT_FILE.write_text(source.rstrip() + "\n" + fallback, encoding="utf-8")
+        return 1
+    return 0
 
 
 def validate() -> None:
