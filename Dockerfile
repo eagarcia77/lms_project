@@ -23,6 +23,7 @@ RUN python tools/patch_quality_navigation.py
 RUN python tools/patch_home_admin_button.py
 RUN python tools/patch_course_catalog_frontend.py
 RUN python tools/bump_course_editor_cache.py
+RUN python tools/stabilize_browser_runtime.py
 RUN python tools/fix_unified_authoring_templates.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
@@ -43,6 +44,7 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/patch_home_admin_button.py \
     && test -f tools/patch_course_catalog_frontend.py \
     && test -f tools/bump_course_editor_cache.py \
+    && test -f tools/stabilize_browser_runtime.py \
     && test -f tools/fix_unified_authoring_templates.py \
     && test -f tools/validate_runtime_dependencies.py \
     && test -f tools/validate_unified_routes.py \
@@ -52,7 +54,8 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/smoke_test_academic_roles.py \
     && test -f tools/smoke_test_home_admin_button.py \
     && test -f tools/smoke_test_course_editing.py \
-    && test -f tools/smoke_test_quality_center.py
+    && test -f tools/smoke_test_quality_center.py \
+    && test -f tools/smoke_test_browser_stability.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
@@ -63,6 +66,7 @@ RUN python -m py_compile app/*.py \
     tools/patch_home_admin_button.py \
     tools/patch_course_catalog_frontend.py \
     tools/bump_course_editor_cache.py \
+    tools/stabilize_browser_runtime.py \
     tools/fix_unified_authoring_templates.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py \
@@ -72,7 +76,8 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_academic_roles.py \
     tools/smoke_test_home_admin_button.py \
     tools/smoke_test_course_editing.py \
-    tools/smoke_test_quality_center.py
+    tools/smoke_test_quality_center.py \
+    tools/smoke_test_browser_stability.py
 RUN python tools/validate_runtime_dependencies.py
 RUN SESSION_SECRET=build-verification-session-secret-change-in-production \
     NEXUS_SESSION_SECRET=build-verification-admin-secret-change-in-production \
@@ -84,6 +89,7 @@ RUN PYTHONPATH=. python tools/smoke_test_academic_roles.py
 RUN PYTHONPATH=. python tools/smoke_test_home_admin_button.py
 RUN PYTHONPATH=. python tools/smoke_test_course_editing.py
 RUN PYTHONPATH=. python tools/smoke_test_quality_center.py
+RUN PYTHONPATH=. python tools/smoke_test_browser_stability.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
@@ -98,10 +104,11 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q 'Creación y edición unificada' app/course_management.py \
     && grep -q 'Portada y Course Studio conectados' app/unified_course_catalog.py \
     && grep -q 'Centro de Calidad Académica' app/quality_center.py \
-    && grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND' app/static/app.js \
+    && grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V3' app/static/app.js \
     && grep -q 'id="admin-access"' app/static/index.html \
-    && grep -q '20260724-course-edit-v5' app/static/index.html \
-    && grep -q '20260724-course-edit-v5' app/static/sw.js \
+    && grep -q '20260725-browser-stability-v7' app/static/index.html \
+    && grep -q '20260725-browser-stability-v7' app/static/sw.js \
+    && grep -q 'NEXUS_BROWSER_STABILITY_NETWORK_ONLY' app/static/sw.js \
     && grep -q 'updateAdminAccess' app/static/app.js \
     && grep -q '/api/admin/access' app/home_admin_access.py
 
