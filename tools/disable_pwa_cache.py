@@ -58,8 +58,6 @@ self.addEventListener("activate", event => {
           .map(key => caches.delete(key))
       ))
       .then(() => self.registration.unregister())
-      .then(() => self.clients.matchAll({ type: "window" }))
-      .then(clients => Promise.all(clients.map(client => client.navigate(client.url))))
       .catch(() => undefined)
   );
 });
@@ -104,10 +102,12 @@ def main() -> None:
         raise RuntimeError("app.js todavía registra un service worker.")
     if "self.registration.unregister()" not in final_sw:
         raise RuntimeError("El service worker no quedó configurado para retirarse.")
+    if "client.navigate" in final_sw:
+        raise RuntimeError("El service worker todavía intenta recargar una ventana.")
 
     print(
         "PWA desactivada de forma independiente: registro eliminado, cachés limpiadas "
-        "y service worker retirado.",
+        "y service worker retirado sin recargar la página.",
         flush=True,
     )
 
