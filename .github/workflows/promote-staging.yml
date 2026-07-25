@@ -1,0 +1,94 @@
+name: Promote Staging to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: Resumen de los cambios que se publicarán
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: promote-staging-to-production
+  cancel-in-progress: false
+
+jobs:
+  validate-and-open-release-pr:
+    name: Validate staging and open production PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout the staging candidate
+        uses: actions/checkout@v4
+        with:
+          ref: staging
+          fetch-depth: 0
+
+      - name: Confirm staging is ahead of production
+        run: |
+          git fetch origin main staging
+          if git diff --quiet origin/main...origin/staging; then
+            echo 'No hay cambios nuevos para promover a producción.'
+            exit 1
+          fi
+
+      - name: Build and execute all Docker validations
+        run: docker build --tag nexus-edu-xr-release-candidate:${{ github.sha }} .
+
+      - name: Start release candidate
+        run: |
+          docker run --detach \
+            --name nexus-release-candidate \
+            --publish 8000:8000 \
+            --env PORT=8000 \
+            --env APP_ENV=release-candidate \
+            --env RELEASE_CHANNEL=release-candidate \
+            --env COOKIE_SECURE=false \
+            --env DATABASE_URL=sqlite:////tmp/nexus-release-candidate.db \
+            --env SESSION_SECRET=release-candidate-session-secret-at-least-thirty-two-characters \
+            --env NEXUS_SESSION_SECRET=release-candidate-admin-secret-at-least-thirty-two-characters \
+            --env NEXUS_BOOTSTRAP_ADMIN_EMAIL=release.candidate@example.com \
+            --env NEXUS_BOOTSTRAP_ADMIN_PASSWORD=Release-Candidate-Password-2026! \
+            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador de publicación' \
+            nexus-edu-xr-release-candidate:${{ github.sha }}
+
+      - name: Validate release candidate runtime
+        run: |
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:8000/healthz > /tmp/release-health.json; then
+              cat /tmp/release-health.json
+              curl --fail --silent --output /tmp/release-admin.html http://127.0.0.1:8000/admin/login
+              grep -qi 'NEXUS' /tmp/release-admin.html
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs nexus-release-candidate
+          exit 1
+
+      - name: Stop release candidate
+        if: always()
+        run: docker rm --force nexus-release-candidate || true
+
+      - name: Create or reuse production pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          existing="$(gh pr list --base main --head staging --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "Ya existe el Pull Request de publicación #$existing."
+            echo "https://github.com/${{ github.repository }}/pull/$existing"
+            exit 0
+          fi
+
+          notes="${RELEASE_NOTES:-Promoción validada desde el entorno staging.}"
+          gh pr create \
+            --base main \
+            --head staging \
+            --title "Publicar staging en producción" \
+            --body "## Candidato de publicación\n\n$notes\n\n### Validaciones completadas\n- Construcción Docker idéntica a Render\n- Pruebas incluidas en el Dockerfile\n- Inicio del contenedor\n- Verificación de /healthz\n- Verificación de /admin/login\n\nLa publicación en Render ocurrirá después de revisar y fusionar este Pull Request y de que los controles de CI de main terminen correctamente."
