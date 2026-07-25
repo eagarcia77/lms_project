@@ -4,10 +4,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "app" / "static" / "app.js"
-MARKER = "NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V2"
+MARKER = "NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V3"
 
 ENHANCEMENT = r'''
-// NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V2
+// NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V3
 (function () {
   function nexusCatalogState() {
     return typeof state === "object" && state ? state : {};
@@ -48,7 +48,9 @@ ENHANCEMENT = r'''
 
   function nexusSyncNewCourseButton() {
     const button = document.querySelector("#new-course-button");
-    if (button) button.hidden = !nexusCanCreateCourses();
+    if (!button) return;
+    const shouldHide = !nexusCanCreateCourses();
+    if (button.hidden !== shouldHide) button.hidden = shouldHide;
   }
 
   function nexusRefreshCourseControls() {
@@ -60,7 +62,7 @@ ENHANCEMENT = r'''
     const originalRenderCourses = renderCourses;
     const wrappedRenderCourses = function (...args) {
       const result = originalRenderCourses.apply(this, args);
-      Promise.resolve().then(nexusRefreshCourseControls);
+      queueMicrotask(nexusRefreshCourseControls);
       return result;
     };
     wrappedRenderCourses.__nexusUnifiedCatalog = true;
@@ -68,7 +70,9 @@ ENHANCEMENT = r'''
   }
 
   document.addEventListener("click", event => {
-    const target = event.target instanceof Element ? event.target.closest("#new-course-button") : null;
+    const target = event.target instanceof Element
+      ? event.target.closest("#new-course-button")
+      : null;
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -81,31 +85,50 @@ ENHANCEMENT = r'''
     }
   }, true);
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", nexusRefreshCourseControls, { once: true });
-  } else {
-    nexusRefreshCourseControls();
+  function scheduleStableRefresh() {
+    [0, 120, 450, 1200, 2500].forEach(delay => {
+      window.setTimeout(nexusRefreshCourseControls, delay);
+    });
   }
 
-  const observer = new MutationObserver(() => nexusRefreshCourseControls());
-  const startObserver = () => {
-    if (document.body) observer.observe(document.body, { childList: true, subtree: true });
-  };
-  if (document.body) startObserver();
-  else document.addEventListener("DOMContentLoaded", startObserver, { once: true });
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", scheduleStableRefresh, { once: true });
+  } else {
+    scheduleStableRefresh();
+  }
+  window.addEventListener("load", scheduleStableRefresh, { once: true });
+  window.addEventListener("pageshow", nexusRefreshCourseControls);
 
   window.nexusEnhanceCourseCatalog = nexusRefreshCourseControls;
 })();
 '''
 
 
+def _remove_older_versions(source: str) -> str:
+    markers = (
+        "// NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND_V2",
+        "// NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND\n",
+    )
+    for marker in markers:
+        start = source.find(marker)
+        if start < 0:
+            continue
+        wrapper_start = source.rfind("(function () {", 0, start)
+        if wrapper_start < 0:
+            wrapper_start = start
+        end = source.find("})();", start)
+        if end >= 0:
+            source = source[:wrapper_start] + source[end + 5 :]
+    return source
+
+
 def main() -> None:
     source = TARGET.read_text(encoding="utf-8")
-    changes = 0
+    original = source
+    source = _remove_older_versions(source)
 
     if MARKER not in source:
         source = source.rstrip() + "\n\n" + ENHANCEMENT.strip() + "\n"
-        changes += 1
 
     TARGET.write_text(source, encoding="utf-8")
 
@@ -115,14 +138,17 @@ def main() -> None:
         "data-edit-course",
         "nexusCanCreateCourses",
         "nexusEnhanceCourseCatalog",
+        "scheduleStableRefresh",
     )
     missing = [marker for marker in required if marker not in source]
     if missing:
         raise RuntimeError(f"Integración visual de cursos incompleta: {missing}")
+    if "new MutationObserver" in source:
+        raise RuntimeError("El catálogo conserva un observador global que puede causar refresco continuo.")
 
     print(
-        "Portada conectada a Course Studio sin depender de renderCourses(); "
-        f"cambios: {changes}.",
+        "Portada conectada a Course Studio con actualización finita y estable; "
+        f"cambios: {int(source != original)}.",
         flush=True,
     )
 
