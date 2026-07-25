@@ -1,0 +1,79 @@
+services:
+  - type: web
+    name: nexus-edu-xr-staging-eagarcia77
+    runtime: docker
+    plan: free
+    region: virginia
+    branch: staging
+    autoDeployTrigger: checksPass
+    healthCheckPath: /healthz
+    envVars:
+      - key: APP_NAME
+        value: NEXUS EDU XR · STAGING
+      - key: APP_ENV
+        value: staging
+      - key: RELEASE_CHANNEL
+        value: staging
+      - key: APP_BASE_URL
+        value: https://nexus-edu-xr-staging-eagarcia77.onrender.com
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: NEXUS_SESSION_SECRET
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nexus-edu-xr-staging-db
+          property: connectionString
+      - key: NEXUS_BOOTSTRAP_ADMIN_EMAIL
+        sync: false
+      - key: NEXUS_BOOTSTRAP_ADMIN_PASSWORD
+        sync: false
+      - key: NEXUS_BOOTSTRAP_ADMIN_NAME
+        value: Administrador NEXUS Staging
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://nexus-edu-xr-staging-eagarcia77.onrender.com/auth/google/callback
+      - key: GOOGLE_WORKSPACE_DOMAIN
+        sync: false
+      - key: AI_BASE_URL
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: llama3.2
+      - key: AI_API_STYLE
+        value: openai
+      - key: COLLABORA_BASE_URL
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM_EMAIL
+        sync: false
+      - key: SMTP_FROM_NAME
+        value: NEXUS EDU XR STAGING
+      - key: SMTP_USE_TLS
+        value: "true"
+      - key: SMTP_USE_SSL
+        value: "false"
+      - key: PASSWORD_RESET_TTL_MINUTES
+        value: "30"
+      - key: LOGIN_MAX_ATTEMPTS
+        value: "5"
+      - key: LOGIN_LOCK_MINUTES
+        value: "15"
+
+databases:
+  - name: nexus-edu-xr-staging-db
+    plan: free
+    region: virginia
