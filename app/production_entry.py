@@ -3,8 +3,8 @@ from __future__ import annotations
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
 La consola administrativa, la identidad académica, Course Studio, el catálogo
-visible en la portada y el Centro de Innovación comparten la misma aplicación,
-base de datos y sistema de permisos.
+visible en la portada, el Centro de Innovación y el Centro de Calidad comparten
+la misma aplicación, base de datos y sistema de permisos.
 """
 
 from fastapi import FastAPI
@@ -17,6 +17,7 @@ from app.home_admin_access import register_home_admin_access
 from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.platform_access import register_platform_access
+from app.quality_center import register_quality_center
 from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
 from app.unified_course_catalog import register_unified_course_catalog
@@ -41,6 +42,7 @@ def _register_administration() -> None:
     register_role_management(app)
     register_home_admin_access(app)
     register_platform_access(app)
+    register_quality_center(app)
 
 
 def _register_unified_studio() -> None:
@@ -87,6 +89,9 @@ def _validate() -> None:
         ("/admin/courses", "GET"),
         ("/admin/system", "GET"),
         ("/admin/system/health", "GET"),
+        ("/admin/quality", "GET"),
+        ("/admin/quality/report.json", "GET"),
+        ("/admin/quality/courses/{course_id}", "GET"),
         ("/admin/roles", "GET"),
         ("/admin/users", "GET"),
         ("/admin/users", "POST"),
@@ -135,7 +140,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/api/courses", "/api/platform", "/api/admin", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
+        if path.startswith(("/course-studio", "/api/courses", "/api/platform", "/api/admin", "/admin/authoring", "/admin/system", "/admin/quality", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
