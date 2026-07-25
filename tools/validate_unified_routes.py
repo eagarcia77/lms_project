@@ -7,6 +7,10 @@ REQUIRED = {
     ("/api/me", "GET"),
     ("/api/platform/access", "GET"),
     ("/api/admin/access", "GET"),
+    ("/api/dashboard", "GET"),
+    ("/api/courses", "GET"),
+    ("/api/courses/{course_id}", "GET"),
+    ("/api/xr", "GET"),
     ("/course-studio", "GET"),
     ("/admin", "GET"),
     ("/admin/login", "GET"),
@@ -29,9 +33,11 @@ REQUIRED = {
     ("/admin/authoring", "GET"),
     ("/admin/authoring/courses", "POST"),
     ("/admin/authoring/courses/{course_id}", "GET"),
+    ("/admin/authoring/courses/{course_id}/update", "POST"),
     ("/admin/authoring/courses/{course_id}/modules", "POST"),
     ("/admin/authoring/courses/{course_id}/ai-plan", "POST"),
     ("/admin/authoring/modules/{module_id}", "GET"),
+    ("/admin/authoring/modules/{module_id}/update", "POST"),
     ("/admin/authoring/modules/{module_id}/autosave", "POST"),
     ("/admin/authoring/modules/{module_id}/content", "POST"),
     ("/admin/authoring/modules/{module_id}/resources", "POST"),
@@ -57,16 +63,13 @@ REQUIRED = {
 
 def main() -> None:
     snapshot = [
-        (
-            str(getattr(route, "path", "")),
-            set(getattr(route, "methods", set()) or set()),
-        )
+        (str(getattr(route, "path", "")), set(getattr(route, "methods", set()) or set()))
         for route in app.routes
     ]
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/api/admin", "/api/platform", "/admin", "/course-studio"))
+        if path.startswith(("/api/admin", "/api/platform", "/api/courses", "/admin", "/course-studio"))
     ]
     missing = [
         f"{method} {path}"
