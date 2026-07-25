@@ -2,11 +2,9 @@ from __future__ import annotations
 
 """Entrada única y determinista de producción para NEXUS EDU XR.
 
-La consola administrativa, la gestión de roles, la identidad académica, el
-acceso administrativo desde la portada, el Studio unificado, el Centro de
-Innovación y el Portal Administrativo Integral se incorporan a la misma
-aplicación FastAPI y comparten usuarios, permisos, navegación, datos y
-diagnóstico.
+La consola administrativa, la identidad académica, Course Studio, el catálogo
+visible en la portada y el Centro de Innovación comparten la misma aplicación,
+base de datos y sistema de permisos.
 """
 
 from fastapi import FastAPI
@@ -14,12 +12,14 @@ from fastapi import FastAPI
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.course_management import register_course_management
 from app.home_admin_access import register_home_admin_access
 from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.platform_access import register_platform_access
 from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
+from app.unified_course_catalog import register_unified_course_catalog
 
 AUTHORING_PREFIXES = ("/admin/authoring", "/course-studio", "/course-builder")
 
@@ -53,6 +53,12 @@ def _register_unified_studio() -> None:
 
     app.router.routes = [route for route in app.router.routes if not _is_authoring_route(route)]
     app.router.routes.extend(routes)
+    register_course_management(app)
+    app.openapi_schema = None
+
+
+def _register_catalog() -> None:
+    register_unified_course_catalog(app)
     app.openapi_schema = None
 
 
@@ -71,6 +77,10 @@ def _validate() -> None:
         ("/api/me", "GET"),
         ("/api/platform/access", "GET"),
         ("/api/admin/access", "GET"),
+        ("/api/dashboard", "GET"),
+        ("/api/courses", "GET"),
+        ("/api/courses/{course_id}", "GET"),
+        ("/api/xr", "GET"),
         ("/course-studio", "GET"),
         ("/admin", "GET"),
         ("/admin/login", "GET"),
@@ -91,9 +101,11 @@ def _validate() -> None:
         ("/admin/authoring", "GET"),
         ("/admin/authoring/courses", "POST"),
         ("/admin/authoring/courses/{course_id}", "GET"),
+        ("/admin/authoring/courses/{course_id}/update", "POST"),
         ("/admin/authoring/courses/{course_id}/modules", "POST"),
         ("/admin/authoring/courses/{course_id}/ai-plan", "POST"),
         ("/admin/authoring/modules/{module_id}", "GET"),
+        ("/admin/authoring/modules/{module_id}/update", "POST"),
         ("/admin/authoring/modules/{module_id}/autosave", "POST"),
         ("/admin/authoring/modules/{module_id}/content", "POST"),
         ("/admin/authoring/modules/{module_id}/resources", "POST"),
@@ -123,7 +135,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/api/platform", "/api/admin", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
+        if path.startswith(("/course-studio", "/api/courses", "/api/platform", "/api/admin", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
@@ -132,5 +144,6 @@ def _validate() -> None:
 
 _register_administration()
 _register_unified_studio()
+_register_catalog()
 _register_integrated_portal()
 _validate()
