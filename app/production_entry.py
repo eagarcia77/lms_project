@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.environment_status import register_environment_status
 from app.home_admin_access import register_home_admin_access
 from app.innovation_hub import register_innovation_hub
 from app.main import app
@@ -40,6 +41,11 @@ def _register_administration() -> None:
     register_home_admin_access(app)
 
 
+def _register_environment() -> None:
+    register_environment_status(app)
+    app.openapi_schema = None
+
+
 def _register_unified_studio() -> None:
     isolated = FastAPI(title="NEXUS Unified Authoring Router")
     register_unified_authoring(isolated)
@@ -65,6 +71,7 @@ def _validate() -> None:
     ]
     required = {
         ("/healthz", "GET"),
+        ("/api/release", "GET"),
         ("/course-studio", "GET"),
         ("/admin", "GET"),
         ("/admin/login", "GET"),
@@ -118,7 +125,7 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/api/admin/access", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
+        if path.startswith(("/course-studio", "/api/release", "/api/admin/access", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
     ]
     print("NEXUS unified routes: " + " | ".join(registered), flush=True)
     if missing:
@@ -126,6 +133,7 @@ def _validate() -> None:
 
 
 _register_administration()
+_register_environment()
 _register_unified_studio()
 _register_integrated_portal()
 _validate()
