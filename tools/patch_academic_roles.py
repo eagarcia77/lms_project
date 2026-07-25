@@ -99,8 +99,22 @@ def patch_admin_security() -> int:
 def patch_portal() -> int:
     source = PORTAL_FILE.read_text(encoding="utf-8")
     changes = 0
+
+    desired_nav = '("/admin/users", "Usuarios", "Administradores, instructores y estudiantes", {"superadmin", "user_admin"}),' 
+    if desired_nav not in source:
+        alternatives = (
+            '("/admin/users", "Usuarios", "Administradores y permisos", {"superadmin", "user_admin"}),',
+            '("/admin/users", "Usuarios", "Administradores y permisos"),',
+        )
+        for old_nav in alternatives:
+            if old_nav in source:
+                source = source.replace(old_nav, desired_nav, 1)
+                changes += 1
+                break
+        else:
+            raise RuntimeError("No se encontró el enlace de Usuarios en la navegación del portal.")
+
     replacements = {
-        '("/admin/users", "Usuarios", "Administradores y permisos"),': '("/admin/users", "Usuarios", "Administradores, instructores y estudiantes"),',
         '"admins": _count(conn, "nexus_admin_users", "active=1"),': '"admins": _count(conn, "nexus_admin_users", "active=1 AND role IN (\'superadmin\',\'course_admin\',\'user_admin\',\'support\',\'auditor\')"),\n                "instructors": _count(conn, "nexus_admin_users", "active=1 AND role=\'instructor\'"),\n                "students": _count(conn, "nexus_admin_users", "active=1 AND role=\'student\'"),',
         '<div class="card metric"><strong>{metrics["admins"]}</strong>Administradores activos</div>': '<div class="card metric"><strong>{metrics["admins"]}</strong>Administradores activos</div>\n          <div class="card metric"><strong>{metrics["instructors"]}</strong>Instructores activos</div>\n          <div class="card metric"><strong>{metrics["students"]}</strong>Estudiantes activos</div>',
     }
@@ -134,7 +148,7 @@ def validate() -> None:
     required = {
         "role_management.py": ('"instructor": {', '"student": {', '"label": "Instructor"', '"label": "Estudiante"'),
         "admin_console.py": ('Esta cuenta no tiene un rol administrativo.', 'not in ROLES'),
-        "admin_portal.py": ('Instructores activos', 'Estudiantes activos'),
+        "admin_portal.py": ('Instructores activos', 'Estudiantes activos', 'Administradores, instructores y estudiantes'),
         "app.js": ('state.me.platformRoleLabel',),
     }
     content = {
