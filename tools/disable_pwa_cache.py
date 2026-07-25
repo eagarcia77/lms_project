@@ -9,17 +9,39 @@ SW_JS = ROOT / "app" / "static" / "sw.js"
 MARKER = "NEXUS_PWA_DISABLED_FOR_STABILITY"
 
 APP_CLEANUP = r'''
-    // NEXUS_PWA_DISABLED_FOR_STABILITY
+
+// NEXUS_PWA_DISABLED_FOR_STABILITY
+(function nexusDisablePwaCache() {
+  async function cleanup() {
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.getRegistrations()
-        .then(registrations => Promise.all(registrations.map(registration => registration.unregister())))
-        .catch(() => undefined);
+      try {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.map(registration => registration.unregister()));
+      } catch (_) {
+        // La plataforma continúa aun cuando el navegador bloquee esta operación.
+      }
     }
+
     if ("caches" in window) {
-      caches.keys()
-        .then(keys => Promise.all(keys.filter(key => key.startsWith("nexus-edu-xr-")).map(key => caches.delete(key))))
-        .catch(() => undefined);
+      try {
+        const keys = await caches.keys();
+        await Promise.all(
+          keys
+            .filter(key => key.startsWith("nexus-edu-xr-"))
+            .map(key => caches.delete(key))
+        );
+      } catch (_) {
+        // La ausencia de Cache Storage no impide iniciar la plataforma.
+      }
     }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => void cleanup(), { once: true });
+  } else {
+    void cleanup();
+  }
+})();
 '''
 
 SELF_DESTRUCT_WORKER = r'''// NEXUS_PWA_DISABLED_FOR_STABILITY
@@ -30,37 +52,45 @@ self.addEventListener("install", event => {
 self.addEventListener("activate", event => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(key => key.startsWith("nexus-edu-xr-")).map(key => caches.delete(key))))
+      .then(keys => Promise.all(
+        keys
+          .filter(key => key.startsWith("nexus-edu-xr-"))
+          .map(key => caches.delete(key))
+      ))
       .then(() => self.registration.unregister())
+      .then(() => self.clients.matchAll({ type: "window" }))
+      .then(clients => Promise.all(clients.map(client => client.navigate(client.url))))
+      .catch(() => undefined)
   );
-});
-
-self.addEventListener("fetch", event => {
-  event.respondWith(fetch(event.request));
 });
 '''
 
 
-def patch_app_js(source: str) -> str:
-    if MARKER in source:
-        return source
-
+def remove_service_worker_registration(source: str) -> str:
+    """Remove common service-worker registration forms without relying on layout."""
     patterns = (
-        r'\s*if \("serviceWorker" in navigator\) navigator\.serviceWorker\.register\("/static/sw\.js"\)\.catch\(\(\) => \{\}\);',
-        r'\s*if \(["\']serviceWorker["\'] in navigator\) navigator\.serviceWorker\.register\(["\']/static/sw\.js["\']\)\.catch\([^;]+;',
+        r'(?ms)^\s*if\s*\(\s*["\']serviceWorker["\']\s+in\s+navigator\s*\)\s*'
+        r'navigator\.serviceWorker\.register\s*\(.*?\)\s*\.catch\s*\(.*?\)\s*;?\s*$',
+        r'(?ms)^\s*navigator\.serviceWorker\.register\s*\(.*?\)\s*'
+        r'(?:\.then\s*\(.*?\)\s*)?(?:\.catch\s*\(.*?\)\s*)?;?\s*$',
     )
+    revised = source
     for pattern in patterns:
-        revised, count = re.subn(pattern, "\n" + APP_CLEANUP.rstrip(), source, count=1)
-        if count:
-            return revised
+        revised = re.sub(pattern, "", revised)
+    return revised
 
-    anchor = '    if (new URLSearchParams(location.search).get("google") === "connected") {'
-    if anchor not in source:
-        raise RuntimeError("No se encontró un punto seguro para desactivar el service worker.")
-    return source.replace(anchor, APP_CLEANUP + "\n" + anchor, 1)
+
+def patch_app_js(source: str) -> str:
+    source = remove_service_worker_registration(source)
+    if MARKER not in source:
+        source = source.rstrip() + APP_CLEANUP + "\n"
+    return source
 
 
 def main() -> None:
+    if not APP_JS.is_file():
+        raise RuntimeError("No existe app/static/app.js después de aplicar la base V3.")
+
     app_source = APP_JS.read_text(encoding="utf-8")
     revised = patch_app_js(app_source)
     APP_JS.write_text(revised, encoding="utf-8")
@@ -70,12 +100,16 @@ def main() -> None:
     final_sw = SW_JS.read_text(encoding="utf-8")
     if MARKER not in final_app or MARKER not in final_sw:
         raise RuntimeError("No se completó la desactivación de la caché PWA.")
-    if 'register("/static/sw.js")' in final_app or "new MutationObserver" in final_app:
-        raise RuntimeError("La portada conserva una integración inestable del navegador.")
+    if re.search(r'navigator\.serviceWorker\.register\s*\(', final_app):
+        raise RuntimeError("app.js todavía registra un service worker.")
     if "self.registration.unregister()" not in final_sw:
         raise RuntimeError("El service worker no quedó configurado para retirarse.")
 
-    print("PWA desactivada para estabilidad: cachés eliminadas y service worker retirado.", flush=True)
+    print(
+        "PWA desactivada de forma independiente: registro eliminado, cachés limpiadas "
+        "y service worker retirado.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
