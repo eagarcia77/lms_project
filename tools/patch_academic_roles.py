@@ -165,7 +165,10 @@ if (typeof updateGoogleIdentity === "function") {
   updateGoogleIdentity = async function (...args) {
     const result = await nexusOriginalUpdateGoogleIdentity(...args);
     const subtitle = document.querySelector(".profile-text small");
-    if (subtitle) subtitle.textContent = state.me?.platformRoleLabel || "Cuenta conectada";
+    const roleLabel = state.me && state.me.platformRoleLabel
+      ? state.me.platformRoleLabel
+      : "Cuenta conectada";
+    if (subtitle) subtitle.textContent = roleLabel;
     return result;
   };
 }
@@ -184,7 +187,7 @@ def validate() -> None:
         "role_management.py": ('"instructor": {', '"student": {', '"label": "Instructor"', '"label": "Estudiante"'),
         "admin_console.py": ('Esta cuenta no tiene un rol administrativo.', 'not in ROLES'),
         "admin_portal.py": ('Instructores activos', 'Estudiantes activos', 'Administradores, instructores y estudiantes'),
-        "app.js": ('state.me.platformRoleLabel',),
+        "app.js": ('platformRoleLabel',),
     }
     content = {
         "role_management.py": roles,
