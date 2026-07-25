@@ -16,7 +16,7 @@ jobs:
       - name: Preserve unified overlay and apply authenticated base
         run: |
           mkdir -p /tmp/nexus-overlay/app
-          cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/home_admin_access.py app/platform_access.py app/course_management.py app/unified_course_catalog.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/
+          cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/home_admin_access.py app/platform_access.py app/course_management.py app/unified_course_catalog.py app/quality_center.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/
           cp start_runtime.sh requirements.txt /tmp/nexus-overlay/
           python tools/apply_v3.py
           cp /tmp/nexus-overlay/app/* app/
@@ -26,11 +26,12 @@ jobs:
       - run: python tools/patch_admin_navigation.py
       - run: python tools/patch_admin_portal_roles.py
       - run: python tools/patch_academic_roles.py
+      - run: python tools/patch_quality_navigation.py
       - run: python tools/patch_home_admin_button.py
       - run: python tools/patch_course_catalog_frontend.py
       - run: python tools/bump_course_editor_cache.py
       - run: python tools/fix_unified_authoring_templates.py
-      - run: test -f app/course_management.py && test -f app/unified_course_catalog.py && test -f app/production_entry.py && test -f tools/patch_course_catalog_frontend.py && test -f tools/bump_course_editor_cache.py && test -f tools/smoke_test_course_editing.py
+      - run: test -f app/course_management.py && test -f app/unified_course_catalog.py && test -f app/quality_center.py && test -f app/production_entry.py && test -f tools/patch_course_catalog_frontend.py && test -f tools/patch_quality_navigation.py && test -f tools/bump_course_editor_cache.py && test -f tools/smoke_test_course_editing.py && test -f tools/smoke_test_quality_center.py
       - run: python -m py_compile app/*.py tools/*.py
       - run: python tools/validate_runtime_dependencies.py
       - run: PYTHONPATH=. python tools/validate_unified_routes.py
@@ -40,6 +41,7 @@ jobs:
       - run: PYTHONPATH=. python tools/smoke_test_academic_roles.py
       - run: PYTHONPATH=. python tools/smoke_test_home_admin_button.py
       - run: PYTHONPATH=. python tools/smoke_test_course_editing.py
+      - run: PYTHONPATH=. python tools/smoke_test_quality_center.py
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js && node --check app/static/sw.js
-      - run: grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND' app/static/app.js && grep -q '20260724-course-edit-v5' app/static/index.html && grep -q '20260724-course-edit-v5' app/static/sw.js && grep -q '/admin/authoring/courses/{course_id}/update' app/production_entry.py && grep -q 'Creación y edición unificada' app/course_management.py && grep -q 'Portada y Course Studio conectados' app/unified_course_catalog.py
+      - run: grep -q 'NEXUS_UNIFIED_COURSE_CATALOG_FRONTEND' app/static/app.js && grep -q '20260724-course-edit-v5' app/static/index.html && grep -q '20260724-course-edit-v5' app/static/sw.js && grep -q '/admin/authoring/courses/{course_id}/update' app/production_entry.py && grep -q '/admin/quality/report.json' app/production_entry.py && grep -q 'Creación y edición unificada' app/course_management.py && grep -q 'Portada y Course Studio conectados' app/unified_course_catalog.py && grep -q 'Centro de Calidad Académica' app/quality_center.py
