@@ -7,6 +7,7 @@ REQUIRED = {
     ("/course-studio", "GET"),
     ("/admin", "GET"),
     ("/admin/login", "GET"),
+    ("/api/admin/access", "GET"),
     ("/admin/courses", "GET"),
     ("/admin/roles", "GET"),
     ("/admin/users", "GET"),
@@ -63,7 +64,7 @@ def main() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/admin", "/course-studio"))
+        if path.startswith(("/admin", "/api/admin/access", "/course-studio"))
     ]
     missing = [
         f"{method} {path}"
