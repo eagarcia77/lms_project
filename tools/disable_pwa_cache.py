@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_JS = ROOT / "app" / "static" / "app.js"
 SW_JS = ROOT / "app" / "static" / "sw.js"
 MARKER = "NEXUS_PWA_DISABLED_FOR_STABILITY"
+DISABLED_REGISTER = "(() => Promise.resolve({ unregister: async () => true }))"
 
 APP_CLEANUP = r'''
 
@@ -65,7 +66,7 @@ self.addEventListener("activate", event => {
 
 
 def remove_service_worker_registration(source: str) -> str:
-    """Remove common service-worker registration forms without relying on layout."""
+    """Remove known forms and neutralize every registration call that remains."""
     patterns = (
         r'(?ms)^\s*if\s*\(\s*["\']serviceWorker["\']\s+in\s+navigator\s*\)\s*'
         r'navigator\.serviceWorker\.register\s*\(.*?\)\s*\.catch\s*\(.*?\)\s*;?\s*$',
@@ -75,6 +76,15 @@ def remove_service_worker_registration(source: str) -> str:
     revised = source
     for pattern in patterns:
         revised = re.sub(pattern, "", revised)
+
+    # Any layout or multiline form not removed above is converted to a harmless
+    # promise-returning function. Existing await/then/catch chains remain valid,
+    # but no service worker is registered.
+    revised = re.sub(
+        r'navigator\.serviceWorker\.register\b',
+        DISABLED_REGISTER,
+        revised,
+    )
     return revised
 
 
@@ -98,7 +108,7 @@ def main() -> None:
     final_sw = SW_JS.read_text(encoding="utf-8")
     if MARKER not in final_app or MARKER not in final_sw:
         raise RuntimeError("No se completó la desactivación de la caché PWA.")
-    if re.search(r'navigator\.serviceWorker\.register\s*\(', final_app):
+    if re.search(r'navigator\.serviceWorker\.register\b', final_app):
         raise RuntimeError("app.js todavía registra un service worker.")
     if "self.registration.unregister()" not in final_sw:
         raise RuntimeError("El service worker no quedó configurado para retirarse.")
@@ -106,8 +116,8 @@ def main() -> None:
         raise RuntimeError("El service worker todavía intenta recargar una ventana.")
 
     print(
-        "PWA desactivada de forma independiente: registro eliminado, cachés limpiadas "
-        "y service worker retirado sin recargar la página.",
+        "PWA desactivada de forma universal: todos los registros fueron neutralizados, "
+        "las cachés se limpiarán y el service worker se retirará sin recargar la página.",
         flush=True,
     )
 
