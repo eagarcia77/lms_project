@@ -5,12 +5,14 @@ services:
     plan: free
     region: virginia
     branch: main
-    autoDeployTrigger: commit
+    autoDeployTrigger: checksPass
     healthCheckPath: /healthz
     envVars:
       - key: APP_NAME
         value: NEXUS EDU XR
       - key: APP_ENV
+        value: production
+      - key: RELEASE_CHANNEL
         value: production
       - key: APP_BASE_URL
         value: https://nexus-edu-xr-eagarcia77.onrender.com
