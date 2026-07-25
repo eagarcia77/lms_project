@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,14 +131,41 @@ def patch_portal() -> int:
 
 def patch_profile() -> int:
     source = SCRIPT_FILE.read_text(encoding="utf-8")
-    old = '    $(".profile-text small").textContent = "Cuenta conectada";'
-    new = '    $(".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
-    if new in source:
+    desired_statement = '$('.replace("'", '"') + '".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
+    # Keep the literal easy to validate and avoid depending on the previous label.
+    desired_statement = '$(".profile-text small").textContent = state.me.platformRoleLabel || "Cuenta conectada";'
+    if desired_statement in source:
         return 0
-    if old not in source:
-        raise RuntimeError("No se encontró el texto del perfil para mostrar el rol académico.")
-    SCRIPT_FILE.write_text(source.replace(old, new, 1), encoding="utf-8")
-    return 1
+
+    # Replace any existing assignment to the profile subtitle, regardless of its
+    # current wording or indentation.
+    subtitle_pattern = re.compile(
+        r'(?m)^(?P<indent>\s*)\$\(["\']\.profile-text small["\']\)\.textContent\s*=\s*[^;]+;\s*$'
+    )
+    match = subtitle_pattern.search(source)
+    if match:
+        indent = match.group("indent")
+        source = subtitle_pattern.sub(indent + desired_statement, source, count=1)
+        SCRIPT_FILE.write_text(source, encoding="utf-8")
+        return 1
+
+    # Some generated frontends omit the subtitle assignment. Insert it directly
+    # after the profile name is populated, preserving the existing indentation.
+    name_pattern = re.compile(
+        r'(?m)^(?P<indent>\s*)\$\(["\']\.profile-text strong["\']\)\.textContent\s*=\s*[^;]+;\s*$'
+    )
+    name_match = name_pattern.search(source)
+    if name_match:
+        indent = name_match.group("indent")
+        insertion = name_match.group(0) + "\n" + indent + desired_statement
+        source = source[: name_match.start()] + insertion + source[name_match.end() :]
+        SCRIPT_FILE.write_text(source, encoding="utf-8")
+        return 1
+
+    raise RuntimeError(
+        "No se encontró un punto seguro del perfil para mostrar el rol académico. "
+        "Se esperaba una asignación a .profile-text small o .profile-text strong."
+    )
 
 
 def validate() -> None:
