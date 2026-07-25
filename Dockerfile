@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python tools/patch_google_workspace_scopes.py
 RUN python tools/patch_admin_navigation.py
 RUN python tools/patch_admin_portal_roles.py
+RUN python tools/disable_pwa_cache.py
 RUN python tools/fix_unified_authoring_templates.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
@@ -29,6 +30,7 @@ RUN test -f app/unified_authoring.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
     && test -f tools/patch_admin_portal_roles.py \
+    && test -f tools/disable_pwa_cache.py \
     && test -f tools/fix_unified_authoring_templates.py \
     && test -f tools/validate_runtime_dependencies.py \
     && test -f tools/validate_unified_routes.py \
@@ -40,6 +42,7 @@ RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
     tools/patch_admin_navigation.py \
     tools/patch_admin_portal_roles.py \
+    tools/disable_pwa_cache.py \
     tools/fix_unified_authoring_templates.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py \
@@ -57,7 +60,10 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
     && grep -q '"/admin/roles"' app/admin_portal.py \
-    && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py
+    && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
+    && grep -q "NEXUS_PWA_DISABLED_FOR_STABILITY" app/static/app.js \
+    && grep -q "self.registration.unregister()" app/static/sw.js \
+    && ! grep -q 'register("/static/sw.js")' app/static/app.js
 
 EXPOSE 8000
 CMD ["./start_runtime.sh"]
