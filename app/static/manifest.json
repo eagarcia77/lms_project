@@ -1,7 +1,7 @@
 {
-  "name": "NEXUS EDU XR",
-  "short_name": "NEXUS XR",
-  "description": "Plataforma educativa inmersiva integrada con Google Workspace.",
+  "name": "EAGR Learning XR",
+  "short_name": "EAGR XR",
+  "description": "Plataforma educativa inmersiva integrada con Google Workspace, inteligencia artificial y experiencias XR.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#F3F7F5",
