@@ -11,6 +11,7 @@ if DB_PATH.exists():
 os.environ['DATABASE_URL'] = f'sqlite:///{DB_PATH}'
 os.environ['ENVIRONMENT'] = 'development'
 os.environ['APP_ENV'] = 'development'
+os.environ['APP_NAME'] = 'EAGR Learning XR'
 os.environ['COOKIE_SECURE'] = 'false'
 os.environ['SESSION_SECRET'] = 'portal-session-secret-at-least-thirty-two-characters'
 os.environ['NEXUS_SESSION_SECRET'] = 'portal-admin-secret-at-least-thirty-two-characters'
@@ -29,10 +30,12 @@ def expect(response, status: int, label: str) -> None:
 
 def assert_portal(response, label: str) -> None:
     expect(response, 200, label)
-    required = ('Administración integral', 'Panel general', 'Diseño académico', 'Innovación IA/XR', 'Roles y permisos', 'Sistema')
+    required = ('EAGR Learning XR', 'Administración integral', 'Panel general', 'Diseño académico', 'Innovación IA/XR', 'Roles y permisos', 'Sistema')
     missing = [text for text in required if text not in response.text]
     if missing:
         raise RuntimeError(f'{label}: faltan elementos del portal integrado: {missing}')
+    if 'NEXUS EDU XR' in response.text:
+        raise RuntimeError(f'{label}: todavía muestra la marca pública anterior.')
 
 
 def main() -> None:
@@ -45,7 +48,7 @@ def main() -> None:
 
         dashboard = client.get('/admin')
         assert_portal(dashboard, 'panel general integrado')
-        for text in ('Centro de operaciones de NEXUS EDU XR', 'Operaciones principales', 'Servicios integrados', 'Personas y acceso', 'Gobernanza y continuidad'):
+        for text in ('Centro de operaciones de EAGR Learning XR', 'Operaciones principales', 'Servicios integrados', 'Personas y acceso', 'Gobernanza y continuidad'):
             if text not in dashboard.text:
                 raise RuntimeError(f'El panel general no mostró {text!r}.')
 
@@ -85,7 +88,7 @@ def main() -> None:
 
         expect(client.get('/admin/logout'), 303, 'cierre de sesión')
 
-    print('Portal integrado validado: panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
+    print('Portal EAGR Learning XR validado: panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
 
 
 if __name__ == '__main__':
