@@ -9,7 +9,7 @@ services:
     healthCheckPath: /healthz
     envVars:
       - key: APP_NAME
-        value: NEXUS EDU XR
+        value: NUVEDRA
       - key: APP_ENV
         value: production
       - key: APP_BASE_URL
@@ -29,7 +29,7 @@ services:
       - key: NEXUS_BOOTSTRAP_ADMIN_PASSWORD
         sync: false
       - key: NEXUS_BOOTSTRAP_ADMIN_NAME
-        value: Administrador NEXUS
+        value: Administrador NUVEDRA
       - key: GOOGLE_CLIENT_ID
         sync: false
       - key: GOOGLE_CLIENT_SECRET
@@ -59,7 +59,7 @@ services:
       - key: SMTP_FROM_EMAIL
         sync: false
       - key: SMTP_FROM_NAME
-        value: NEXUS EDU XR
+        value: NUVEDRA
       - key: SMTP_USE_TLS
         value: "true"
       - key: SMTP_USE_SSL
