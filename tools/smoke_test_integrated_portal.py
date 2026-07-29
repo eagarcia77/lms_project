@@ -11,6 +11,7 @@ if DB_PATH.exists():
 os.environ['DATABASE_URL'] = f'sqlite:///{DB_PATH}'
 os.environ['ENVIRONMENT'] = 'development'
 os.environ['APP_ENV'] = 'development'
+os.environ['APP_NAME'] = 'NUVEDRA'
 os.environ['COOKIE_SECURE'] = 'false'
 os.environ['SESSION_SECRET'] = 'portal-session-secret-at-least-thirty-two-characters'
 os.environ['NEXUS_SESSION_SECRET'] = 'portal-admin-secret-at-least-thirty-two-characters'
@@ -20,6 +21,10 @@ os.environ['NEXUS_BOOTSTRAP_ADMIN_NAME'] = 'Administración integrada'
 
 from fastapi.testclient import TestClient  # noqa: E402
 from app.production_entry import app  # noqa: E402
+
+
+PUBLIC_BRAND = 'NUVEDRA'
+LEGACY_PUBLIC_BRAND = 'NEXUS EDU XR'
 
 
 def expect(response, status: int, label: str) -> None:
@@ -33,11 +38,19 @@ def assert_portal(response, label: str) -> None:
     missing = [text for text in required if text not in response.text]
     if missing:
         raise RuntimeError(f'{label}: faltan elementos del portal integrado: {missing}')
+    if PUBLIC_BRAND not in response.text:
+        raise RuntimeError(f'{label}: no mostró la marca pública {PUBLIC_BRAND}.')
+    if LEGACY_PUBLIC_BRAND in response.text:
+        raise RuntimeError(f'{label}: todavía mostró la marca anterior {LEGACY_PUBLIC_BRAND}.')
 
 
 def main() -> None:
     with TestClient(app, follow_redirects=False) as client:
-        expect(client.get('/admin/login'), 200, 'acceso administrativo')
+        login_page = client.get('/admin/login')
+        expect(login_page, 200, 'acceso administrativo')
+        if PUBLIC_BRAND not in login_page.text or LEGACY_PUBLIC_BRAND in login_page.text:
+            raise RuntimeError('La pantalla de acceso administrativo no refleja correctamente la marca NUVEDRA.')
+
         login = client.post('/admin/login', data={'email': 'portal.admin@example.com', 'password': 'Initial-Portal-Password-2026!'})
         expect(login, 303, 'inicio de sesión')
         password = client.post('/admin/password', data={'password': 'Updated-Portal-Password-2026!', 'confirm': 'Updated-Portal-Password-2026!'})
@@ -45,7 +58,7 @@ def main() -> None:
 
         dashboard = client.get('/admin')
         assert_portal(dashboard, 'panel general integrado')
-        for text in ('Centro de operaciones de NEXUS EDU XR', 'Operaciones principales', 'Servicios integrados', 'Personas y acceso', 'Gobernanza y continuidad'):
+        for text in ('Centro de operaciones', 'Operaciones principales', 'Servicios integrados', 'Personas y acceso', 'Gobernanza y continuidad'):
             if text not in dashboard.text:
                 raise RuntimeError(f'El panel general no mostró {text!r}.')
 
@@ -85,7 +98,7 @@ def main() -> None:
 
         expect(client.get('/admin/logout'), 303, 'cierre de sesión')
 
-    print('Portal integrado validado: panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
+    print('Portal NUVEDRA validado: marca, panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
 
 
 if __name__ == '__main__':
