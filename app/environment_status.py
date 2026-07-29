@@ -27,7 +27,7 @@ def _commit_sha() -> str | None:
 def release_payload() -> dict[str, Any]:
     environment = _environment()
     return {
-        "application": os.getenv("APP_NAME", "NEXUS EDU XR"),
+        "application": os.getenv("APP_NAME", "EAGR Learning XR"),
         "environment": environment,
         "releaseChannel": _release_channel(),
         "commit": _commit_sha(),
