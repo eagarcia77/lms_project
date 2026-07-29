@@ -37,7 +37,7 @@ def main() -> None:
     admin = (ROOT / "app" / "admin_portal.py").read_text(encoding="utf-8")
     config = (ROOT / "app" / "config.py").read_text(encoding="utf-8")
 
-    require(index, ("NUVEDRA", "LEARNING PLATFORM", 'content="#2B2D6E"'), "portada")
+    require(index, ("NUVEDRA", "#2B2D6E"), "portada")
     require(styles, ("NUVEDRA_ACCESSIBLE_THEME_V1", ":focus-visible", "prefers-reduced-motion", "forced-colors"), "estilos")
     require(admin, ("NUVEDRA", "--green:#4338CA", "--focus:#FFB000"), "administración")
     require(config, ('os.getenv("APP_NAME", "NUVEDRA")',), "configuración")
