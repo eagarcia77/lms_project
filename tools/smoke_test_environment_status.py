@@ -4,7 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 
-os.environ.setdefault("APP_NAME", "NEXUS EDU XR · STAGING")
+os.environ.setdefault("APP_NAME", "EAGR Learning XR · STAGING")
 os.environ.setdefault("APP_ENV", "staging")
 os.environ.setdefault("RELEASE_CHANNEL", "staging")
 os.environ.setdefault(
@@ -41,6 +41,7 @@ def main() -> None:
         )
     release = release_response.json()
     expected = {
+        "application": "EAGR Learning XR · STAGING",
         "environment": "staging",
         "releaseChannel": "staging",
         "isProduction": False,
@@ -58,7 +59,7 @@ def main() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     styles = STYLES.read_text(encoding="utf-8")
     markers = {
-        "index.html": ('id="environment-banner"', "ENTORNO DE PRUEBA"),
+        "index.html": ('id="environment-banner"', "ENTORNO DE PRUEBA", "EAGR Learning XR"),
         "app.js": ("NEXUS_ENVIRONMENT_BANNER_V1", "/api/release", "isStaging"),
         "styles.css": ("NEXUS_ENVIRONMENT_BANNER_V1", ".environment-banner"),
     }
@@ -70,6 +71,8 @@ def main() -> None:
     missing = {name: values for name, values in missing.items() if values}
     if missing:
         raise RuntimeError(f"Banda de staging incompleta: {missing}")
+    if "NEXUS EDU XR" in index:
+        raise RuntimeError("La portada de staging todavía muestra la marca pública anterior.")
 
     forbidden = ("location.reload(", "new MutationObserver", "client.navigate")
     detected = [value for value in forbidden if value in script]
@@ -77,7 +80,7 @@ def main() -> None:
         raise RuntimeError(f"La interfaz de staging contiene patrones inestables: {detected}")
 
     print(
-        "Entorno staging validado: identidad, ruta de versión y banda visual estables.",
+        "Entorno EAGR Learning XR staging validado: identidad, versión y banda visual estables.",
         flush=True,
     )
 
