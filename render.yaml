@@ -9,7 +9,7 @@ services:
     healthCheckPath: /healthz
     envVars:
       - key: APP_NAME
-        value: NEXUS EDU XR
+        value: EAGR Learning XR
       - key: APP_ENV
         value: production
       - key: RELEASE_CHANNEL
@@ -31,7 +31,7 @@ services:
       - key: NEXUS_BOOTSTRAP_ADMIN_PASSWORD
         sync: false
       - key: NEXUS_BOOTSTRAP_ADMIN_NAME
-        value: Administrador NEXUS
+        value: Administrador EAGR Learning XR
       - key: GOOGLE_CLIENT_ID
         sync: false
       - key: GOOGLE_CLIENT_SECRET
@@ -61,7 +61,7 @@ services:
       - key: SMTP_FROM_EMAIL
         sync: false
       - key: SMTP_FROM_NAME
-        value: NEXUS EDU XR
+        value: EAGR Learning XR
       - key: SMTP_USE_TLS
         value: "true"
       - key: SMTP_USE_SSL
