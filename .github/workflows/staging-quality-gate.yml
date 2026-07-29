@@ -32,6 +32,7 @@ jobs:
             --name nexus-staging-ci \
             --publish 8000:8000 \
             --env PORT=8000 \
+            --env APP_NAME='EAGR Learning XR · STAGING' \
             --env APP_ENV=staging \
             --env RELEASE_CHANNEL=staging \
             --env COOKIE_SECURE=false \
@@ -40,7 +41,7 @@ jobs:
             --env NEXUS_SESSION_SECRET=staging-runtime-admin-secret-at-least-thirty-two-characters \
             --env NEXUS_BOOTSTRAP_ADMIN_EMAIL=staging.ci@example.com \
             --env NEXUS_BOOTSTRAP_ADMIN_PASSWORD=Staging-CI-Password-2026! \
-            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador de pruebas' \
+            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador EAGR Learning XR de pruebas' \
             nexus-edu-xr-staging-ci:${{ github.sha }}
 
       - name: Wait for application health
@@ -55,11 +56,23 @@ jobs:
           docker logs nexus-staging-ci
           exit 1
 
-      - name: Validate key runtime routes
+      - name: Validate EAGR Learning XR runtime
         run: |
           curl --fail --silent http://127.0.0.1:8000/healthz
+          curl --fail --silent http://127.0.0.1:8000/api/release > /tmp/release.json
+          python - <<'PY'
+          import json
+          payload = json.load(open('/tmp/release.json', encoding='utf-8'))
+          assert payload['application'] == 'EAGR Learning XR · STAGING', payload
+          assert payload['isStaging'] is True, payload
+          assert payload['isProduction'] is False, payload
+          PY
+          curl --fail --silent --output /tmp/home.html http://127.0.0.1:8000/
           curl --fail --silent --output /tmp/admin-login.html http://127.0.0.1:8000/admin/login
-          grep -qi 'NEXUS' /tmp/admin-login.html
+          grep -q 'EAGR Learning XR' /tmp/home.html
+          grep -q 'EAGR Learning XR' /tmp/admin-login.html
+          ! grep -q 'NEXUS EDU XR' /tmp/home.html
+          ! grep -q 'NEXUS EDU XR' /tmp/admin-login.html
 
       - name: Show logs on failure
         if: failure()
