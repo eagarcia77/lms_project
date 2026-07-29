@@ -22,11 +22,30 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.production_entry import app  # noqa: E402
 
 
+SAFE_REDIRECT_STATUSES = {302, 303, 307, 308}
+
+
 def expect(response, status: int, label: str) -> None:
     if response.status_code != status:
         raise RuntimeError(
             f"{label}: se esperaba {status} y se recibió {response.status_code}: "
             f"{response.text[:500]}"
+        )
+
+
+def expect_home(response) -> None:
+    if response.status_code == 200:
+        return
+    if response.status_code not in SAFE_REDIRECT_STATUSES:
+        raise RuntimeError(
+            f"portada: se esperaba 200 o una redirección segura y se recibió "
+            f"{response.status_code}: {response.text[:500]}"
+        )
+
+    location = (response.headers.get("location") or "").strip()
+    if not location.startswith("/") or location.startswith("//") or location == "/":
+        raise RuntimeError(
+            f"portada: redirección insegura o cíclica recibida: {location!r}"
         )
 
 
@@ -48,7 +67,7 @@ def main() -> None:
 
     with TestClient(app, follow_redirects=False) as client:
         home = client.get("/")
-        expect(home, 200, "portada")
+        expect_home(home)
 
         anonymous = client.get("/api/admin/access")
         expect(anonymous, 200, "acceso anónimo")
@@ -98,7 +117,8 @@ def main() -> None:
             raise RuntimeError("Administrador permaneció visible después de cerrar sesión.")
 
     print(
-        "Administrador validado: portada, autorización, inicio de sesión, portal y cierre seguro.",
+        "Administrador validado: portada directa o redirección interna segura, autorización, "
+        "inicio de sesión, portal y cierre seguro.",
         flush=True,
     )
 
