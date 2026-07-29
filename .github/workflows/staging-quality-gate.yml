@@ -67,11 +67,38 @@ jobs:
           assert payload['isStaging'] is True, payload
           assert payload['isProduction'] is False, payload
           PY
-          curl --fail --silent --output /tmp/home.html http://127.0.0.1:8000/
+
+          home_status="$(curl --silent --show-error --output /tmp/home-response.html --dump-header /tmp/home-headers.txt --write-out '%{http_code}' http://127.0.0.1:8000/)"
+          case "$home_status" in
+            200)
+              ;;
+            302|303|307|308)
+              home_location="$(awk 'BEGIN{IGNORECASE=1} /^location:/{sub(/^[^:]*:[[:space:]]*/,""); sub(/\r$/,""); print; exit}' /tmp/home-headers.txt)"
+              case "$home_location" in
+                /*)
+                  if [ "$home_location" = "/" ]; then
+                    echo "La portada redirige hacia sí misma."
+                    exit 1
+                  fi
+                  ;;
+                *)
+                  echo "La portada produjo una redirección externa o vacía: $home_location"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "La portada respondió con un estado inesperado: $home_status"
+              cat /tmp/home-response.html
+              exit 1
+              ;;
+          esac
+
+          curl --fail --silent --output /tmp/static-home.html http://127.0.0.1:8000/static/index.html
           curl --fail --silent --output /tmp/admin-login.html http://127.0.0.1:8000/admin/login
-          grep -q 'EAGR Learning XR' /tmp/home.html
+          grep -q 'EAGR Learning XR' /tmp/static-home.html
           grep -q 'EAGR Learning XR' /tmp/admin-login.html
-          ! grep -q 'NEXUS EDU XR' /tmp/home.html
+          ! grep -q 'NEXUS EDU XR' /tmp/static-home.html
           ! grep -q 'NEXUS EDU XR' /tmp/admin-login.html
 
       - name: Show logs on failure
