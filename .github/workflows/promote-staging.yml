@@ -45,7 +45,8 @@ jobs:
             --name nexus-release-candidate \
             --publish 8000:8000 \
             --env PORT=8000 \
-            --env APP_ENV=release-candidate \
+            --env APP_NAME='EAGR Learning XR' \
+            --env APP_ENV=production \
             --env RELEASE_CHANNEL=release-candidate \
             --env COOKIE_SECURE=false \
             --env DATABASE_URL=sqlite:////tmp/nexus-release-candidate.db \
@@ -53,16 +54,27 @@ jobs:
             --env NEXUS_SESSION_SECRET=release-candidate-admin-secret-at-least-thirty-two-characters \
             --env NEXUS_BOOTSTRAP_ADMIN_EMAIL=release.candidate@example.com \
             --env NEXUS_BOOTSTRAP_ADMIN_PASSWORD=Release-Candidate-Password-2026! \
-            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador de publicación' \
+            --env NEXUS_BOOTSTRAP_ADMIN_NAME='Administrador EAGR Learning XR de publicación' \
             nexus-edu-xr-release-candidate:${{ github.sha }}
 
-      - name: Validate release candidate runtime
+      - name: Validate EAGR Learning XR release candidate
         run: |
           for attempt in $(seq 1 40); do
             if curl --fail --silent http://127.0.0.1:8000/healthz > /tmp/release-health.json; then
               cat /tmp/release-health.json
+              curl --fail --silent http://127.0.0.1:8000/api/release > /tmp/release.json
+              curl --fail --silent --output /tmp/release-home.html http://127.0.0.1:8000/
               curl --fail --silent --output /tmp/release-admin.html http://127.0.0.1:8000/admin/login
-              grep -qi 'NEXUS' /tmp/release-admin.html
+              python - <<'PY'
+              import json
+              payload = json.load(open('/tmp/release.json', encoding='utf-8'))
+              assert payload['application'] == 'EAGR Learning XR', payload
+              assert payload['isProduction'] is True, payload
+              PY
+              grep -q 'EAGR Learning XR' /tmp/release-home.html
+              grep -q 'EAGR Learning XR' /tmp/release-admin.html
+              ! grep -q 'NEXUS EDU XR' /tmp/release-home.html
+              ! grep -q 'NEXUS EDU XR' /tmp/release-admin.html
               exit 0
             fi
             sleep 2
@@ -86,9 +98,9 @@ jobs:
             exit 0
           fi
 
-          notes="${RELEASE_NOTES:-Promoción validada desde el entorno staging.}"
+          notes="${RELEASE_NOTES:-Cambio de marca validado a EAGR Learning XR desde staging.}"
           gh pr create \
             --base main \
             --head staging \
-            --title "Publicar staging en producción" \
-            --body "## Candidato de publicación\n\n$notes\n\n### Validaciones completadas\n- Construcción Docker idéntica a Render\n- Pruebas incluidas en el Dockerfile\n- Inicio del contenedor\n- Verificación de /healthz\n- Verificación de /admin/login\n\nLa publicación en Render ocurrirá después de revisar y fusionar este Pull Request y de que los controles de CI de main terminen correctamente."
+            --title "Publicar EAGR Learning XR en producción" \
+            --body "## Candidato de publicación: EAGR Learning XR\n\n$notes\n\n### Validaciones completadas\n- Construcción Docker idéntica a Render\n- Pruebas incluidas en el Dockerfile\n- Inicio del contenedor\n- Verificación de /healthz y /api/release\n- Verificación de portada y /admin/login\n- Confirmación de la nueva marca y ausencia del nombre público anterior\n\nLa publicación en Render ocurrirá después de revisar y fusionar este Pull Request y de que los controles de CI de main terminen correctamente."
