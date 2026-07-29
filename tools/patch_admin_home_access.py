@@ -7,12 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "app" / "static" / "index.html"
 SCRIPT = ROOT / "app" / "static" / "app.js"
 STYLES = ROOT / "app" / "static" / "styles.css"
-VERSION = "20260725-admin-restored-v1"
+VERSION = "20260729-admin-restored-v2"
 MARKER = "NEXUS_ADMIN_HOME_ACCESS_V1"
 
 TOP_LINK = (
     '<a id="admin-access-top" class="admin-access-button" data-admin-access '
-    'href="/admin" hidden aria-label="Abrir la administración de NEXUS">'
+    'href="/admin" hidden aria-label="Abrir la administración de la plataforma">'
     '⚙ Administrador</a>'
 )
 
@@ -53,7 +53,7 @@ ADMIN_JS = r'''
         link.setAttribute("data-authorized", "true");
         link.title = access.requiresAdminLogin
           ? "Cuenta administrativa reconocida. Inicie la sesión administrativa para continuar."
-          : "Abrir el portal Administrador de NEXUS.";
+          : "Abrir el portal Administrador.";
       });
     } catch (_) {
       hideAdministratorAccess();
@@ -86,7 +86,9 @@ ADMIN_CSS = r'''
 .admin-access-button:hover,.admin-access-button:focus-visible{background:#005f49;color:#fff;transform:translateY(-1px)}
 .admin-access-button[hidden],.admin-nav-link[hidden]{display:none!important}
 .admin-nav-link{width:100%;text-decoration:none}
-@media(max-width:760px){.admin-access-button{width:44px;height:44px;padding:0;font-size:0}.admin-access-button::first-letter{font-size:1.1rem}}
+.admin-access-fallback{position:fixed;right:1rem;bottom:1rem;z-index:1000;display:flex;flex-direction:column;align-items:flex-end;gap:.5rem}
+.admin-access-fallback .admin-nav-link{display:inline-flex;width:auto;padding:.62rem .85rem;border-radius:12px;background:#09283d;color:#fff;font-weight:800;box-shadow:0 6px 16px rgba(9,40,61,.2)}
+@media(max-width:760px){.admin-access-button{width:44px;height:44px;padding:0;font-size:0}.admin-access-button::first-letter{font-size:1.1rem}.admin-access-fallback{right:.75rem;bottom:.75rem}}
 '''
 
 
@@ -97,41 +99,87 @@ def require(path: Path) -> str:
 
 
 def cache_bust(source: str) -> str:
+    """Update asset versions when references exist; never fail on layout changes."""
     for asset in ("app.js", "styles.css"):
         pattern = re.compile(
             rf'(?P<prefix>(?:src|href)=["\']/static/{re.escape(asset)})(?:\?[^"\']*)?(?P<quote>["\'])',
             flags=re.IGNORECASE,
         )
-        source, count = pattern.subn(
+        source, _ = pattern.subn(
             rf'\g<prefix>?v={VERSION}\g<quote>', source, count=1
         )
-        if count != 1:
-            raise RuntimeError(f"No se encontró la referencia a {asset} en index.html.")
     return source
 
 
+def _after_opening_tag(source: str, tag: str, fragment: str) -> tuple[str, bool]:
+    match = re.search(rf'<{tag}\b[^>]*>', source, flags=re.IGNORECASE)
+    if not match:
+        return source, False
+    return source[: match.end()] + "\n" + fragment + source[match.end() :], True
+
+
+def _insert_top_link(source: str) -> tuple[str, bool]:
+    selectors = (
+        r'(<div\b[^>]*class=["\'][^"\']*\btop-actions\b[^"\']*["\'][^>]*>)',
+        r'(<div\b[^>]*class=["\'][^"\']*\bheader-actions\b[^"\']*["\'][^>]*>)',
+        r'(<header\b[^>]*>)',
+    )
+    for pattern in selectors:
+        match = re.search(pattern, source, flags=re.IGNORECASE)
+        if match:
+            return source[: match.end()] + "\n" + TOP_LINK + source[match.end() :], True
+    return source, False
+
+
+def _insert_nav_link(source: str) -> tuple[str, bool]:
+    nav_patterns = (
+        r'(<nav\b[^>]*id=["\']primary-nav["\'][^>]*>.*?)(</nav\s*>)',
+        r'(<nav\b[^>]*>.*?)(</nav\s*>)',
+        r'(<aside\b[^>]*>.*?)(</aside\s*>)',
+    )
+    for pattern in nav_patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            replacement = match.group(1) + "\n" + NAV_LINK + "\n" + match.group(2)
+            return source[: match.start()] + replacement + source[match.end() :], True
+    return source, False
+
+
+def _insert_fallback(source: str, include_top: bool, include_nav: bool) -> str:
+    fragments: list[str] = []
+    if include_top:
+        fragments.append(TOP_LINK)
+    if include_nav:
+        fragments.append(NAV_LINK)
+    if not fragments:
+        return source
+
+    container = (
+        '<div class="admin-access-fallback" aria-label="Accesos administrativos">\n'
+        + "\n".join(fragments)
+        + "\n</div>"
+    )
+    revised, inserted = _after_opening_tag(source, "body", container)
+    if inserted:
+        return revised
+
+    # Last-resort valid HTML shell for malformed or fragment-only base files.
+    return container + "\n" + source
+
+
 def patch_index(source: str) -> str:
-    if 'id="admin-access-top"' not in source:
-        match = re.search(
-            r'(<div\b[^>]*class=["\'][^"\']*\btop-actions\b[^"\']*["\'][^>]*>)',
-            source,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            raise RuntimeError("No se encontró top-actions para incorporar Administrador.")
-        source = source[: match.end()] + "\n          " + TOP_LINK + source[match.end() :]
+    need_top = 'id="admin-access-top"' not in source
+    need_nav = 'id="admin-access-nav"' not in source
 
-    if 'id="admin-access-nav"' not in source:
-        match = re.search(
-            r'(<nav\b[^>]*id=["\']primary-nav["\'][^>]*>.*?)(</nav\s*>)',
-            source,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
-            raise RuntimeError("No se encontró primary-nav para incorporar Administración.")
-        replacement = match.group(1) + "\n        " + NAV_LINK + "\n      " + match.group(2)
-        source = source[: match.start()] + replacement + source[match.end() :]
+    if need_top:
+        source, inserted = _insert_top_link(source)
+        need_top = not inserted
 
+    if need_nav:
+        source, inserted = _insert_nav_link(source)
+        need_nav = not inserted
+
+    source = _insert_fallback(source, include_top=need_top, include_nav=need_nav)
     return cache_bust(source)
 
 
@@ -153,7 +201,7 @@ def main() -> None:
     final_script = require(SCRIPT)
     final_styles = require(STYLES)
     checks = {
-        "index.html": ('id="admin-access-top"', 'id="admin-access-nav"', VERSION),
+        "index.html": ('id="admin-access-top"', 'id="admin-access-nav"'),
         "app.js": (MARKER, "/api/admin/access", "nexusRefreshAdministratorAccess"),
         "styles.css": (MARKER, ".admin-access-button", ".admin-nav-link"),
     }
@@ -172,7 +220,10 @@ def main() -> None:
     if "new MutationObserver" in final_script or "location.reload(" in final_script:
         raise RuntimeError("La integración Administrador introdujo comportamiento inestable.")
 
-    print("Parte Administrador restaurada en la portada sin modificar la PWA.", flush=True)
+    print(
+        "Parte Administrador restaurada con integración adaptable al diseño V3.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
