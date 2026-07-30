@@ -18,10 +18,16 @@ def main() -> None:
             'data-testid="visual-course-studio"',
             'data-testid="visual-module-studio"',
             'data-testid="visual-item-editor"',
+            'data-testid="instructor-course-preview"',
+            'data-testid="instructor-item-preview"',
+            'NUVEDRA_VISUAL_STUDIO_PREVIEW_V1',
             'visual_studio_item_created',
             'visual_studio_item_updated',
             'assessment_response_type',
             'administrator_enabled_as_instructor',
+            'due_at=due_at.strip(), status="draft")',
+            'due_at=str(item.get("due_at") or ""), status="draft")',
+            'due_at=str(source.get("due_at") or ""), status="draft")',
         ),
     )
     require(
