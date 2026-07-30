@@ -9,7 +9,7 @@ COPY . .
 # Preserve NUVEDRA extensions while allowing the authenticated V3 package to
 # keep its own google_api.py contract used by app/main.py.
 RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
-    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/course_editor_access.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
@@ -29,6 +29,7 @@ RUN python app/patch_public_homepage_runtime.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
     && test -f app/course_workspace.py \
+    && test -f app/course_editor_access.py \
     && test -f app/academic_portal.py \
     && test -f app/academic_access.py \
     && test -f app/faculty_portal.py \
@@ -61,7 +62,8 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/smoke_test_nuvedra_branding.py \
     && test -f tools/smoke_test_course_workspace.py \
     && test -f tools/smoke_test_academic_roles.py \
-    && test -f tools/smoke_test_platform_upgrade.py
+    && test -f tools/smoke_test_platform_upgrade.py \
+    && test -f tools/smoke_test_course_editor_access.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
@@ -78,7 +80,8 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_nuvedra_branding.py \
     tools/smoke_test_course_workspace.py \
     tools/smoke_test_academic_roles.py \
-    tools/smoke_test_platform_upgrade.py
+    tools/smoke_test_platform_upgrade.py \
+    tools/smoke_test_course_editor_access.py
 # The production image is Python-only. JavaScript syntax is validated in CI,
 # while Docker verifies that frontend files exist, are UTF-8 and non-empty.
 RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js'),Path('app/static/i18n.js')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos JavaScript vacíos'"
@@ -94,6 +97,7 @@ RUN PYTHONPATH=. python tools/smoke_test_nuvedra_branding.py
 RUN PYTHONPATH=. python tools/smoke_test_course_workspace.py
 RUN PYTHONPATH=. python tools/smoke_test_academic_roles.py
 RUN PYTHONPATH=. python tools/smoke_test_platform_upgrade.py
+RUN PYTHONPATH=. python tools/smoke_test_course_editor_access.py
 RUN grep -q "store_token" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
@@ -102,6 +106,8 @@ RUN grep -q "store_token" app/google_api.py \
     && grep -q '"/admin/home-content"' app/admin_portal.py \
     && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
     && grep -q "NUVEDRA Course Workspace" app/course_workspace.py \
+    && grep -q "register_course_editor_access" app/production_entry.py \
+    && grep -q "administrator_enabled_as_instructor" app/course_editor_access.py \
     && grep -q "google-hub" app/course_workspace.py \
     && grep -q "Tecnologías emergentes" app/course_workspace.py \
     && grep -q "course_created_and_professor_assigned" app/academic_access.py \
