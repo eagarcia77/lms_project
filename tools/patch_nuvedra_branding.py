@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -121,6 +122,38 @@ def patch_manifest() -> None:
     write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
+def ensure_home_content_navigation(text: str) -> str:
+    if '"/admin/home-content"' in text:
+        return text
+
+    role_aware = "def _navigation(role:" in text
+    insertion = (
+        '("/admin/home-content", "Portada y anuncios", "Banners, avisos y programación", {"superadmin", "course_admin"}),' 
+        if role_aware
+        else '("/admin/home-content", "Portada y anuncios", "Banners, avisos y programación"),'
+    )
+    markers = (
+        '("/admin", "Panel general", "Inicio y operaciones", all_roles),',
+        '("/admin", "Panel general", "Inicio y operaciones"),',
+    )
+    for marker in markers:
+        if marker in text:
+            text = text.replace(marker, f"{marker}\n        {insertion}", 1)
+            break
+
+    if '"/admin/home-content"' not in text:
+        pattern = re.compile(
+            r'(?P<line>\(\s*["\']/admin["\']\s*,\s*["\']Panel general["\']\s*,\s*["\']Inicio y operaciones["\'](?:\s*,\s*all_roles)?\s*\),)'
+        )
+        text, count = pattern.subn(lambda match: f"{match.group('line')}\n        {insertion}", text, count=1)
+        if count == 0:
+            raise RuntimeError("No se encontró el punto de inserción para Portada y anuncios.")
+
+    if '"/admin/home-content"' not in text:
+        raise RuntimeError("No se pudo incorporar Portada y anuncios a la navegación administrativa.")
+    return text
+
+
 def patch_python_files() -> None:
     for path in PUBLIC_FILES:
         if not path.is_file():
@@ -129,12 +162,7 @@ def patch_python_files() -> None:
         if path.name == "config.py":
             text = text.replace('os.getenv("APP_NAME", "NEXUS")', 'os.getenv("APP_NAME", "NUVEDRA")')
         if path.name == "admin_portal.py":
-            if '"/admin/home-content"' not in text:
-                text = text.replace(
-                    '("/admin", "Panel general", "Inicio y operaciones"),',
-                    '("/admin", "Panel general", "Inicio y operaciones"),\n        ("/admin/home-content", "Portada y anuncios", "Banners, avisos y programación"),',
-                    1,
-                )
+            text = ensure_home_content_navigation(text)
             text = text.replace(
                 ':root{--navy:#09283d;--green:#007b5f;--gold:#fed141;--blue:#185adb;--ink:#172033;--muted:#586b7d;--soft:#f3f7f8;--line:#cbd7df;--white:#fff;--danger:#a61b1b;--focus:#ffbf47}',
                 ':root{--navy:#171A2B;--green:#4338CA;--gold:#FFB000;--blue:#4338CA;--ink:#171A2B;--muted:#4B5563;--soft:#F7F8FC;--line:#D7DBE8;--white:#fff;--danger:#A61B1B;--focus:#FFB000}',
