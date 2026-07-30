@@ -53,10 +53,12 @@ def register_student_portal(app: FastAPI) -> None:
         if item.get("embed_url"):
             embed = f'<iframe src="{esc(item.get("embed_url"), attr=True)}" title="{esc(item.get("title"), attr=True)}" allow="fullscreen; xr-spatial-tracking"></iframe>'
         assessment = ""
-        if str(item.get("item_type")) in ASSESSMENT_TYPES:
+        if str(item.get("item_type")) in ASSESSMENT_TYPES and str(access.get("course_role")) == "student":
             existing = submissions[0] if submissions else {}
             saved = '<p class="success">Su respuesta está guardada. Puede actualizarla mientras la evaluación esté disponible.</p>' if submissions else ""
             assessment = f'''<section class="card"><h3>Responder evaluación</h3>{saved}<form method="post" action="/learn/items/{item_id}/submit"><label>Respuesta<textarea name="response_text" required>{esc(existing.get("response_text"))}</textarea></label><label>Enlace de evidencia (opcional)<input type="url" name="response_url" value="{esc(existing.get("response_url"), attr=True)}"></label><button>Guardar y entregar</button></form></section>'''
+        elif str(item.get("item_type")) in ASSESSMENT_TYPES:
+            assessment = '<p class="notice">El rol de observador permite consultar la evaluación, pero no enviar respuestas.</p>'
         body = f'<p><a href="/learn/courses/{course_id}">&larr; Volver al curso</a></p><section class="card content-body"><span class="badge">{esc(item.get("item_type"))}</span><h2>{esc(item["title"])}</h2>{item.get("body_html") or ""}{external}{embed}</section>{assessment}'
         return portal_page("Contenido", body, user)
 
