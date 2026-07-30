@@ -5,9 +5,9 @@ from urllib.parse import quote
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from app import google_api
 from app.academic_access import AUTHOR_ROLES, STUDENT_ROLES, esc, google_user, portal_page, remove_route, safe_next
 from app.admin_console import audit, db, require_admin
-from app.google_api import TOKEN_STORE, build_authorization_url, exchange_code, google_get
 from app.unified_authoring import PREFIX, _insert_item, _module
 
 
@@ -19,7 +19,7 @@ def register_portal_home_and_google(app: FastAPI) -> None:
         target = safe_next(next)
         request.session["post_google_redirect"] = target
         try:
-            return RedirectResponse(build_authorization_url(request), status_code=303)
+            return RedirectResponse(google_api.build_authorization_url(request), status_code=303)
         except HTTPException as exc:
             body = f'<section class="card"><h2>Google todavía no está configurado</h2><p>{esc(exc.detail)}</p><p class="notice">El administrador debe configurar GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI en Render.</p><a class="button" href="/login">Volver</a></section>'
             return portal_page("Conectar Google", body)
@@ -30,15 +30,16 @@ def register_portal_home_and_google(app: FastAPI) -> None:
 
     @app.get("/auth/google/callback", response_model=None)
     async def google_callback(request: Request, code: str, state: str):
-        await exchange_code(request, code, state)
+        await google_api.exchange_code(request, code, state)
         target = safe_next(str(request.session.pop("post_google_redirect", "/portal")))
         return RedirectResponse(target, status_code=303)
 
     @app.get("/portal/logout", response_model=None)
     async def portal_logout(request: Request):
         sid = request.session.get("sid")
-        if sid:
-            TOKEN_STORE.pop(str(sid), None)
+        token_store = getattr(google_api, "TOKEN_STORE", None)
+        if sid and isinstance(token_store, dict):
+            token_store.pop(str(sid), None)
         request.session.pop("sid", None)
         request.session.pop("user", None)
         return RedirectResponse("/login", status_code=303)
@@ -70,6 +71,8 @@ def register_portal_home_and_google(app: FastAPI) -> None:
             for row in enrollments if str(row.get("course_role")) in STUDENT_ROLES and str(row.get("course_status")) == "active"
         )
         body = '<h2>Mis cursos</h2><p class="muted">Las funciones dependen del rol asignado por el administrador.</p>'
+        if user.get("_auth_source") == "admin":
+            body += '<p class="notice"><strong>Administrador e instructor:</strong> está utilizando su sesión administrativa. Solo verá herramientas docentes en los cursos donde su correo tenga el rol de instructor.</p>'
         if author_cards:
             body += f'<h3>Cursos que desarrollo</h3><div class="grid">{author_cards}</div>'
         if student_cards:
@@ -89,7 +92,7 @@ def register_portal_home_and_google(app: FastAPI) -> None:
         message = ""
         if request.session.get("sid"):
             try:
-                payload = await google_get(
+                payload = await google_api.google_get(
                     request,
                     "https://www.googleapis.com/drive/v3/files",
                     params={"q": "trashed=false", "pageSize": 30, "orderBy": "modifiedTime desc", "fields": "files(id,name,mimeType,webViewLink,modifiedTime)"},
