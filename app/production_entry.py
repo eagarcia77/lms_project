@@ -17,6 +17,7 @@ from app.academic_portal import register_academic_portal
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.course_editor_access import register_course_editor_access
 from app.course_workspace import ALL_ITEM_TYPES, register_course_workspace
 from app.home_content import register_home_content
 from app.innovation_hub import register_innovation_hub
@@ -143,6 +144,7 @@ def _validate() -> None:
         ("/admin/authoring/courses", "POST"),
         ("/admin/authoring/courses/{course_id}", "GET"),
         ("/admin/authoring/courses/{course_id}/update", "POST"),
+        ("/admin/authoring/courses/{course_id}/open-editor", "POST"),
         ("/admin/authoring/courses/{course_id}/modules", "POST"),
         ("/admin/authoring/courses/{course_id}/ai-plan", "POST"),
         ("/admin/authoring/courses/{course_id}/google-hub", "GET"),
@@ -150,6 +152,7 @@ def _validate() -> None:
         ("/admin/authoring/courses/{course_id}/emerging", "GET"),
         ("/admin/authoring/courses/{course_id}/emerging/add", "POST"),
         ("/admin/authoring/modules/{module_id}", "GET"),
+        ("/admin/authoring/modules/{module_id}/open-editor", "POST"),
         ("/admin/authoring/modules/{module_id}/edit", "GET"),
         ("/admin/authoring/modules/{module_id}/edit", "POST"),
         ("/admin/authoring/modules/{module_id}/autosave", "POST"),
@@ -200,4 +203,5 @@ _register_unified_studio()
 _register_integrated_portal()
 _register_public_login()
 register_platform_upgrade(app)
+register_course_editor_access(app)
 _validate()
