@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Entrada única y determinista de producción para NUVEDRA.
 
-La consola administrativa, la gestión de roles, el Studio unificado, el Centro
-de Innovación, la administración de la portada y el Portal Administrativo
-Integral se incorporan a la misma aplicación FastAPI.
+La consola administrativa, la gestión de roles, el Studio unificado, Google Hub,
+las tecnologías emergentes, el Centro de Innovación, la administración de la
+portada y el Portal Administrativo Integral se incorporan a la misma aplicación
+FastAPI.
 """
 
 from pathlib import Path
@@ -15,6 +16,7 @@ from fastapi.responses import FileResponse
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.course_workspace import register_course_workspace
 from app.home_content import register_home_content
 from app.innovation_hub import register_innovation_hub
 from app.main import app
@@ -70,6 +72,7 @@ def _register_unified_studio() -> None:
 
 def _register_integrated_portal() -> None:
     register_admin_portal(app)
+    register_course_workspace(app)
     register_home_content(app)
     app.openapi_schema = None
 
@@ -121,9 +124,16 @@ def _validate() -> None:
         ("/admin/authoring", "GET"),
         ("/admin/authoring/courses", "POST"),
         ("/admin/authoring/courses/{course_id}", "GET"),
+        ("/admin/authoring/courses/{course_id}/update", "POST"),
         ("/admin/authoring/courses/{course_id}/modules", "POST"),
         ("/admin/authoring/courses/{course_id}/ai-plan", "POST"),
+        ("/admin/authoring/courses/{course_id}/google-hub", "GET"),
+        ("/admin/authoring/courses/{course_id}/google-hub/create", "POST"),
+        ("/admin/authoring/courses/{course_id}/emerging", "GET"),
+        ("/admin/authoring/courses/{course_id}/emerging/add", "POST"),
         ("/admin/authoring/modules/{module_id}", "GET"),
+        ("/admin/authoring/modules/{module_id}/edit", "GET"),
+        ("/admin/authoring/modules/{module_id}/edit", "POST"),
         ("/admin/authoring/modules/{module_id}/autosave", "POST"),
         ("/admin/authoring/modules/{module_id}/content", "POST"),
         ("/admin/authoring/modules/{module_id}/resources", "POST"),
@@ -132,6 +142,8 @@ def _validate() -> None:
         ("/admin/authoring/modules/{module_id}/drive", "GET"),
         ("/admin/authoring/modules/{module_id}/drive-link", "POST"),
         ("/admin/authoring/modules/{module_id}/odf/{kind}", "GET"),
+        ("/admin/authoring/items/{item_id}/edit", "GET"),
+        ("/admin/authoring/items/{item_id}/edit", "POST"),
         ("/admin/authoring/items/{item_id}/forum", "GET"),
         ("/admin/authoring/items/{item_id}/forum", "POST"),
         ("/admin/authoring/items/{item_id}/preview", "GET"),
