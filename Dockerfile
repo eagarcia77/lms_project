@@ -6,11 +6,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
-# Preserve the consolidated authoring, innovation, role management,
-# homepage content management and administration layers while applying
-# the authenticated V3 base package.
+# Preserve the consolidated authoring, innovation, course workspace, role
+# management, homepage content management and administration layers while
+# applying the authenticated V3 base package.
 RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
-    && cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
@@ -29,6 +29,7 @@ RUN python tools/patch_nuvedra_branding.py
 RUN python app/patch_public_homepage_runtime.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
+    && test -f app/course_workspace.py \
     && test -f app/admin_portal.py \
     && test -f app/role_management.py \
     && test -f app/production_entry.py \
@@ -50,7 +51,8 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/smoke_test_admin_flow.py \
     && test -f tools/smoke_test_integrated_portal.py \
     && test -f tools/smoke_test_role_management.py \
-    && test -f tools/smoke_test_nuvedra_branding.py
+    && test -f tools/smoke_test_nuvedra_branding.py \
+    && test -f tools/smoke_test_course_workspace.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
@@ -64,7 +66,8 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_admin_flow.py \
     tools/smoke_test_integrated_portal.py \
     tools/smoke_test_role_management.py \
-    tools/smoke_test_nuvedra_branding.py
+    tools/smoke_test_nuvedra_branding.py \
+    tools/smoke_test_course_workspace.py
 # The production image is Python-only. JavaScript syntax is validated in CI,
 # while Docker verifies that both frontend files exist, are UTF-8 and non-empty.
 RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos JavaScript vacíos'"
@@ -77,12 +80,16 @@ RUN PYTHONPATH=. python tools/smoke_test_admin_flow.py
 RUN PYTHONPATH=. python tools/smoke_test_integrated_portal.py
 RUN PYTHONPATH=. python tools/smoke_test_role_management.py
 RUN PYTHONPATH=. python tools/smoke_test_nuvedra_branding.py
+RUN PYTHONPATH=. python tools/smoke_test_course_workspace.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
     && grep -q '"/admin/roles"' app/admin_portal.py \
     && grep -q '"/admin/home-content"' app/admin_portal.py \
     && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
+    && grep -q "NUVEDRA Course Workspace" app/course_workspace.py \
+    && grep -q "google-hub" app/course_workspace.py \
+    && grep -q "Tecnologías emergentes" app/course_workspace.py \
     && grep -q "NUVEDRA" app/static/index.html \
     && grep -q "/api/home-content" app/static/app.js \
     && grep -q "NUVEDRA_PUBLIC_LOGIN_SAFE_V1" app/static/app.js \
