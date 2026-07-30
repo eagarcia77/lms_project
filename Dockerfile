@@ -15,7 +15,6 @@ RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
     && cp /tmp/nexus-overlay/app/* app/ \
-    && rm -rf app/static \
     && mkdir -p app/static \
     && cp -a /tmp/nexus-overlay/static/. app/static/ \
     && cp /tmp/nexus-overlay/start_runtime.sh /tmp/nexus-overlay/requirements.txt ./
@@ -36,6 +35,7 @@ RUN test -f app/unified_authoring.py \
     && test -f app/admin_authoring_v6.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
+    && test -f app/static/auth.js \
     && test -f app/static/assets/nuvedra-logo.svg \
     && test -f app/static/assets/nuvedra-hero.svg \
     && test -f tools/patch_admin_portal_roles.py \
@@ -62,6 +62,7 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_integrated_portal.py \
     tools/smoke_test_role_management.py \
     tools/smoke_test_nuvedra_branding.py
+RUN node --check app/static/app.js && node --check app/static/auth.js
 RUN python tools/validate_runtime_dependencies.py
 RUN APP_NAME=NUVEDRA \
     SESSION_SECRET=build-verification-session-secret-change-in-production \
