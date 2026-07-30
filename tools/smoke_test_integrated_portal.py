@@ -46,6 +46,14 @@ def assert_portal(response, label: str) -> None:
 
 def main() -> None:
     with TestClient(app, follow_redirects=False) as client:
+        public_login = client.get('/login')
+        expect(public_login, 200, 'portada pública de acceso')
+        for text in ('NUVEDRA', 'Bienvenido a', 'Continuar con Google', 'Anuncios y novedades'):
+            if text not in public_login.text:
+                raise RuntimeError(f'La portada pública no mostró {text!r}.')
+        if LEGACY_PUBLIC_BRAND in public_login.text:
+            raise RuntimeError('La portada pública todavía mostró la marca anterior.')
+
         login_page = client.get('/admin/login')
         expect(login_page, 200, 'acceso administrativo')
         if PUBLIC_BRAND not in login_page.text or LEGACY_PUBLIC_BRAND in login_page.text:
@@ -98,7 +106,7 @@ def main() -> None:
 
         expect(client.get('/admin/logout'), 303, 'cierre de sesión')
 
-    print('Portal NUVEDRA validado: marca, panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
+    print('Portal NUVEDRA validado: portada pública, marca, panel, diseño, innovación, roles, cursos, usuarios, matrículas, auditoría, sistema y respaldo.', flush=True)
 
 
 if __name__ == '__main__':
