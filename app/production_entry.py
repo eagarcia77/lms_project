@@ -3,9 +3,9 @@ from __future__ import annotations
 """Entrada única y determinista de producción para NUVEDRA.
 
 La consola administrativa, la gestión de roles, el Studio unificado, Google Hub,
-las tecnologías emergentes, el Centro de Innovación, la administración de la
-portada y el Portal Administrativo Integral se incorporan a la misma aplicación
-FastAPI.
+las tecnologías emergentes, el Centro de Innovación, el portal académico por
+roles, la administración de la portada y el Portal Administrativo Integral se
+incorporan a la misma aplicación FastAPI.
 """
 
 from pathlib import Path
@@ -13,6 +13,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
+from app.academic_portal import register_academic_portal
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
@@ -78,6 +79,7 @@ def _register_unified_studio() -> None:
 def _register_integrated_portal() -> None:
     register_admin_portal(app)
     register_course_workspace(app)
+    register_academic_portal(app)
     register_home_content(app)
     app.openapi_schema = None
 
@@ -97,15 +99,25 @@ def _register_public_login() -> None:
 
 
 def _validate() -> None:
-    snapshot = [
-        (_path(route), _methods(route))
-        for route in app.router.routes
-    ]
+    snapshot = [(_path(route), _methods(route)) for route in app.router.routes]
     required = {
         ("/healthz", "GET"),
         ("/login", "GET"),
         ("/api/home-content", "GET"),
         ("/course-studio", "GET"),
+        ("/portal", "GET"),
+        ("/portal/login", "GET"),
+        ("/portal/logout", "GET"),
+        ("/faculty/courses/{course_id}", "GET"),
+        ("/faculty/courses/{course_id}/modules", "POST"),
+        ("/faculty/modules/{module_id}", "GET"),
+        ("/faculty/modules/{module_id}/update", "POST"),
+        ("/faculty/modules/{module_id}/items", "POST"),
+        ("/faculty/items/{item_id}/edit", "GET"),
+        ("/faculty/items/{item_id}/edit", "POST"),
+        ("/learn/courses/{course_id}", "GET"),
+        ("/learn/items/{item_id}", "GET"),
+        ("/learn/items/{item_id}/submit", "POST"),
         ("/admin", "GET"),
         ("/admin/login", "GET"),
         ("/admin/home-content", "GET"),
@@ -146,6 +158,7 @@ def _validate() -> None:
         ("/admin/authoring/modules/{module_id}/google", "POST"),
         ("/admin/authoring/modules/{module_id}/drive", "GET"),
         ("/admin/authoring/modules/{module_id}/drive-link", "POST"),
+        ("/admin/authoring/modules/{module_id}/google-link", "POST"),
         ("/admin/authoring/modules/{module_id}/odf/{kind}", "GET"),
         ("/admin/authoring/items/{item_id}/edit", "GET"),
         ("/admin/authoring/items/{item_id}/edit", "POST"),
@@ -171,15 +184,9 @@ def _validate() -> None:
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
         if path.startswith((
-            "/login",
-            "/course-studio",
-            "/admin/authoring",
-            "/admin/system",
-            "/admin/users",
-            "/admin/roles",
-            "/admin/enrollments",
-            "/admin/home-content",
-            "/admin",
+            "/login", "/portal", "/faculty", "/learn", "/course-studio",
+            "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles",
+            "/admin/enrollments", "/admin/home-content", "/admin",
         ))
     ]
     print("NUVEDRA unified routes: " + " | ".join(registered), flush=True)
