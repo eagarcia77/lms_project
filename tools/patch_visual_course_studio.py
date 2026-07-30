@@ -5,7 +5,7 @@ from pathlib import Path
 PATH = Path("app/course_editor_access.py")
 TAG = "NUVEDRA_VISUAL_STUDIO_PREVIEW_V1"
 
-PREVIEW_ROUTES = r'''
+PREVIEW_ROUTES = r"""
 
     # NUVEDRA_VISUAL_STUDIO_PREVIEW_V1
     @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/preview", response_class=HTMLResponse, response_model=None)
@@ -61,7 +61,7 @@ PREVIEW_ROUTES = r'''
         </main>
         '''
         return _studio_page("Content preview", body, user)
-'''
+"""
 
 
 def replace_required(text: str, old: str, new: str) -> str:
