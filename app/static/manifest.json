@@ -1,11 +1,11 @@
 {
-  "name": "NEXUS EDU XR",
-  "short_name": "NEXUS XR",
-  "description": "Plataforma educativa inmersiva integrada con Google Workspace.",
+  "name": "NUVEDRA",
+  "short_name": "NUVEDRA",
+  "description": "Plataforma de aprendizaje inteligente, inmersivo y conectado.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#F3F7F5",
-  "theme_color": "#007B5F",
+  "background_color": "#F7F8FC",
+  "theme_color": "#2B2D6E",
   "icons": [
     {"src": "/static/assets/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
   ]
