@@ -6,13 +6,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
-# Preserve the consolidated authoring, innovation, role management and
-# administration layers while applying the authenticated V3 base package.
-RUN mkdir -p /tmp/nexus-overlay/app \
-    && cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/production_entry.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+# Preserve the consolidated authoring, innovation, role management,
+# homepage content management and administration layers while applying
+# the authenticated V3 base package.
+RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
+    && cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
     && cp /tmp/nexus-overlay/app/* app/ \
+    && rm -rf app/static \
+    && mkdir -p app/static \
+    && cp -a /tmp/nexus-overlay/static/. app/static/ \
     && cp /tmp/nexus-overlay/start_runtime.sh /tmp/nexus-overlay/requirements.txt ./
 
 RUN pip install --no-cache-dir -r requirements.txt
@@ -27,9 +32,12 @@ RUN test -f app/unified_authoring.py \
     && test -f app/admin_portal.py \
     && test -f app/role_management.py \
     && test -f app/production_entry.py \
+    && test -f app/home_content.py \
     && test -f app/admin_authoring_v6.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
+    && test -f app/static/assets/nuvedra-logo.svg \
+    && test -f app/static/assets/nuvedra-hero.svg \
     && test -f tools/patch_admin_portal_roles.py \
     && test -f tools/disable_pwa_cache.py \
     && test -f tools/fix_unified_authoring_templates.py \
@@ -67,8 +75,10 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
     && grep -q '"/admin/roles"' app/admin_portal.py \
+    && grep -q '"/admin/home-content"' app/admin_portal.py \
     && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
     && grep -q "NUVEDRA" app/static/index.html \
+    && grep -q "/api/home-content" app/static/app.js \
     && grep -q "NUVEDRA_ACCESSIBLE_THEME_V1" app/static/styles.css \
     && grep -q '"name": "NUVEDRA"' app/static/manifest.json \
     && grep -q "prefers-reduced-motion" app/static/styles.css \
