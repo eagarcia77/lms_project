@@ -16,12 +16,17 @@ from fastapi.responses import FileResponse
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
-from app.course_workspace import register_course_workspace
+from app.course_workspace import ALL_ITEM_TYPES, register_course_workspace
 from app.home_content import register_home_content
 from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
+
+ALL_ITEM_TYPES.update({
+    "assessment": "Google Forms / evaluación",
+    "announcement": "Anuncio",
+})
 
 AUTHORING_PREFIXES = ("/admin/authoring", "/course-studio", "/course-builder")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
