@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#007B5F">
-  <meta name="description" content="NEXUS EDU XR: plataforma de educación en línea con Google Workspace, realidad virtual y realidad aumentada.">
-  <title>NEXUS EDU XR</title>
+  <meta name="theme-color" content="#2B2D6E">
+  <meta name="description" content="NUVEDRA: plataforma educativa inteligente, inmersiva y conectada con Google Workspace, realidad virtual y realidad aumentada.">
+  <title>NUVEDRA</title>
   <link rel="manifest" href="/static/manifest.json">
   <link rel="stylesheet" href="/static/styles.css">
   <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.3.1/model-viewer.min.js"></script>
@@ -13,157 +13,199 @@
 </head>
 <body>
   <a class="skip-link" href="#main">Saltar al contenido principal</a>
-  <div class="app-shell">
-    <aside class="sidebar" aria-label="Navegación principal">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">NX</div>
-        <div><strong>NEXUS</strong><span>EDU XR</span></div>
-      </div>
-      <nav id="primary-nav">
-        <button class="nav-item active" data-view="home" aria-current="page"><span>⌂</span> Inicio</button>
-        <button class="nav-item" data-view="courses"><span>▤</span> Cursos</button>
-        <button class="nav-item" data-view="google"><span>G</span> Google Hub</button>
-        <button class="nav-item" data-view="xr"><span>◉</span> Laboratorio XR</button>
-        <button class="nav-item" data-view="analytics"><span>↗</span> Analítica</button>
-      </nav>
-      <div class="sidebar-footer">
-        <div class="status-dot"><i></i> Plataforma operacional</div>
-        <small>Versión MVP 0.1.0</small>
-      </div>
-    </aside>
 
-    <div class="workspace">
-      <header class="topbar">
-        <button id="menu-button" class="icon-button" aria-label="Abrir menú">☰</button>
-        <div class="search-wrap">
-          <label class="sr-only" for="global-search">Buscar</label>
-          <input id="global-search" type="search" placeholder="Buscar cursos, tareas y recursos…">
-        </div>
-        <div class="top-actions">
-          <button class="icon-button" aria-label="Notificaciones">🔔<span class="notification-badge">3</span></button>
-          <button id="google-profile" class="profile-button" aria-label="Cuenta de usuario">
-            <span class="avatar">EG</span><span class="profile-text"><strong>Eduardo García</strong><small>Administrador</small></span>
-          </button>
-        </div>
-      </header>
+  <header class="site-header">
+    <a class="brand" href="#" data-go="home" aria-label="NUVEDRA, ir al inicio">
+      <img src="/static/assets/nuvedra-logo.svg" alt="NUVEDRA">
+    </a>
 
-      <main id="main" tabindex="-1">
-        <section id="view-home" class="view active" aria-labelledby="home-title">
-          <div class="hero">
-            <div>
-              <p class="eyebrow">Aprendizaje sin límites</p>
-              <h1 id="home-title">Tu ecosistema académico, conectado e inmersivo.</h1>
-              <p>Administra cursos, colabora con Google Workspace y transforma contenidos en experiencias de realidad virtual y aumentada.</p>
-              <div class="hero-actions">
-                <button class="button primary" data-go="courses">Continuar aprendiendo</button>
-                <button class="button secondary" data-go="xr">Explorar laboratorio XR</button>
-              </div>
-            </div>
-            <div class="hero-orbit" aria-hidden="true">
-              <div class="orbit orbit-a"><span>VR</span></div>
-              <div class="orbit orbit-b"><span>AR</span></div>
-              <div class="orbit-center">G</div>
-            </div>
-          </div>
+    <button id="menu-button" class="menu-button" type="button" aria-controls="primary-nav" aria-expanded="false">
+      <span aria-hidden="true">☰</span><span class="sr-only">Abrir menú</span>
+    </button>
 
-          <div id="stats-grid" class="stats-grid" aria-label="Indicadores académicos"></div>
+    <nav id="primary-nav" class="top-nav" aria-label="Navegación principal">
+      <button class="nav-item active" data-view="home" aria-current="page">Inicio</button>
+      <button class="nav-item" data-view="courses">Cursos</button>
+      <button class="nav-item" data-view="google">Google Hub</button>
+      <button class="nav-item" data-view="xr">Laboratorio XR</button>
+      <button class="nav-item" data-view="analytics">Analítica</button>
+    </nav>
 
-          <div class="dashboard-grid">
-            <section class="panel">
-              <div class="panel-heading"><div><p class="eyebrow">Próximamente</p><h2>Agenda académica</h2></div><button class="text-button" data-go="google">Ver calendario</button></div>
-              <div id="upcoming-list" class="stack-list" aria-live="polite"></div>
-            </section>
-            <section class="panel">
-              <div class="panel-heading"><div><p class="eyebrow">Comunidad</p><h2>Anuncios</h2></div><button class="text-button">Ver todos</button></div>
-              <div id="announcement-list" class="stack-list" aria-live="polite"></div>
-            </section>
-          </div>
-        </section>
-
-        <section id="view-courses" class="view" aria-labelledby="courses-title">
-          <div class="page-heading">
-            <div><p class="eyebrow">Aprendizaje</p><h1 id="courses-title">Mis cursos</h1><p>Contenido organizado por módulos, con progreso claro y acceso directo a cada actividad.</p></div>
-            <button class="button primary" id="new-course-button">＋ Crear curso</button>
-          </div>
-          <div id="course-grid" class="course-grid" aria-live="polite"></div>
-          <section id="course-detail" class="panel course-detail" hidden></section>
-        </section>
-
-        <section id="view-google" class="view" aria-labelledby="google-title">
-          <div class="page-heading">
-            <div><p class="eyebrow">Google Workspace</p><h1 id="google-title">Google Hub</h1><p>Un solo lugar para Classroom, Drive, Calendar, Meet, Docs, Slides, Sheets, Forms y YouTube.</p></div>
-            <button id="connect-google" class="button google-button">Conectar cuenta de Google</button>
-          </div>
-          <div id="google-status" class="notice info">La plataforma opera en modo demostración hasta configurar OAuth en Google Cloud.</div>
-          <div class="app-grid">
-            <button class="google-card" data-google-action="classroom"><span class="google-icon classroom">C</span><strong>Classroom</strong><small>Sincronizar cursos y tareas</small></button>
-            <button class="google-card" data-google-action="drive"><span class="google-icon drive">▲</span><strong>Drive</strong><small>Archivos y materiales</small></button>
-            <button class="google-card" data-google-action="calendar"><span class="google-icon calendar">21</span><strong>Calendar</strong><small>Agenda y fechas límite</small></button>
-            <button class="google-card" data-google-action="meet"><span class="google-icon meet">▶</span><strong>Meet</strong><small>Crear una videoclase</small></button>
-            <a class="google-card" href="https://docs.google.com/document/" target="_blank" rel="noopener"><span class="google-icon docs">▤</span><strong>Docs</strong><small>Documentos colaborativos</small></a>
-            <a class="google-card" href="https://docs.google.com/presentation/" target="_blank" rel="noopener"><span class="google-icon slides">▰</span><strong>Slides</strong><small>Presentaciones académicas</small></a>
-            <a class="google-card" href="https://docs.google.com/spreadsheets/" target="_blank" rel="noopener"><span class="google-icon sheets">▦</span><strong>Sheets</strong><small>Datos y calificaciones</small></a>
-            <a class="google-card" href="https://docs.google.com/forms/" target="_blank" rel="noopener"><span class="google-icon forms">◆</span><strong>Forms</strong><small>Pruebas y encuestas</small></a>
-          </div>
-          <section class="panel google-results">
-            <div class="panel-heading"><div><p class="eyebrow">Datos conectados</p><h2 id="google-result-title">Selecciona una aplicación</h2></div></div>
-            <div id="google-results" class="empty-state">Conecta Google y selecciona Classroom, Drive o Calendar.</div>
-          </section>
-        </section>
-
-        <section id="view-xr" class="view" aria-labelledby="xr-title">
-          <div class="page-heading">
-            <div><p class="eyebrow">WebXR</p><h1 id="xr-title">Laboratorio de aprendizaje inmersivo</h1><p>Experiencias accesibles desde computadora, móvil, Meta Quest, Apple Vision Pro y otros dispositivos compatibles.</p></div>
-            <span class="chip">VR + AR + 3D</span>
-          </div>
-          <div id="xr-cards" class="xr-card-grid"></div>
-          <div class="xr-stage-grid">
-            <section class="panel xr-panel">
-              <div class="panel-heading"><div><p class="eyebrow">Realidad aumentada</p><h2>Objeto 3D interactivo</h2></div><span class="chip">Móvil</span></div>
-              <model-viewer
-                src="https://modelviewer.dev/shared-assets/models/Astronaut.glb"
-                alt="Modelo tridimensional de un astronauta para una demostración educativa"
-                ar ar-modes="webxr scene-viewer quick-look"
-                camera-controls auto-rotate shadow-intensity="1"
-                exposure="1" touch-action="pan-y">
-                <button class="ar-button" slot="ar-button">Ver en mi espacio</button>
-              </model-viewer>
-            </section>
-            <section class="panel xr-panel">
-              <div class="panel-heading"><div><p class="eyebrow">Realidad virtual</p><h2>Salón de cobertura Wi-Fi</h2></div><span class="chip">Headset</span></div>
-              <div class="aframe-wrap">
-                <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true; colorManagement: true" background="color: #EAF2F0">
-                  <a-box position="-2 1 -4" width="1.2" height="2" depth="0.2" color="#007B5F"></a-box>
-                  <a-box position="2 1 -4" width="1.2" height="2" depth="0.2" color="#FED141"></a-box>
-                  <a-cylinder position="0 2.6 -4" radius="0.28" height="0.12" color="#FFFFFF"></a-cylinder>
-                  <a-ring position="0 2.6 -4" rotation="90 0 0" radius-inner="0.4" radius-outer="0.44" color="#007B5F"></a-ring>
-                  <a-ring position="0 2.6 -4" rotation="90 0 0" radius-inner="0.7" radius-outer="0.74" color="#007B5F"></a-ring>
-                  <a-text value="Punto de acceso" align="center" color="#12332C" position="0 3.3 -4"></a-text>
-                  <a-plane position="0 0 -4" rotation="-90 0 0" width="10" height="10" color="#D6E4E0"></a-plane>
-                  <a-sky color="#F7FAF9"></a-sky>
-                  <a-entity position="0 1.6 0"><a-camera><a-cursor color="#007B5F"></a-cursor></a-camera></a-entity>
-                </a-scene>
-              </div>
-            </section>
-          </div>
-        </section>
-
-        <section id="view-analytics" class="view" aria-labelledby="analytics-title">
-          <div class="page-heading"><div><p class="eyebrow">Inteligencia académica</p><h1 id="analytics-title">Analítica y éxito estudiantil</h1><p>Indicadores tempranos para participación, progreso, desempeño, accesibilidad y retención.</p></div><button class="button secondary">Exportar informe</button></div>
-          <div class="analytics-grid">
-            <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Participación</p><h2>Actividad semanal</h2></div></div><div class="bar-chart" aria-label="Gráfica de actividad semanal"><div style="--h:48%"><span>L</span></div><div style="--h:66%"><span>M</span></div><div style="--h:82%"><span>X</span></div><div style="--h:58%"><span>J</span></div><div style="--h:76%"><span>V</span></div><div style="--h:36%"><span>S</span></div><div style="--h:24%"><span>D</span></div></div></section>
-            <section class="panel risk-panel"><div class="panel-heading"><div><p class="eyebrow">Intervención temprana</p><h2>Alertas académicas</h2></div></div><div class="risk-row"><span class="risk-avatar">AM</span><div><strong>Ana Martínez</strong><small>7 días sin acceder</small></div><span class="risk high">Alta</span></div><div class="risk-row"><span class="risk-avatar">JR</span><div><strong>José Rivera</strong><small>2 tareas pendientes</small></div><span class="risk medium">Media</span></div><div class="risk-row"><span class="risk-avatar">LC</span><div><strong>Laura Cruz</strong><small>Progreso menor de 40%</small></div><span class="risk medium">Media</span></div></section>
-          </div>
-          <div class="analytics-cards"><article><span>94%</span><strong>Accesibilidad</strong><small>Validación WCAG/WAVE</small></article><article><span>84%</span><strong>Participación</strong><small>Últimos 7 días</small></article><article><span>91%</span><strong>Retención</strong><small>Proyección del término</small></article><article><span>4.6</span><strong>Satisfacción</strong><small>Promedio de 5</small></article></div>
-        </section>
-      </main>
+    <div class="header-features" aria-label="Características de la plataforma">
+      <span><i class="feature-icon cube" aria-hidden="true">◇</i> Inmersivo</span>
+      <span><i class="feature-icon brain" aria-hidden="true">✦</i> Inteligente</span>
+      <span><i class="feature-icon rocket" aria-hidden="true">↗</i> Innovador</span>
     </div>
-  </div>
+
+    <a class="admin-link" href="/admin/home-content" aria-label="Administrar anuncios y banners">
+      <span aria-hidden="true">⚙</span> Administrar
+    </a>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <section id="view-home" class="view active" aria-labelledby="home-title">
+      <div class="home-grid">
+        <div class="home-content">
+          <section id="hero-carousel" class="hero" aria-roledescription="carrusel" aria-label="Banners destacados">
+            <div class="hero-copy">
+              <p id="hero-badge" class="hero-badge">PLATAFORMA XR</p>
+              <h1 id="home-title">Explora el <span>aprendizaje inmersivo</span></h1>
+              <p id="hero-body">Tecnología XR, inteligencia artificial y contenido adaptativo para transformar la educación.</p>
+              <a id="hero-cta" class="hero-button" href="#announcements-title">
+                <span aria-hidden="true">▶</span> Descubre NUVEDRA
+              </a>
+            </div>
+            <div class="hero-media" aria-hidden="true">
+              <img id="hero-image" src="/static/assets/nuvedra-hero.svg" alt="">
+            </div>
+            <button id="hero-prev" class="carousel-arrow previous" type="button" aria-label="Banner anterior">‹</button>
+            <button id="hero-next" class="carousel-arrow next" type="button" aria-label="Banner siguiente">›</button>
+            <div id="hero-dots" class="carousel-dots" aria-label="Seleccionar banner"></div>
+          </section>
+
+          <section class="announcement-section" aria-labelledby="announcements-title">
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Información destacada</p>
+                <h2 id="announcements-title">Anuncios y novedades</h2>
+              </div>
+              <a class="manage-link" href="/admin/home-content"><span aria-hidden="true">⚙</span> Administrar anuncios</a>
+            </div>
+            <div id="announcement-cards" class="announcement-cards" aria-live="polite"></div>
+          </section>
+
+          <section class="value-strip" aria-label="Beneficios de NUVEDRA">
+            <article><span class="value-icon">◎</span><div><strong>Aprendizaje inmersivo</strong><small>Experiencias XR que conectan la teoría con la práctica.</small></div></article>
+            <article><span class="value-icon">✦</span><div><strong>Inteligencia adaptativa</strong><small>Contenido que responde al progreso del estudiante.</small></div></article>
+            <article><span class="value-icon">◉</span><div><strong>Colaboración global</strong><small>Google Workspace, Meet y trabajo compartido.</small></div></article>
+            <article><span class="value-icon">⬡</span><div><strong>Seguridad y privacidad</strong><small>Acceso protegido y trazabilidad administrativa.</small></div></article>
+          </section>
+        </div>
+
+        <aside class="login-card" aria-labelledby="login-title">
+          <div class="login-glow" aria-hidden="true"></div>
+          <p class="login-kicker">ACCESO A LA PLATAFORMA</p>
+          <h2 id="login-title">Bienvenido a <span>NUVEDRA</span></h2>
+          <p class="login-subtitle">Accede a tu cuenta para continuar tu aprendizaje.</p>
+
+          <button id="connect-google" data-google-connect class="google-login" type="button">
+            <span class="google-g" aria-hidden="true">G</span>
+            <span>Continuar con Google</span>
+          </button>
+
+          <div class="login-divider"><span>o continúa con tu correo</span></div>
+
+          <form id="local-login-form" method="post" action="/admin/login">
+            <label for="login-email">Correo electrónico</label>
+            <div class="input-wrap"><span aria-hidden="true">✉</span><input id="login-email" name="email" type="email" autocomplete="username" required placeholder="Ingresa tu correo electrónico"></div>
+
+            <label for="login-password">Contraseña</label>
+            <div class="input-wrap"><span aria-hidden="true">▣</span><input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="Ingresa tu contraseña"><button id="toggle-password" class="password-toggle" type="button" aria-label="Mostrar contraseña">◉</button></div>
+
+            <label class="remember"><input type="checkbox" name="remember"> Mantener sesión iniciada</label>
+            <button class="login-submit" type="submit">Iniciar sesión <span aria-hidden="true">›</span></button>
+          </form>
+
+          <div class="login-links">
+            <a href="/admin/login">¿Olvidé mi contraseña?</a>
+            <button id="request-account" class="link-button" type="button">Solicitar una cuenta <span aria-hidden="true">→</span></button>
+          </div>
+          <p id="auth-status" class="auth-note">La cuenta por correo utiliza el acceso administrativo durante esta fase.</p>
+        </aside>
+      </div>
+
+      <div class="home-lower-grid">
+        <section class="panel" aria-labelledby="upcoming-title">
+          <div class="panel-heading"><div><p class="eyebrow">Próximamente</p><h2 id="upcoming-title">Agenda académica</h2></div><button class="text-button" data-go="google">Ver calendario</button></div>
+          <div id="upcoming-list" class="stack-list" aria-live="polite"></div>
+        </section>
+        <section class="panel stats-panel" aria-labelledby="stats-title">
+          <div class="panel-heading"><div><p class="eyebrow">Actividad</p><h2 id="stats-title">Indicadores de la plataforma</h2></div></div>
+          <div id="stats-grid" class="stats-grid" aria-label="Indicadores académicos"></div>
+        </section>
+      </div>
+    </section>
+
+    <section id="view-courses" class="view" aria-labelledby="courses-title">
+      <div class="page-heading">
+        <div><p class="eyebrow">Aprendizaje</p><h1 id="courses-title">Mis cursos</h1><p>Contenido organizado por módulos, con progreso claro y acceso directo a cada actividad.</p></div>
+        <button class="button primary" id="new-course-button">＋ Crear curso</button>
+      </div>
+      <div id="course-grid" class="course-grid" aria-live="polite"></div>
+      <section id="course-detail" class="panel course-detail" hidden></section>
+    </section>
+
+    <section id="view-google" class="view" aria-labelledby="google-title">
+      <div class="page-heading">
+        <div><p class="eyebrow">Google Workspace</p><h1 id="google-title">Google Hub</h1><p>Un solo lugar para Classroom, Drive, Calendar, Meet, Docs, Slides, Sheets, Forms y YouTube.</p></div>
+        <button data-google-connect class="button google-button">Conectar cuenta de Google</button>
+      </div>
+      <div id="google-status" class="notice info">La plataforma opera en modo demostración hasta configurar OAuth en Google Cloud.</div>
+      <div class="app-grid">
+        <button class="google-card" data-google-action="classroom"><span class="google-icon classroom">C</span><strong>Classroom</strong><small>Sincronizar cursos y tareas</small></button>
+        <button class="google-card" data-google-action="drive"><span class="google-icon drive">▲</span><strong>Drive</strong><small>Archivos y materiales</small></button>
+        <button class="google-card" data-google-action="calendar"><span class="google-icon calendar">21</span><strong>Calendar</strong><small>Agenda y fechas límite</small></button>
+        <button class="google-card" data-google-action="meet"><span class="google-icon meet">▶</span><strong>Meet</strong><small>Crear una videoclase</small></button>
+        <a class="google-card" href="https://docs.google.com/document/" target="_blank" rel="noopener"><span class="google-icon docs">▤</span><strong>Docs</strong><small>Documentos colaborativos</small></a>
+        <a class="google-card" href="https://docs.google.com/presentation/" target="_blank" rel="noopener"><span class="google-icon slides">▰</span><strong>Slides</strong><small>Presentaciones académicas</small></a>
+        <a class="google-card" href="https://docs.google.com/spreadsheets/" target="_blank" rel="noopener"><span class="google-icon sheets">▦</span><strong>Sheets</strong><small>Datos y calificaciones</small></a>
+        <a class="google-card" href="https://docs.google.com/forms/" target="_blank" rel="noopener"><span class="google-icon forms">◆</span><strong>Forms</strong><small>Pruebas y encuestas</small></a>
+      </div>
+      <section class="panel google-results">
+        <div class="panel-heading"><div><p class="eyebrow">Datos conectados</p><h2 id="google-result-title">Selecciona una aplicación</h2></div></div>
+        <div id="google-results" class="empty-state">Conecta Google y selecciona Classroom, Drive o Calendar.</div>
+      </section>
+    </section>
+
+    <section id="view-xr" class="view" aria-labelledby="xr-title">
+      <div class="page-heading">
+        <div><p class="eyebrow">WebXR</p><h1 id="xr-title">Laboratorio de aprendizaje inmersivo</h1><p>Experiencias accesibles desde computadora, móvil, Meta Quest, Apple Vision Pro y otros dispositivos compatibles.</p></div>
+        <span class="chip">VR + AR + 3D</span>
+      </div>
+      <div id="xr-cards" class="xr-card-grid"></div>
+      <div class="xr-stage-grid">
+        <section class="panel xr-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Realidad aumentada</p><h2>Objeto 3D interactivo</h2></div><span class="chip">Móvil</span></div>
+          <model-viewer src="https://modelviewer.dev/shared-assets/models/Astronaut.glb" alt="Modelo tridimensional de un astronauta para una demostración educativa" ar ar-modes="webxr scene-viewer quick-look" camera-controls auto-rotate shadow-intensity="1" exposure="1" touch-action="pan-y"><button class="ar-button" slot="ar-button">Ver en mi espacio</button></model-viewer>
+        </section>
+        <section class="panel xr-panel">
+          <div class="panel-heading"><div><p class="eyebrow">Realidad virtual</p><h2>Salón de cobertura Wi-Fi</h2></div><span class="chip">Headset</span></div>
+          <div class="aframe-wrap">
+            <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true; colorManagement: true" background="color: #F7F8FC">
+              <a-box position="-2 1 -4" width="1.2" height="2" depth="0.2" color="#4338CA"></a-box>
+              <a-box position="2 1 -4" width="1.2" height="2" depth="0.2" color="#FFB000"></a-box>
+              <a-cylinder position="0 2.6 -4" radius="0.28" height="0.12" color="#FFFFFF"></a-cylinder>
+              <a-ring position="0 2.6 -4" rotation="90 0 0" radius-inner="0.4" radius-outer="0.44" color="#006B6B"></a-ring>
+              <a-ring position="0 2.6 -4" rotation="90 0 0" radius-inner="0.7" radius-outer="0.74" color="#006B6B"></a-ring>
+              <a-text value="Punto de acceso" align="center" color="#171A2B" position="0 3.3 -4"></a-text>
+              <a-plane position="0 0 -4" rotation="-90 0 0" width="10" height="10" color="#D7DBE8"></a-plane>
+              <a-sky color="#F7F8FC"></a-sky>
+              <a-entity position="0 1.6 0"><a-camera><a-cursor color="#4338CA"></a-cursor></a-camera></a-entity>
+            </a-scene>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="view-analytics" class="view" aria-labelledby="analytics-title">
+      <div class="page-heading"><div><p class="eyebrow">Inteligencia académica</p><h1 id="analytics-title">Analítica y éxito estudiantil</h1><p>Indicadores tempranos para participación, progreso, desempeño, accesibilidad y retención.</p></div><button class="button secondary">Exportar informe</button></div>
+      <div class="analytics-grid">
+        <section class="panel"><div class="panel-heading"><div><p class="eyebrow">Participación</p><h2>Actividad semanal</h2></div></div><div class="bar-chart" aria-label="Gráfica de actividad semanal"><div style="--h:48%"><span>L</span></div><div style="--h:66%"><span>M</span></div><div style="--h:82%"><span>X</span></div><div style="--h:58%"><span>J</span></div><div style="--h:76%"><span>V</span></div><div style="--h:36%"><span>S</span></div><div style="--h:24%"><span>D</span></div></div></section>
+        <section class="panel risk-panel"><div class="panel-heading"><div><p class="eyebrow">Intervención temprana</p><h2>Alertas académicas</h2></div></div><div class="risk-row"><span class="risk-avatar">AM</span><div><strong>Ana Martínez</strong><small>7 días sin acceder</small></div><span class="risk high">Alta</span></div><div class="risk-row"><span class="risk-avatar">JR</span><div><strong>José Rivera</strong><small>2 tareas pendientes</small></div><span class="risk medium">Media</span></div><div class="risk-row"><span class="risk-avatar">LC</span><div><strong>Laura Cruz</strong><small>Progreso menor de 40%</small></div><span class="risk medium">Media</span></div></section>
+      </div>
+      <div class="analytics-cards"><article><span>94%</span><strong>Accesibilidad</strong><small>Validación WCAG/WAVE</small></article><article><span>84%</span><strong>Participación</strong><small>Últimos 7 días</small></article><article><span>91%</span><strong>Retención</strong><small>Proyección del término</small></article><article><span>4.6</span><strong>Satisfacción</strong><small>Promedio de 5</small></article></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>© 2026 NUVEDRA. Educación inmersiva e inteligente.</span>
+    <nav aria-label="Enlaces legales"><a href="/admin/login">Centro de ayuda</a><a href="#">Términos y condiciones</a><a href="#">Política de privacidad</a></nav>
+  </footer>
 
   <dialog id="meet-dialog">
     <form id="meet-form" method="dialog">
       <div class="dialog-heading"><div><p class="eyebrow">Google Meet</p><h2>Crear videoclase</h2></div><button class="icon-button" value="cancel" aria-label="Cerrar">×</button></div>
-      <label>Título<input name="title" required minlength="3" value="Videoclase NEXUS EDU XR"></label>
+      <label>Título<input name="title" required minlength="3" value="Videoclase NUVEDRA"></label>
       <label>Inicio<input name="start_iso" type="datetime-local"></label>
       <label>Duración<select name="duration_minutes"><option value="30">30 minutos</option><option value="60" selected>60 minutos</option><option value="90">90 minutos</option><option value="120">120 minutos</option></select></label>
       <label>Participantes<input name="attendees" type="text" placeholder="correo1@dominio.edu, correo2@dominio.edu"></label>
