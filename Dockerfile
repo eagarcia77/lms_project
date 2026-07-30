@@ -7,10 +7,10 @@ WORKDIR /app
 COPY . .
 
 # Preserve the consolidated authoring, innovation, role-based academic portal,
-# course workspace, homepage content management and administration layers while
-# applying the authenticated V3 base package.
+# English-first bilingual layer, Google authentication, course workspace,
+# homepage content management and administration layers while applying V3.
 RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
-    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/google_api.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
@@ -35,6 +35,8 @@ RUN test -f app/unified_authoring.py \
     && test -f app/faculty_portal.py \
     && test -f app/student_portal.py \
     && test -f app/google_hub_safe.py \
+    && test -f app/google_api.py \
+    && test -f app/platform_upgrade.py \
     && test -f app/admin_portal.py \
     && test -f app/role_management.py \
     && test -f app/production_entry.py \
@@ -45,6 +47,7 @@ RUN test -f app/unified_authoring.py \
     && test -f app/admin_system.py \
     && test -f app/static/app.js \
     && test -f app/static/auth.js \
+    && test -f app/static/i18n.js \
     && test -f app/static/assets/nuvedra-logo.svg \
     && test -f app/static/assets/nuvedra-hero.svg \
     && test -f tools/patch_admin_portal_roles.py \
@@ -58,7 +61,8 @@ RUN test -f app/unified_authoring.py \
     && test -f tools/smoke_test_role_management.py \
     && test -f tools/smoke_test_nuvedra_branding.py \
     && test -f tools/smoke_test_course_workspace.py \
-    && test -f tools/smoke_test_academic_roles.py
+    && test -f tools/smoke_test_academic_roles.py \
+    && test -f tools/smoke_test_platform_upgrade.py
 RUN chmod +x start_runtime.sh
 RUN python -m py_compile app/*.py \
     tools/patch_google_workspace_scopes.py \
@@ -74,10 +78,11 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_role_management.py \
     tools/smoke_test_nuvedra_branding.py \
     tools/smoke_test_course_workspace.py \
-    tools/smoke_test_academic_roles.py
+    tools/smoke_test_academic_roles.py \
+    tools/smoke_test_platform_upgrade.py
 # The production image is Python-only. JavaScript syntax is validated in CI,
-# while Docker verifies that both frontend files exist, are UTF-8 and non-empty.
-RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos JavaScript vacíos'"
+# while Docker verifies that frontend files exist, are UTF-8 and non-empty.
+RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js'),Path('app/static/i18n.js')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos JavaScript vacíos'"
 RUN python tools/validate_runtime_dependencies.py
 RUN APP_NAME=NUVEDRA \
     SESSION_SECRET=build-verification-session-secret-change-in-production \
@@ -89,6 +94,7 @@ RUN PYTHONPATH=. python tools/smoke_test_role_management.py
 RUN PYTHONPATH=. python tools/smoke_test_nuvedra_branding.py
 RUN PYTHONPATH=. python tools/smoke_test_course_workspace.py
 RUN PYTHONPATH=. python tools/smoke_test_academic_roles.py
+RUN PYTHONPATH=. python tools/smoke_test_platform_upgrade.py
 RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
@@ -100,6 +106,10 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "Tecnologías emergentes" app/course_workspace.py \
     && grep -q "course_created_and_professor_assigned" app/academic_access.py \
     && grep -q "Google Hub sencillo" app/google_hub_safe.py \
+    && grep -q "getattr(google_api, \"TOKEN_STORE\"" app/google_hub_safe.py \
+    && grep -q "register_platform_upgrade" app/production_entry.py \
+    && grep -q 'DEFAULT_LANGUAGE = "en"' app/static/i18n.js \
+    && grep -q '"Español"' app/static/i18n.js \
     && grep -q "student_assessment_submitted" app/student_portal.py \
     && grep -q "NUVEDRA" app/static/index.html \
     && grep -q "/api/home-content" app/static/app.js \
