@@ -77,9 +77,17 @@ def main() -> None:
 
         course = client.get(location)
         expect(course, 200, "configuración administrativa del curso")
-        for marker in ("Configuración administrativa", "Separación de funciones", "Administrar matrículas"):
+        for marker in (
+            "Editar configuración del curso",
+            "Editar contenido del curso",
+            "Abrir editor del profesor",
+            "Administrar matrículas",
+        ):
             if marker not in course.text:
-                raise RuntimeError(f"La configuración del curso no mostró {marker!r}.")
+                raise RuntimeError(
+                    f"La configuración editable del curso no mostró {marker!r}. "
+                    f"Respuesta recibida: {course.text[:1200]}"
+                )
 
         update_course = client.post(
             f"/admin/authoring/courses/{course_id}/update",
@@ -181,7 +189,7 @@ def main() -> None:
         expect(update_item, 303, "actualización del contenido")
 
     print(
-        "Course Workspace validado: administración del curso, supervisión técnica, Google Hub y tecnologías emergentes.",
+        "Course Workspace validado: configuración editable, contenido, Google Hub y tecnologías emergentes.",
         flush=True,
     )
 
