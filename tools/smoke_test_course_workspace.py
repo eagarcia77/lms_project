@@ -51,9 +51,12 @@ def main() -> None:
 
         workspace = client.get("/admin/authoring")
         expect(workspace, 200, "espacio de cursos")
-        for marker in ("NUVEDRA Course Workspace", "Cursos existentes", "Tecnologías emergentes"):
+        for marker in ("NUVEDRA Course Workspace", "Cursos existentes", "Flujo integrado"):
             if marker not in workspace.text:
-                raise RuntimeError(f"El espacio de cursos no mostró {marker!r}.")
+                raise RuntimeError(
+                    f"El espacio de cursos no mostró {marker!r}. "
+                    f"Respuesta recibida: {workspace.text[:800]}"
+                )
 
         create = client.post(
             "/admin/authoring/courses",
@@ -133,6 +136,10 @@ def main() -> None:
 
         emerging = client.get(f"/admin/authoring/courses/{course_id}/emerging")
         expect(emerging, 200, "centro de tecnologías emergentes")
+        for marker in ("Añadir experiencia", "H5P/Lumi", "Realidad aumentada"):
+            if marker not in emerging.text:
+                raise RuntimeError(f"El centro de tecnologías emergentes no mostró {marker!r}.")
+
         add_emerging = client.post(
             f"/admin/authoring/courses/{course_id}/emerging/add",
             data={
