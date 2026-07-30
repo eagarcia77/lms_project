@@ -7,6 +7,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+import app.admin_console as admin_console
 from app.admin_authoring_v6 import _template_modules
 from app.admin_console import audit, db, database_url, execute, require_admin, rows, utcnow
 from app.unified_authoring import PREFIX, _course, _item, _module
@@ -14,6 +15,7 @@ from app.unified_authoring import PREFIX, _course, _item, _module
 AUTHOR_ROLES = {"instructor", "teaching_assistant", "course_builder", "facilitator"}
 STUDENT_ROLES = {"student", "observer"}
 ASSESSMENT_TYPES = {"assignment", "discussion", "quiz", "project", "presentation", "rubric", "assessment"}
+COURSE_STATES = {"draft", "active", "archived"}
 
 
 def esc(value: Any, *, attr: bool = False) -> str:
@@ -143,8 +145,14 @@ def assign_professor(conn: Any, course_id: int, email: str) -> None:
         )
 
 
+def _selected(current: Any, candidate: str) -> str:
+    return " selected" if str(current or "") == candidate else ""
+
+
 def register_admin_course_creation(app: FastAPI) -> None:
     remove_route(app, f"{PREFIX}/courses", "POST")
+    remove_route(app, f"{PREFIX}/courses/{{course_id}}", "GET")
+    remove_route(app, f"{PREFIX}/courses/{{course_id}}/update", "POST")
 
     @app.post(f"{PREFIX}/courses", response_model=None)
     async def create_course(
@@ -183,4 +191,107 @@ def register_admin_course_creation(app: FastAPI) -> None:
                         (course_id, module_title, module_description, outcomes, 60, position, "draft", now, now),
                     )
             audit(conn, admin["email"], "course_created_and_professor_assigned", "course", str(course_id), professor, request.client.host if request.client else "")
+        return RedirectResponse(f"{PREFIX}/courses/{course_id}", status_code=303)
+
+    @app.get(f"{PREFIX}/courses/{{course_id}}", response_class=HTMLResponse, response_model=None)
+    async def admin_course_page(course_id: int, request: Request):
+        admin = require_admin(request, {"course_admin"})
+        with db() as conn:
+            course = _course(conn, course_id)
+            modules = rows(
+                execute(
+                    conn,
+                    """SELECT m.*,(SELECT COUNT(*) FROM nexus_content_items i WHERE i.module_id=m.id) AS item_total
+                       FROM nexus_modules m WHERE m.course_id=? ORDER BY m.position,m.id""",
+                    (course_id,),
+                )
+            )
+            enrollment_counts = rows(
+                execute(
+                    conn,
+                    "SELECT course_role,COUNT(*) AS total FROM nexus_admin_enrollments WHERE course_id=? AND status='active' GROUP BY course_role",
+                    (course_id,),
+                )
+            )
+        counts = {str(row["course_role"]): int(row.get("total") or 0) for row in enrollment_counts}
+        module_rows = "".join(
+            f'<tr><td>{int(module.get("position") or 1)}. <strong>{esc(module["title"])}</strong></td><td>{esc(module.get("status") or "draft")}</td><td>{int(module.get("item_total") or 0)}</td><td><a href="{PREFIX}/modules/{module["id"]}">Revisar estructura</a></td></tr>'
+            for module in modules
+        ) or '<tr><td colspan="4">El profesor todavía no ha creado módulos.</td></tr>'
+        body = f'''
+        <p><a href="{PREFIX}">&larr; Todos los cursos</a></p>
+        <h2>{esc(course["course_code"])}: {esc(course["title"])}</h2>
+        <p class="notice"><strong>Separación de funciones:</strong> el administrador configura y asigna el curso; el profesor desarrolla módulos, contenido y evaluaciones desde <code>/portal</code>; el estudiante solo consulta lo publicado y responde evaluaciones.</p>
+        <div class="grid">
+          <section class="card">
+            <h3>Configuración administrativa</h3>
+            <form method="post" action="{PREFIX}/courses/{course_id}/update">
+              <label>Código<input name="course_code" required maxlength="40" value="{esc(course["course_code"], attr=True)}"></label>
+              <label>Título<input name="title" required maxlength="180" value="{esc(course["title"], attr=True)}"></label>
+              <label>Descripción<textarea name="description">{esc(course.get("description"))}</textarea></label>
+              <label>Periodo<input name="term" value="{esc(course.get("term"), attr=True)}"></label>
+              <label>Profesor responsable<input type="email" name="instructor_email" required value="{esc(course.get("instructor_email"), attr=True)}"></label>
+              <div class="grid">
+                <label>Inicio<input type="date" name="start_date" value="{esc(course.get("start_date"), attr=True)}"></label>
+                <label>Fin<input type="date" name="end_date" value="{esc(course.get("end_date"), attr=True)}"></label>
+              </div>
+              <label>Estado<select name="status"><option value="draft"{_selected(course.get("status"), "draft")}>Borrador</option><option value="active"{_selected(course.get("status"), "active")}>Activo para estudiantes</option><option value="archived"{_selected(course.get("status"), "archived")}>Archivado</option></select></label>
+              <button>Guardar configuración</button>
+            </form>
+          </section>
+          <section class="card">
+            <h3>Asignaciones y acceso</h3>
+            <p><strong>Profesor principal:</strong><br>{esc(course.get("instructor_email") or "Sin asignar")}</p>
+            <p><span class="badge">{counts.get("instructor", 0)} profesores</span> <span class="badge">{counts.get("student", 0)} estudiantes</span> <span class="badge">{counts.get("observer", 0)} observadores</span></p>
+            <a class="button" href="/admin/enrollments">Administrar matrículas</a>
+            <a class="button secondary" href="{PREFIX}/innovation/courses/{course_id}">Calidad e innovación</a>
+            <p>El profesor accede a <strong>/portal</strong> con el correo asignado. Los estudiantes también entran por <strong>/portal</strong>, pero reciben una vista de solo lectura con acceso a las evaluaciones.</p>
+          </section>
+        </div>
+        <h2>Estructura desarrollada por el profesor</h2>
+        <section class="card"><table><thead><tr><th>Módulo</th><th>Estado</th><th>Elementos</th><th>Supervisión</th></tr></thead><tbody>{module_rows}</tbody></table></section>
+        '''
+        return admin_console.page("Configuración del curso", body, admin)
+
+    @app.post(f"{PREFIX}/courses/{{course_id}}/update", response_model=None)
+    async def update_course(
+        course_id: int,
+        request: Request,
+        course_code: str = Form(...),
+        title: str = Form(...),
+        description: str = Form(""),
+        term: str = Form(""),
+        instructor_email: str = Form(...),
+        start_date: str = Form(""),
+        end_date: str = Form(""),
+        status: str = Form("draft"),
+    ):
+        admin = require_admin(request, {"course_admin"})
+        code = course_code.strip().upper()
+        clean_title = title.strip()
+        professor = instructor_email.strip().lower()
+        if not code or not clean_title or not professor:
+            raise HTTPException(400, "Código, título y profesor son obligatorios.")
+        if status not in COURSE_STATES:
+            raise HTTPException(400, "Estado del curso inválido.")
+        if start_date and end_date and start_date > end_date:
+            raise HTTPException(400, "La fecha final no puede ser anterior a la inicial.")
+        with db() as conn:
+            course = _course(conn, course_id)
+            if rows(execute(conn, "SELECT id FROM nexus_admin_courses WHERE course_code=? AND id<>?", (code, course_id))):
+                raise HTTPException(409, "Ya existe otro curso con ese código.")
+            previous = str(course.get("instructor_email") or "").strip().lower()
+            execute(
+                conn,
+                """UPDATE nexus_admin_courses SET course_code=?,title=?,description=?,term=?,status=?,instructor_email=?,start_date=?,end_date=?,updated_at=? WHERE id=?""",
+                (code, clean_title, description.strip(), term.strip(), status, professor, start_date.strip() or None, end_date.strip() or None, utcnow(), course_id),
+            )
+            assign_professor(conn, course_id, professor)
+            if previous and previous != professor:
+                execute(
+                    conn,
+                    "UPDATE nexus_admin_enrollments SET status='inactive' WHERE course_id=? AND user_email=? AND course_role='instructor'",
+                    (course_id, previous),
+                )
+            audit(conn, admin["email"], "course_configuration_updated", "course", str(course_id), f"{code}:{professor}:{status}", request.client.host if request.client else "")
         return RedirectResponse(f"{PREFIX}/courses/{course_id}", status_code=303)
