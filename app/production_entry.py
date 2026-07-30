@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-"""Entrada única y determinista de producción para NEXUS EDU XR.
+"""Entrada única y determinista de producción para NUVEDRA.
 
 La consola administrativa, la gestión de roles, el Studio unificado, el Centro
-de Innovación y el Portal Administrativo Integral se incorporan a la misma
-aplicación FastAPI y comparten usuarios, permisos, navegación, datos y
-diagnóstico.
+de Innovación, la administración de la portada y el Portal Administrativo
+Integral se incorporan a la misma aplicación FastAPI.
 """
 
 from fastapi import FastAPI
@@ -13,6 +12,7 @@ from fastapi import FastAPI
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
 from app.admin_system import register_admin_system
+from app.home_content import register_home_content
 from app.innovation_hub import register_innovation_hub
 from app.main import app
 from app.role_management import register_role_management
@@ -39,7 +39,7 @@ def _register_administration() -> None:
 
 
 def _register_unified_studio() -> None:
-    isolated = FastAPI(title="NEXUS Unified Authoring Router")
+    isolated = FastAPI(title="NUVEDRA Unified Authoring Router")
     register_unified_authoring(isolated)
     register_innovation_hub(isolated)
     routes = [route for route in isolated.router.routes if _is_authoring_route(route)]
@@ -53,6 +53,7 @@ def _register_unified_studio() -> None:
 
 def _register_integrated_portal() -> None:
     register_admin_portal(app)
+    register_home_content(app)
     app.openapi_schema = None
 
 
@@ -63,9 +64,14 @@ def _validate() -> None:
     ]
     required = {
         ("/healthz", "GET"),
+        ("/api/home-content", "GET"),
         ("/course-studio", "GET"),
         ("/admin", "GET"),
         ("/admin/login", "GET"),
+        ("/admin/home-content", "GET"),
+        ("/admin/home-content/save", "POST"),
+        ("/admin/home-content/{item_id}/toggle", "POST"),
+        ("/admin/home-content/{item_id}/delete", "POST"),
         ("/admin/courses", "GET"),
         ("/admin/system", "GET"),
         ("/admin/system/health", "GET"),
@@ -115,9 +121,18 @@ def _validate() -> None:
     registered = [
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
-        if path.startswith(("/course-studio", "/admin/authoring", "/admin/system", "/admin/users", "/admin/roles", "/admin/enrollments", "/admin"))
+        if path.startswith((
+            "/course-studio",
+            "/admin/authoring",
+            "/admin/system",
+            "/admin/users",
+            "/admin/roles",
+            "/admin/enrollments",
+            "/admin/home-content",
+            "/admin",
+        ))
     ]
-    print("NEXUS unified routes: " + " | ".join(registered), flush=True)
+    print("NUVEDRA unified routes: " + " | ".join(registered), flush=True)
     if missing:
         raise RuntimeError("Faltan rutas unificadas: " + ", ".join(missing))
 

@@ -1,1 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="NEXUS EDU XR"><rect width="512" height="512" rx="120" fill="#007B5F"/><circle cx="256" cy="256" r="150" fill="none" stroke="#FED141" stroke-width="28"/><path d="M151 330V182h47l116 101V182h48v148h-46L199 229v101z" fill="#fff"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">NUVEDRA</title>
+  <desc id="desc">Letra N geométrica que representa conexión, aprendizaje y experiencias inmersivas.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#090B2B"/>
+      <stop offset="1" stop-color="#2B2D6E"/>
+    </linearGradient>
+    <linearGradient id="n" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C3AED"/>
+      <stop offset=".5" stop-color="#4338CA"/>
+      <stop offset="1" stop-color="#00B8C8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path d="M116 374V138h70l140 145V138h70v236h-66L186 228v146z" fill="none" stroke="url(#n)" stroke-width="42" stroke-linejoin="round"/>
+  <circle cx="256" cy="256" r="16" fill="#FFB000"/>
+</svg>

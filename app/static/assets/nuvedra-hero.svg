@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" role="img" aria-labelledby="title desc">
+  <title id="title">Experiencia educativa inmersiva de NUVEDRA</title>
+  <desc id="desc">Ilustración futurista de una persona utilizando un visor de realidad extendida frente a un globo holográfico y paneles de aprendizaje.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07143D"/><stop offset=".55" stop-color="#102B76"/><stop offset="1" stop-color="#34177A"/></linearGradient>
+    <linearGradient id="hoodie" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0A1A45"/><stop offset="1" stop-color="#164B9B"/></linearGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#4338CA"/><stop offset=".5" stop-color="#00D3C7"/><stop offset="1" stop-color="#38BDF8"/></linearGradient>
+    <radialGradient id="globe"><stop stop-color="#C9FBFF"/><stop offset=".3" stop-color="#28DCE1"/><stop offset="1" stop-color="#2563EB" stop-opacity="0"/></radialGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="soft"><feGaussianBlur stdDeviation="22"/></filter>
+  </defs>
+  <rect width="900" height="520" fill="url(#bg)"/>
+  <circle cx="620" cy="120" r="170" fill="#00D3C7" opacity=".08" filter="url(#soft)"/>
+  <circle cx="760" cy="365" r="210" fill="#6D28D9" opacity=".16" filter="url(#soft)"/>
+  <g opacity=".35" stroke="#38BDF8" fill="none"><path d="M60 90h270M35 150h330M115 410h210"/><path d="M120 55v390M230 25v450M340 75v360" opacity=".25"/></g>
+  <g transform="translate(555 76)" filter="url(#glow)">
+    <circle cx="0" cy="0" r="88" fill="url(#globe)" opacity=".8"/>
+    <circle cx="0" cy="0" r="58" fill="none" stroke="#9BF8FF" stroke-width="2"/>
+    <ellipse cx="0" cy="0" rx="58" ry="23" fill="none" stroke="#9BF8FF" stroke-width="1.5"/>
+    <ellipse cx="0" cy="0" rx="25" ry="58" fill="none" stroke="#9BF8FF" stroke-width="1.5"/>
+    <path d="M-43-27l18-9 17 8 12-12 24 13 13 20-12 11-20-2-11 19-21-5-8-18z" fill="#9BF8FF" opacity=".48"/>
+  </g>
+  <g opacity=".7" fill="none" stroke="#63EAF0"><rect x="375" y="170" width="145" height="88" rx="12"/><path d="M395 225l24-25 26 14 28-33 27 15"/><circle cx="397" cy="188" r="4" fill="#FFB000" stroke="none"/><rect x="660" y="105" width="170" height="96" rx="12"/><path d="M680 170h126M680 145h82M680 122h105"/></g>
+  <g transform="translate(565 154)">
+    <path d="M85 130c-27-7-52-7-77 2-32 12-56 41-65 85l-24 123h339l-16-126c-7-55-41-82-90-91z" fill="url(#hoodie)"/>
+    <path d="M65 100c-5 28 11 55 38 64 32 11 65-9 71-43l7-40-104-31z" fill="#E7AF91"/>
+    <path d="M50 62c8-47 48-75 96-60 35 11 55 38 48 77l-10 50c-15-22-32-33-55-36-31-4-52-15-79-31z" fill="#10172C"/>
+    <g transform="rotate(7 115 72)" filter="url(#glow)"><path d="M47 47c18-18 101-18 132 2l-8 58c-34 19-98 16-130-7z" fill="#06132E" stroke="url(#visor)" stroke-width="8"/><path d="M62 68c29-12 72-12 102 1" fill="none" stroke="#B8FCFF" stroke-width="5" stroke-linecap="round"/><path d="M45 70H17" stroke="#4338CA" stroke-width="12" stroke-linecap="round"/></g>
+    <path d="M96 147c22 13 48 14 69-2" fill="none" stroke="#CF806B" stroke-width="4" stroke-linecap="round"/>
+    <path d="M-7 259c-58-7-108-34-132-68-13-18-26-10-30 7-5 22 19 50 55 73 44 28 86 39 129 42z" fill="#E7AF91"/>
+    <path d="M-160 196l-28-36c-8-11-24-5-20 9l15 49" fill="#E7AF91"/>
+    <path d="M-191 163l4-55c1-14 18-14 20 0l6 57" fill="#E7AF91"/>
+    <circle cx="-190" cy="106" r="9" fill="#63F7EF" filter="url(#glow)"/>
+  </g>
+  <g fill="#9BF8FF" opacity=".75"><circle cx="350" cy="115" r="4"/><circle cx="408" cy="80" r="3"/><circle cx="485" cy="302" r="5"/><circle cx="780" cy="260" r="4"/><circle cx="835" cy="315" r="3"/></g>
+  <path d="M50 470C270 390 520 515 860 410" fill="none" stroke="#00D3C7" stroke-width="2" opacity=".35"/>
+</svg>
