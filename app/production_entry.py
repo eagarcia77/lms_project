@@ -7,7 +7,10 @@ de Innovación, la administración de la portada y el Portal Administrativo
 Integral se incorporan a la misma aplicación FastAPI.
 """
 
+from pathlib import Path
+
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
 from app.admin_console import register_admin_console
 from app.admin_portal import register_admin_portal
@@ -19,15 +22,29 @@ from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
 
 AUTHORING_PREFIXES = ("/admin/authoring", "/course-studio", "/course-builder")
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _path(route: object) -> str:
     return str(getattr(route, "path", ""))
 
 
+def _methods(route: object) -> set[str]:
+    return set(getattr(route, "methods", set()) or set())
+
+
 def _is_authoring_route(route: object) -> bool:
     path = _path(route)
     return any(path == prefix or path.startswith(prefix + "/") for prefix in AUTHORING_PREFIXES)
+
+
+def _remove_get_route(path: str) -> None:
+    """Replace only the public GET route while preserving POST authentication."""
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not (_path(route) == path and "GET" in _methods(route))
+    ]
 
 
 def _register_administration() -> None:
@@ -57,13 +74,28 @@ def _register_integrated_portal() -> None:
     app.openapi_schema = None
 
 
+def _register_public_login() -> None:
+    """Use the production NUVEDRA homepage for the unauthenticated login view."""
+    _remove_get_route("/login")
+
+    @app.get("/login", include_in_schema=False, response_class=FileResponse)
+    async def nuvedra_login() -> FileResponse:
+        page = STATIC_DIR / "index.html"
+        if not page.is_file():
+            raise RuntimeError("No se encontró la página principal de NUVEDRA.")
+        return FileResponse(page, media_type="text/html; charset=utf-8")
+
+    app.openapi_schema = None
+
+
 def _validate() -> None:
     snapshot = [
-        (_path(route), set(getattr(route, "methods", set()) or set()))
+        (_path(route), _methods(route))
         for route in app.router.routes
     ]
     required = {
         ("/healthz", "GET"),
+        ("/login", "GET"),
         ("/api/home-content", "GET"),
         ("/course-studio", "GET"),
         ("/admin", "GET"),
@@ -122,6 +154,7 @@ def _validate() -> None:
         f"{'/'.join(sorted(methods)) or '-'} {path}"
         for path, methods in snapshot
         if path.startswith((
+            "/login",
             "/course-studio",
             "/admin/authoring",
             "/admin/system",
@@ -140,4 +173,5 @@ def _validate() -> None:
 _register_administration()
 _register_unified_studio()
 _register_integrated_portal()
+_register_public_login()
 _validate()

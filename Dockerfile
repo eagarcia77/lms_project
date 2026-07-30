@@ -10,12 +10,11 @@ COPY . .
 # homepage content management and administration layers while applying
 # the authenticated V3 base package.
 RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
-    && cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
     && cp /tmp/nexus-overlay/app/* app/ \
-    && rm -rf app/static \
     && mkdir -p app/static \
     && cp -a /tmp/nexus-overlay/static/. app/static/ \
     && cp /tmp/nexus-overlay/start_runtime.sh /tmp/nexus-overlay/requirements.txt ./
@@ -27,15 +26,18 @@ RUN python tools/patch_admin_portal_roles.py
 RUN python tools/disable_pwa_cache.py
 RUN python tools/fix_unified_authoring_templates.py
 RUN python tools/patch_nuvedra_branding.py
+RUN python app/patch_public_homepage_runtime.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
     && test -f app/admin_portal.py \
     && test -f app/role_management.py \
     && test -f app/production_entry.py \
     && test -f app/home_content.py \
+    && test -f app/patch_public_homepage_runtime.py \
     && test -f app/admin_authoring_v6.py \
     && test -f app/admin_console.py \
     && test -f app/admin_system.py \
+    && test -f app/static/auth.js \
     && test -f app/static/assets/nuvedra-logo.svg \
     && test -f app/static/assets/nuvedra-hero.svg \
     && test -f tools/patch_admin_portal_roles.py \
@@ -62,6 +64,7 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_integrated_portal.py \
     tools/smoke_test_role_management.py \
     tools/smoke_test_nuvedra_branding.py
+RUN node --check app/static/app.js && node --check app/static/auth.js
 RUN python tools/validate_runtime_dependencies.py
 RUN APP_NAME=NUVEDRA \
     SESSION_SECRET=build-verification-session-secret-change-in-production \
@@ -79,6 +82,7 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py \
     && grep -q "NUVEDRA" app/static/index.html \
     && grep -q "/api/home-content" app/static/app.js \
+    && grep -q "NUVEDRA_PUBLIC_LOGIN_SAFE_V1" app/static/app.js \
     && grep -q "NUVEDRA_ACCESSIBLE_THEME_V1" app/static/styles.css \
     && grep -q '"name": "NUVEDRA"' app/static/manifest.json \
     && grep -q "prefers-reduced-motion" app/static/styles.css \
