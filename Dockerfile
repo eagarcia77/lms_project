@@ -26,6 +26,7 @@ RUN python tools/disable_pwa_cache.py
 RUN python tools/fix_unified_authoring_templates.py
 RUN python tools/patch_nuvedra_branding.py
 RUN python app/patch_public_homepage_runtime.py
+RUN python tools/patch_visual_course_studio.py
 RUN test -f app/unified_authoring.py \
     && test -f app/innovation_hub.py \
     && test -f app/course_workspace.py \
@@ -48,12 +49,16 @@ RUN test -f app/unified_authoring.py \
     && test -f app/static/app.js \
     && test -f app/static/auth.js \
     && test -f app/static/i18n.js \
+    && test -f app/static/course-studio.js \
+    && test -f app/static/course-studio.css \
     && test -f app/static/assets/nuvedra-logo.svg \
     && test -f app/static/assets/nuvedra-hero.svg \
     && test -f tools/patch_admin_portal_roles.py \
     && test -f tools/disable_pwa_cache.py \
     && test -f tools/fix_unified_authoring_templates.py \
     && test -f tools/patch_nuvedra_branding.py \
+    && test -f tools/patch_visual_course_studio.py \
+    && test -f tools/validate_visual_course_studio_source.py \
     && test -f tools/validate_runtime_dependencies.py \
     && test -f tools/validate_unified_routes.py \
     && test -f tools/smoke_test_admin_flow.py \
@@ -72,6 +77,8 @@ RUN python -m py_compile app/*.py \
     tools/disable_pwa_cache.py \
     tools/fix_unified_authoring_templates.py \
     tools/patch_nuvedra_branding.py \
+    tools/patch_visual_course_studio.py \
+    tools/validate_visual_course_studio_source.py \
     tools/validate_runtime_dependencies.py \
     tools/validate_unified_routes.py \
     tools/smoke_test_admin_flow.py \
@@ -84,7 +91,8 @@ RUN python -m py_compile app/*.py \
     tools/smoke_test_course_editor_access.py
 # The production image is Python-only. JavaScript syntax is validated in CI,
 # while Docker verifies that frontend files exist, are UTF-8 and non-empty.
-RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js'),Path('app/static/i18n.js')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos JavaScript vacíos'"
+RUN python -c "from pathlib import Path; files=[Path('app/static/app.js'),Path('app/static/auth.js'),Path('app/static/i18n.js'),Path('app/static/course-studio.js'),Path('app/static/course-studio.css')]; [p.read_text(encoding='utf-8') for p in files]; assert all(p.stat().st_size > 0 for p in files), 'Archivos frontend vacíos'"
+RUN python tools/validate_visual_course_studio_source.py
 RUN python tools/validate_runtime_dependencies.py
 RUN APP_NAME=NUVEDRA \
     SESSION_SECRET=build-verification-session-secret-change-in-production \
@@ -108,6 +116,10 @@ RUN grep -q "store_token" app/google_api.py \
     && grep -q "NUVEDRA Course Workspace" app/course_workspace.py \
     && grep -q "register_course_editor_access" app/production_entry.py \
     && grep -q "administrator_enabled_as_instructor" app/course_editor_access.py \
+    && grep -q "NUVEDRA_VISUAL_STUDIO_PREVIEW_V1" app/course_editor_access.py \
+    && grep -q 'data-testid="visual-course-studio"' app/course_editor_access.py \
+    && grep -q 'data-testid="visual-module-studio"' app/course_editor_access.py \
+    && grep -q 'data-testid="visual-item-editor"' app/course_editor_access.py \
     && grep -q "google-hub" app/course_workspace.py \
     && grep -q "Tecnologías emergentes" app/course_workspace.py \
     && grep -q "course_created_and_professor_assigned" app/academic_access.py \
