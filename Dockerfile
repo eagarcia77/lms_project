@@ -6,11 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY . .
 
-# Preserve the consolidated authoring, innovation, role-based academic portal,
-# English-first bilingual layer, Google authentication, course workspace,
-# homepage content management and administration layers while applying V3.
+# Preserve NUVEDRA extensions while allowing the authenticated V3 package to
+# keep its own google_api.py contract used by app/main.py.
 RUN mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static \
-    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/google_api.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
+    && cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/ \
     && cp -a app/static/. /tmp/nexus-overlay/static/ \
     && cp start_runtime.sh requirements.txt /tmp/nexus-overlay/ \
     && python tools/apply_v3.py \
@@ -95,7 +94,8 @@ RUN PYTHONPATH=. python tools/smoke_test_nuvedra_branding.py
 RUN PYTHONPATH=. python tools/smoke_test_course_workspace.py
 RUN PYTHONPATH=. python tools/smoke_test_academic_roles.py
 RUN PYTHONPATH=. python tools/smoke_test_platform_upgrade.py
-RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
+RUN grep -q "store_token" app/google_api.py \
+    && grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py \
     && grep -q "Administración integral" app/admin_portal.py \
     && grep -q '"/admin/roles"' app/admin_portal.py \
@@ -106,7 +106,8 @@ RUN grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
     && grep -q "Tecnologías emergentes" app/course_workspace.py \
     && grep -q "course_created_and_professor_assigned" app/academic_access.py \
     && grep -q "Google Hub sencillo" app/google_hub_safe.py \
-    && grep -q "getattr(google_api, \"TOKEN_STORE\"" app/google_hub_safe.py \
+    && grep -q "/api/google/drive/files" app/google_hub_safe.py \
+    && ! grep -q "from app import google_api" app/google_hub_safe.py \
     && grep -q "register_platform_upgrade" app/production_entry.py \
     && grep -q 'DEFAULT_LANGUAGE = "en"' app/static/i18n.js \
     && grep -q '"Español"' app/static/i18n.js \

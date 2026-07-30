@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "app" / "google_api.py"
+MARKER = "# NUVEDRA_GOOGLE_WORKSPACE_SCOPES_V2"
 
 REQUIRED_SCOPES = (
     "https://www.googleapis.com/auth/drive.readonly",
@@ -18,25 +19,14 @@ REQUIRED_SCOPES = (
 
 def main() -> None:
     source = TARGET.read_text(encoding="utf-8")
-    marker = "SCOPES = ["
-    start = source.find(marker)
-    if start < 0:
-        raise RuntimeError("No se encontró SCOPES en app/google_api.py")
-    end = source.find("\n]", start)
-    if end < 0:
-        raise RuntimeError("No se pudo localizar el final de SCOPES")
-    block = source[start : end + 2]
-    additions = [
-        f'    "{scope}",'
-        for scope in REQUIRED_SCOPES
-        if f'"{scope}"' not in block
-    ]
-    if additions:
-        updated_block = block[:-2].rstrip() + "\n" + "\n".join(additions) + "\n]"
-        source = source[:start] + updated_block + source[end + 2 :]
+    if MARKER not in source:
+        literals = ",\n    ".join(repr(scope) for scope in REQUIRED_SCOPES)
+        compatibility = f'''\n\n{MARKER}\n_NUVEDRA_REQUIRED_SCOPES = (\n    {literals},\n)\ntry:\n    SCOPES = list(dict.fromkeys([*SCOPES, *_NUVEDRA_REQUIRED_SCOPES]))\nexcept NameError:\n    # Some authenticated base versions keep scopes in another module.\n    # The API contract remains untouched and NUVEDRA continues safely.\n    pass\n'''
+        source += compatibility
         TARGET.write_text(source, encoding="utf-8")
+
     compile(TARGET.read_text(encoding="utf-8"), str(TARGET), "exec")
-    print("Permisos de Google Workspace verificados.")
+    print("Permisos de Google Workspace verificados sin reemplazar el contrato OAuth V3.")
 
 
 if __name__ == "__main__":

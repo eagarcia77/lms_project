@@ -17,7 +17,7 @@ jobs:
       - name: Preserve unified overlay and apply authenticated base
         run: |
           mkdir -p /tmp/nexus-overlay/app /tmp/nexus-overlay/static
-          cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/google_api.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/
+          cp app/unified_authoring.py app/innovation_hub.py app/course_workspace.py app/academic_portal.py app/academic_access.py app/faculty_portal.py app/student_portal.py app/google_hub_safe.py app/platform_upgrade.py app/admin_portal.py app/role_management.py app/production_entry.py app/home_content.py app/patch_public_homepage_runtime.py app/admin_authoring_v6.py app/admin_console.py app/admin_system.py /tmp/nexus-overlay/app/
           cp -a app/static/. /tmp/nexus-overlay/static/
           cp start_runtime.sh requirements.txt /tmp/nexus-overlay/
           python tools/apply_v3.py
@@ -46,9 +46,9 @@ jobs:
       - run: PYTHONPATH=. python tools/smoke_test_platform_upgrade.py
       - run: PYTHONPATH=. pytest -q
       - run: node --check app/static/app.js && node --check app/static/auth.js && node --check app/static/sw.js && node --check app/static/i18n.js
-      - run: grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py
+      - run: grep -q "store_token" app/google_api.py && grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py && grep -q "https://www.googleapis.com/auth/forms.body" app/google_api.py
       - run: grep -q "Administración integral" app/admin_portal.py && grep -q '"/admin/roles"' app/admin_portal.py && grep -q '"/admin/home-content"' app/admin_portal.py && grep -q "Debe permanecer por lo menos un superadministrador activo" app/role_management.py
       - run: grep -q "NUVEDRA Course Workspace" app/course_workspace.py && grep -q "google-hub" app/course_workspace.py && grep -q "Tecnologías emergentes" app/course_workspace.py
-      - run: grep -q "course_created_and_professor_assigned" app/academic_access.py && grep -q "Google Hub sencillo" app/google_hub_safe.py && grep -q "getattr(google_api, \"TOKEN_STORE\"" app/google_hub_safe.py && grep -q "register_platform_upgrade" app/production_entry.py && grep -q 'DEFAULT_LANGUAGE = "en"' app/static/i18n.js && grep -q '"Español"' app/static/i18n.js && grep -q "student_assessment_submitted" app/student_portal.py
+      - run: grep -q "course_created_and_professor_assigned" app/academic_access.py && grep -q "Google Hub sencillo" app/google_hub_safe.py && grep -q "/api/google/drive/files" app/google_hub_safe.py && ! grep -q "from app import google_api" app/google_hub_safe.py && grep -q "register_platform_upgrade" app/production_entry.py && grep -q 'DEFAULT_LANGUAGE = "en"' app/static/i18n.js && grep -q '"Español"' app/static/i18n.js && grep -q "student_assessment_submitted" app/student_portal.py
       - run: grep -q "NUVEDRA" app/static/index.html && grep -q "NUVEDRA_PUBLIC_LOGIN_SAFE_V1" app/static/app.js && grep -q "NUVEDRA_ACCESSIBLE_THEME_V1" app/static/styles.css && grep -q '"name": "NUVEDRA"' app/static/manifest.json && grep -q "prefers-reduced-motion" app/static/styles.css && grep -q "forced-colors" app/static/styles.css && ! grep -q "NEXUS EDU XR" app/static/index.html && ! grep -qi "#007B5F\|#FED141\|#85714D" app/static/styles.css
       - run: grep -q "NEXUS_PWA_DISABLED_FOR_STABILITY" app/static/app.js && grep -q "self.registration.unregister()" app/static/sw.js && ! grep -q 'register("/static/sw.js")' app/static/app.js
