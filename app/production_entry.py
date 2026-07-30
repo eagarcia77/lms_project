@@ -21,6 +21,7 @@ from app.course_workspace import ALL_ITEM_TYPES, register_course_workspace
 from app.home_content import register_home_content
 from app.innovation_hub import register_innovation_hub
 from app.main import app
+from app.platform_upgrade import register_platform_upgrade
 from app.role_management import register_role_management
 from app.unified_authoring import register_unified_authoring
 
@@ -198,4 +199,5 @@ _register_administration()
 _register_unified_studio()
 _register_integrated_portal()
 _register_public_login()
+register_platform_upgrade(app)
 _validate()
