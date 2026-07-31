@@ -103,10 +103,22 @@ def main() -> None:
             )
 
         expect(client.get('/__smoke/google-user/professor'), 200, 'sesión de profesor')
-        faculty = client.get(f'/faculty/courses/{course_id}')
-        expect(faculty, 200, 'espacio del profesor')
-        if 'Crear módulo' not in faculty.text or 'desarrollar módulos' not in faculty.text:
-            raise RuntimeError('El espacio del profesor no mostró el flujo sencillo esperado.')
+        legacy_faculty = client.get(f'/faculty/courses/{course_id}')
+        expect(legacy_faculty, 303, 'redirección del espacio docente anterior')
+        studio_location = f'/faculty/studio/courses/{course_id}'
+        if legacy_faculty.headers.get('location', '') != studio_location:
+            raise RuntimeError(
+                'La ruta docente anterior no redirigió al Visual Course Studio: '
+                f"{legacy_faculty.headers.get('location', '')!r}."
+            )
+        faculty = client.get(studio_location)
+        expect(faculty, 200, 'Visual Course Studio del profesor')
+        for marker in (
+            'data-testid="visual-course-studio"',
+            f'action="/faculty/studio/courses/{course_id}/modules"',
+        ):
+            if marker not in faculty.text:
+                raise RuntimeError(f'El Visual Course Studio no mostró {marker!r}.')
 
         module_response = client.post(f'/faculty/courses/{course_id}/modules', data={
             'title': 'Módulo publicado',
@@ -176,7 +188,7 @@ def main() -> None:
         expect(student_course, 200, 'vista del curso para estudiante')
         if 'Evaluación del módulo' not in student_course.text:
             raise RuntimeError('El estudiante no pudo ver la evaluación publicada.')
-        expect(client.get(f'/faculty/courses/{course_id}'), 403, 'bloqueo de autoría para estudiante')
+        expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para estudiante')
         item = client.get(f'/learn/items/{item_id}')
         expect(item, 200, 'evaluación para estudiante')
         if 'Responder evaluación' not in item.text:
@@ -197,12 +209,13 @@ def main() -> None:
 
         expect(client.get('/__smoke/google-user/observer'), 200, 'sesión de observador')
         expect(client.get(f'/learn/items/{item_id}'), 200, 'lectura para observador')
+        expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para observador')
         expect(client.post(f'/learn/items/{item_id}/submit', data={
             'response_text': 'No debe guardarse.',
             'response_url': '',
         }), 403, 'bloqueo de entrega para observador')
 
-    print('Portal por roles validado: administrador crea y asigna; profesor desarrolla; estudiante visualiza y responde; Google Drive falla de forma segura.', flush=True)
+    print('Portal por roles validado: administrador crea y asigna; profesor desarrolla en Visual Course Studio; estudiante visualiza y responde; Google Drive falla de forma segura.', flush=True)
 
 
 if __name__ == '__main__':
