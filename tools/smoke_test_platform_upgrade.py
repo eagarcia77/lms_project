@@ -101,8 +101,19 @@ def main() -> None:
         if "Administrator as Instructor" not in portal.text or f'/faculty/courses/{course_id}' not in portal.text:
             raise RuntimeError("The administrator could not see the assigned instructor workspace.")
 
-        faculty = client.get(f"/faculty/courses/{course_id}")
-        expect(faculty, 200, "administrator using instructor tools")
+        legacy_faculty = client.get(f"/faculty/courses/{course_id}")
+        expect(legacy_faculty, 303, "legacy instructor route redirect")
+        studio_location = f"/faculty/studio/courses/{course_id}"
+        if legacy_faculty.headers.get("location", "") != studio_location:
+            raise RuntimeError(
+                "The legacy instructor route did not redirect to Visual Course Studio: "
+                f"{legacy_faculty.headers.get('location', '')!r}."
+            )
+
+        faculty = client.get(studio_location)
+        expect(faculty, 200, "administrator using Visual Course Studio")
+        if 'data-testid="visual-course-studio"' not in faculty.text:
+            raise RuntimeError("The administrator-instructor did not receive the Visual Course Studio interface.")
 
         module = client.post(
             f"/faculty/courses/{course_id}/modules",
@@ -130,7 +141,7 @@ def main() -> None:
             raise RuntimeError("The safe Google Hub did not display the shared-link workflow.")
 
     print(
-        "Platform upgrade validated: English-first language switch, safe Google Hub, and administrator-instructor workflow.",
+        "Platform upgrade validated: English-first language switch, safe Google Hub, Visual Course Studio redirect, and administrator-instructor workflow.",
         flush=True,
     )
 
