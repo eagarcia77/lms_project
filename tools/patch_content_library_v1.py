@@ -6,6 +6,8 @@ SOURCE = Path("tools/content_library_v1_module.py.txt")
 MODULE = Path("app/content_library.py")
 ACADEMIC_PORTAL = Path("app/academic_portal.py")
 STUDIO_JS = Path("app/static/course-studio.js")
+UNIFIED_AUTHORING = Path("app/unified_authoring.py")
+COURSE_EDITOR = Path("app/course_editor_access.py")
 TAG = "NUVEDRA_CONTENT_LIBRARY_V1"
 
 
@@ -32,6 +34,31 @@ def patch_academic_portal() -> None:
         "Content Library registration",
     )
     ACADEMIC_PORTAL.write_text(text, encoding="utf-8")
+
+
+def protected_resource_helper() -> str:
+    return '''def _content_resource_url(value: Any) -> str | None:\n    clean = str(value or "").strip()\n    prefix = "/library/assets/"\n    suffix = "/download"\n    if clean.startswith(prefix) and clean.endswith(suffix):\n        asset_id = clean[len(prefix):-len(suffix)]\n        if asset_id.isdigit():\n            return clean\n    return safe_url(clean)\n\n\n'''
+
+
+def patch_internal_library_urls() -> None:
+    unified = UNIFIED_AUTHORING.read_text(encoding="utf-8")
+    if "def _content_resource_url(value: Any)" not in unified:
+        marker = "def _insert_item(\n"
+        if marker not in unified:
+            raise RuntimeError("Content Library v1 could not add protected URL support to unified authoring.")
+        unified = unified.replace(marker, protected_resource_helper() + marker, 1)
+    unified = unified.replace("            safe_url(external_url) or None,", "            _content_resource_url(external_url) or None,")
+    UNIFIED_AUTHORING.write_text(unified, encoding="utf-8")
+
+    editor = COURSE_EDITOR.read_text(encoding="utf-8")
+    if "def _content_resource_url(value: Any)" not in editor:
+        marker = "def _normalize_positions(conn: Any, table: str, parent_column: str, parent_id: int) -> list[dict[str, Any]]:\n"
+        if marker not in editor:
+            raise RuntimeError("Content Library v1 could not add protected URL support to Visual Course Studio.")
+        editor = editor.replace(marker, protected_resource_helper() + marker, 1)
+    editor = editor.replace("safe_url(external_url), safe_url(embed_url)", "_content_resource_url(external_url), safe_url(embed_url)")
+    editor = editor.replace('type="url" name="external_url"', 'type="text" name="external_url"')
+    COURSE_EDITOR.write_text(editor, encoding="utf-8")
 
 
 def patch_studio_js() -> None:
@@ -80,6 +107,7 @@ def main() -> None:
         raise RuntimeError("Content Library v1 source template is missing.")
     MODULE.write_text(SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
     patch_academic_portal()
+    patch_internal_library_urls()
     patch_studio_js()
     print("NUVEDRA Content Library v1 installed: reusable files and links, protected downloads, accessibility metadata, and course reuse.", flush=True)
 
