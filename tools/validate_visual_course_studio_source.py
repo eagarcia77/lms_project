@@ -37,6 +37,8 @@ def main() -> None:
             'data-rich-editor',
             'data-assessment-settings',
             'data-select-type',
+            'NUVEDRA_GRADEBOOK_V1',
+            'data-gradebook-link',
         ),
     )
     require(
@@ -48,7 +50,27 @@ def main() -> None:
             '@media(forced-colors:active)',
         ),
     )
-    print("Visual Course Studio source validated.", flush=True)
+    require(
+        "app/gradebook.py",
+        (
+            'CREATE TABLE IF NOT EXISTS nuvedra_grades',
+            '/courses/{course_id}/gradebook',
+            '/submissions/{submission_id}/grade',
+            'gradebook.csv',
+            '/learn/courses/{course_id}/grades',
+            'submission_graded',
+            'data-testid="course-gradebook"',
+            'data-testid="student-grades"',
+        ),
+    )
+    require(
+        "app/academic_portal.py",
+        (
+            'from app.gradebook import register_gradebook',
+            'register_gradebook(app)',
+        ),
+    )
+    print("Visual Course Studio and Gradebook v1 source validated.", flush=True)
 
 
 if __name__ == "__main__":
