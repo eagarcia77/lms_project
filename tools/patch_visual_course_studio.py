@@ -120,6 +120,9 @@ def main() -> None:
     from patch_assessments_smoke import main as patch_assessments_smoke
     patch_assessments_smoke()
 
+    from patch_gradebook_v2_smoke import main as patch_gradebook_v2_smoke
+    patch_gradebook_v2_smoke()
+
     from patch_logo_visibility import main as patch_logo_visibility
     patch_logo_visibility()
 
