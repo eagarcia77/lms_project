@@ -1,0 +1,743 @@
+from __future__ import annotations
+
+import html
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_authoring_v6 import sanitize_html
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+ASSESSMENT_TYPES_V2 = {"assessment", "quiz"}
+QUESTION_TYPES = {"multiple_choice", "true_false", "short_answer", "essay"}
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _esc(value: Any, *, attr: bool = False) -> str:
+    return html.escape(str(value or ""), quote=attr)
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def ensure_assessment_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_questions (
+                id {pk},
+                item_id INTEGER NOT NULL,
+                question_type TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                choices_json TEXT NOT NULL DEFAULT '[]',
+                correct_answer TEXT,
+                points REAL NOT NULL DEFAULT 1,
+                position INTEGER NOT NULL DEFAULT 1,
+                feedback_correct TEXT,
+                feedback_incorrect TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_question_bank (
+                id {pk},
+                owner_email TEXT NOT NULL,
+                question_type TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                choices_json TEXT NOT NULL DEFAULT '[]',
+                correct_answer TEXT,
+                points REAL NOT NULL DEFAULT 1,
+                tags TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_attempts (
+                id {pk},
+                item_id INTEGER NOT NULL,
+                student_email TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                started_at TEXT NOT NULL,
+                submitted_at TEXT,
+                score_auto REAL NOT NULL DEFAULT 0,
+                score_total REAL,
+                has_manual_items INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(item_id,student_email,attempt_number)
+            )""",
+        )
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_answers (
+                id {pk},
+                attempt_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                answer_text TEXT,
+                is_correct INTEGER,
+                points_awarded REAL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(attempt_id,question_id)
+            )""",
+        )
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _metadata(item: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(str(item.get("metadata_json") or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _assessment_settings(item: dict[str, Any]) -> dict[str, Any]:
+    meta = _metadata(item)
+    settings = meta.get("assessment")
+    if not isinstance(settings, dict):
+        settings = {}
+    attempts = max(1, int(settings.get("attempts") or 1))
+    time_limit = max(0, int(settings.get("time_limit") or 0))
+    return {
+        "attempts": attempts,
+        "time_limit": time_limit,
+        "response_type": str(settings.get("response_type") or "structured"),
+        "rubric": str(settings.get("rubric") or ""),
+    }
+
+
+def _item_bundle(conn: Any, item_id: int) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    course_id, item, module = academic_access.item_bundle(conn, item_id)
+    if str(item.get("item_type")) not in ASSESSMENT_TYPES_V2:
+        raise HTTPException(400, "This item is not a structured assessment.")
+    return course_id, item, module
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _author_access(conn: Any, item_id: int, user: dict[str, Any]) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    course_id, item, module = _item_bundle(conn, item_id)
+    academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+    return course_id, item, module
+
+
+def _questions(conn: Any, item_id: int) -> list[dict[str, Any]]:
+    return rows(
+        execute(
+            conn,
+            "SELECT * FROM nuvedra_assessment_questions WHERE item_id=? ORDER BY position,id",
+            (item_id,),
+        )
+    )
+
+
+def _normalize_question_type(value: str) -> str:
+    value = value.strip()
+    if value not in QUESTION_TYPES:
+        raise HTTPException(400, "Invalid question type.")
+    return value
+
+
+def _choices(question_type: str, raw: str) -> list[str]:
+    if question_type == "true_false":
+        return ["True", "False"]
+    if question_type != "multiple_choice":
+        return []
+    values = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(values) < 2:
+        raise HTTPException(400, "Multiple-choice questions require at least two options.")
+    if len(set(values)) != len(values):
+        raise HTTPException(400, "Multiple-choice options must be unique.")
+    return values
+
+
+def _validate_correct_answer(question_type: str, choices: list[str], value: str) -> str:
+    answer = value.strip()
+    if question_type == "essay":
+        return ""
+    if not answer:
+        raise HTTPException(400, "A correct answer is required for automatically graded questions.")
+    if question_type in {"multiple_choice", "true_false"} and answer not in choices:
+        raise HTTPException(400, "The correct answer must match one of the available options.")
+    return answer
+
+
+def _question_form(item_id: int, question: dict[str, Any] | None = None) -> str:
+    question = question or {}
+    qid = int(question.get("id") or 0)
+    action = (
+        f"{STUDIO_PREFIX}/items/{item_id}/assessment/questions/{qid}/update"
+        if qid
+        else f"{STUDIO_PREFIX}/items/{item_id}/assessment/questions"
+    )
+    qtype = str(question.get("question_type") or "multiple_choice")
+    try:
+        choices = json.loads(str(question.get("choices_json") or "[]"))
+    except json.JSONDecodeError:
+        choices = []
+    choices_text = "\n".join(str(value) for value in choices if value is not None)
+    selected = lambda candidate: " selected" if qtype == candidate else ""
+    save_to_bank = "" if qid else '<label><input type="checkbox" name="save_to_bank" value="1"> <span data-i18n-en="Save a copy to my question bank" data-i18n-es="Guardar una copia en mi banco de preguntas">Save a copy to my question bank</span></label>'
+    return f"""
+    <form method="post" action="{action}" class="studio-panel" data-question-form>
+      <h3 data-i18n-en="{'Edit question' if qid else 'Add question'}" data-i18n-es="{'Editar pregunta' if qid else 'Añadir pregunta'}">{'Edit question' if qid else 'Add question'}</h3>
+      <label><span data-i18n-en="Question type" data-i18n-es="Tipo de pregunta">Question type</span>
+        <select name="question_type" data-question-type>
+          <option value="multiple_choice"{selected("multiple_choice")}>Multiple choice</option>
+          <option value="true_false"{selected("true_false")}>True / False</option>
+          <option value="short_answer"{selected("short_answer")}>Short answer</option>
+          <option value="essay"{selected("essay")}>Essay</option>
+        </select>
+      </label>
+      <label><span data-i18n-en="Question" data-i18n-es="Pregunta">Question</span><textarea name="prompt" required>{_esc(question.get("prompt"))}</textarea></label>
+      <label data-question-choices><span data-i18n-en="Options (one per line)" data-i18n-es="Opciones (una por línea)">Options (one per line)</span><textarea name="choices">{_esc(choices_text)}</textarea></label>
+      <label data-question-answer><span data-i18n-en="Correct answer" data-i18n-es="Respuesta correcta">Correct answer</span><input name="correct_answer" value="{_esc(question.get("correct_answer"), attr=True)}"><small data-i18n-en="For short answers, separate acceptable answers with ||." data-i18n-es="Para respuesta corta, separe respuestas aceptables con ||.">For short answers, separate acceptable answers with ||.</small></label>
+      <div class="studio-form-grid">
+        <label><span data-i18n-en="Points" data-i18n-es="Puntos">Points</span><input type="number" name="points" min="0" step="0.01" value="{_esc(question.get("points") if question.get("points") is not None else 1, attr=True)}" required></label>
+        <label><span data-i18n-en="Position" data-i18n-es="Posición">Position</span><input type="number" name="position" min="1" value="{_esc(question.get("position") or 1, attr=True)}" required></label>
+      </div>
+      <label><span data-i18n-en="Feedback when correct" data-i18n-es="Retroalimentación si es correcta">Feedback when correct</span><textarea name="feedback_correct">{_esc(question.get("feedback_correct"))}</textarea></label>
+      <label><span data-i18n-en="Feedback when incorrect" data-i18n-es="Retroalimentación si es incorrecta">Feedback when incorrect</span><textarea name="feedback_incorrect">{_esc(question.get("feedback_incorrect"))}</textarea></label>
+      {save_to_bank}
+      <button class="studio-button" data-i18n-en="{'Save question' if qid else 'Add question'}" data-i18n-es="{'Guardar pregunta' if qid else 'Añadir pregunta'}">{'Save question' if qid else 'Add question'}</button>
+    </form>
+    """
+
+
+def _question_card(item_id: int, question: dict[str, Any]) -> str:
+    qid = int(question["id"])
+    return f"""
+    <article class="studio-panel">
+      <p class="studio-eyebrow">#{int(question.get('position') or 1)} · {_esc(question.get('question_type'))} · {float(question.get('points') or 0):g} pts</p>
+      <h3>{_esc(question.get('prompt'))}</h3>
+      <details><summary data-i18n-en="Edit question" data-i18n-es="Editar pregunta">Edit question</summary>{_question_form(item_id, question)}</details>
+      <form method="post" action="{STUDIO_PREFIX}/items/{item_id}/assessment/questions/{qid}/delete" data-confirm data-confirm-en="Delete this question?" data-confirm-es="¿Eliminar esta pregunta?">
+        <button class="studio-button studio-button--danger" data-i18n-en="Delete" data-i18n-es="Eliminar">Delete</button>
+      </form>
+    </article>
+    """
+
+
+def _bank_card(item_id: int, question: dict[str, Any]) -> str:
+    return f"""
+    <article class="studio-panel">
+      <p class="studio-eyebrow">{_esc(question.get('question_type'))} · {float(question.get('points') or 0):g} pts</p>
+      <h3>{_esc(question.get('prompt'))}</h3>
+      <form method="post" action="{STUDIO_PREFIX}/items/{item_id}/assessment/bank/{int(question['id'])}/import">
+        <button class="studio-button studio-button--quiet" data-i18n-en="Add to assessment" data-i18n-es="Añadir a la evaluación">Add to assessment</button>
+      </form>
+    </article>
+    """
+
+
+def _student_access(conn: Any, item_id: int, user: dict[str, Any]) -> tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    course_id, item, module = _item_bundle(conn, item_id)
+    access = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+    if (
+        str(access.get("course_status")) != "active"
+        or str(module.get("status")) != "published"
+        or str(item.get("status")) != "published"
+    ):
+        raise HTTPException(403, "This assessment is not available.")
+    return course_id, item, module, access
+
+
+def _parse_iso(value: str) -> datetime:
+    clean = str(value or "").strip().replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(clean)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _deadline_ms(started_at: str, minutes: int) -> int:
+    if minutes <= 0:
+        return 0
+    start = _parse_iso(started_at)
+    return int((start.timestamp() + minutes * 60) * 1000)
+
+
+def _answer_input(question: dict[str, Any], existing: str = "") -> str:
+    qid = int(question["id"])
+    qtype = str(question.get("question_type"))
+    name = f"q_{qid}"
+    if qtype in {"multiple_choice", "true_false"}:
+        try:
+            choices = json.loads(str(question.get("choices_json") or "[]"))
+        except json.JSONDecodeError:
+            choices = []
+        controls = []
+        for option in choices:
+            checked = " checked" if str(existing) == str(option) else ""
+            controls.append(
+                f'<label class="studio-choice"><input type="radio" name="{name}" value="{_esc(option, attr=True)}"{checked} required> {_esc(option)}</label>'
+            )
+        return "".join(controls)
+    if qtype == "short_answer":
+        return f'<input name="{name}" value="{_esc(existing, attr=True)}" required>'
+    return f'<textarea name="{name}" rows="6" required>{_esc(existing)}</textarea>'
+
+
+def _grade_answer(question: dict[str, Any], answer: str) -> tuple[int | None, float | None]:
+    qtype = str(question.get("question_type"))
+    if qtype == "essay":
+        return None, None
+    actual = answer.strip().casefold()
+    expected = str(question.get("correct_answer") or "")
+    if qtype == "short_answer":
+        accepted = [part.strip().casefold() for part in expected.split("||") if part.strip()]
+        correct = actual in accepted
+    else:
+        correct = actual == expected.strip().casefold()
+    points = float(question.get("points") or 0) if correct else 0.0
+    return (1 if correct else 0), points
+
+
+def _upsert_submission(conn: Any, item_id: int, email: str, attempt_number: int, status: str) -> int:
+    now = utcnow()
+    summary = f"Structured assessment attempt {attempt_number} submitted ({status})."
+    found = rows(execute(conn, "SELECT id FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    if found:
+        submission_id = int(found[0]["id"])
+        execute(
+            conn,
+            "UPDATE nuvedra_submissions SET response_text=?,response_url=NULL,status='submitted',submitted_at=?,updated_at=? WHERE id=?",
+            (summary, now, now, submission_id),
+        )
+        return submission_id
+    return _insert_id(
+        conn,
+        "INSERT INTO nuvedra_submissions (item_id,student_email,response_text,response_url,status,submitted_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+        (item_id, email.lower(), summary, None, "submitted", now, now),
+    )
+
+
+def _sync_auto_grade(conn: Any, submission_id: int, score: float, user_email: str, fully_auto: bool) -> None:
+    if not fully_auto:
+        execute(conn, "DELETE FROM nuvedra_grades WHERE submission_id=?", (submission_id,))
+        return
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+    feedback = "Automatically graded by NUVEDRA Assessments."
+    if found:
+        execute(
+            conn,
+            "UPDATE nuvedra_grades SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE submission_id=?",
+            (score, feedback, "NUVEDRA AutoGrade", now, now, submission_id),
+        )
+    else:
+        execute(
+            conn,
+            "INSERT INTO nuvedra_grades (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+            (submission_id, score, feedback, "graded", "NUVEDRA AutoGrade", now, now),
+        )
+
+
+def register_assessment_engine(app: FastAPI) -> None:
+    ensure_assessment_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/items/{{item_id}}/assessment", response_class=HTMLResponse, response_model=None)
+    async def assessment_builder(item_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/assessment")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _author_access(conn, item_id, user)
+            questions = _questions(conn, item_id)
+            bank = rows(
+                execute(
+                    conn,
+                    "SELECT * FROM nuvedra_question_bank WHERE lower(owner_email)=? ORDER BY updated_at DESC,id DESC LIMIT 50",
+                    (user["email"].lower(),),
+                )
+            )
+        settings = _assessment_settings(item)
+        total_points = sum(float(question.get("points") or 0) for question in questions)
+        question_html = "".join(_question_card(item_id, question) for question in questions) or '<section class="studio-empty" data-i18n-en="No questions yet. Add the first question below." data-i18n-es="Todavía no hay preguntas. Añada la primera pregunta abajo.">No questions yet. Add the first question below.</section>'
+        bank_html = "".join(_bank_card(item_id, question) for question in bank) or '<section class="studio-empty" data-i18n-en="Your question bank is empty." data-i18n-es="Su banco de preguntas está vacío.">Your question bank is empty.</section>'
+        body = f"""{_assets()}
+        <main class="studio-shell" data-studio-root data-testid="assessment-builder">
+          <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/items/{item_id}/edit" data-i18n-en="Back to item" data-i18n-es="Volver al elemento">Back to item</a><span>/</span><a href="{STUDIO_PREFIX}/modules/{int(module['id'])}">{_esc(module.get('title'))}</a></nav>
+          <header class="studio-hero studio-hero--module">
+            <div><p class="studio-eyebrow" data-i18n-en="Assessment Builder" data-i18n-es="Constructor de evaluaciones">Assessment Builder</p><h2>{_esc(item.get('title'))}</h2><p data-i18n-en="Build structured questions without writing code." data-i18n-es="Cree preguntas estructuradas sin escribir código.">Build structured questions without writing code.</p></div>
+            <div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook">Gradebook</a></div>
+          </header>
+          <section class="studio-summary-grid">
+            <article class="studio-panel"><strong>{len(questions)}</strong><span data-i18n-en="Questions" data-i18n-es="Preguntas">Questions</span></article>
+            <article class="studio-panel"><strong>{total_points:g}</strong><span data-i18n-en="Question points" data-i18n-es="Puntos de preguntas">Question points</span></article>
+            <article class="studio-panel"><strong>{settings['attempts']}</strong><span data-i18n-en="Attempts" data-i18n-es="Intentos">Attempts</span></article>
+            <article class="studio-panel"><strong>{settings['time_limit'] or '∞'}</strong><span data-i18n-en="Minutes" data-i18n-es="Minutos">Minutes</span></article>
+          </section>
+          <section class="studio-section"><h2 data-i18n-en="Assessment questions" data-i18n-es="Preguntas de la evaluación">Assessment questions</h2>{question_html}</section>
+          <section class="studio-section"><h2 data-i18n-en="Add a question" data-i18n-es="Añadir una pregunta">Add a question</h2>{_question_form(item_id)}</section>
+          <section class="studio-section"><h2 data-i18n-en="My question bank" data-i18n-es="Mi banco de preguntas">My question bank</h2><p data-i18n-en="Reuse questions that you previously saved." data-i18n-es="Reutilice preguntas que guardó anteriormente.">Reuse questions that you previously saved.</p><div class="studio-grid">{bank_html}</div></section>
+        </main>"""
+        return academic_access.portal_page("Assessment Builder", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/items/{{item_id}}/assessment/questions", response_model=None)
+    async def add_question(
+        item_id: int,
+        request: Request,
+        question_type: str = Form(...),
+        prompt: str = Form(...),
+        choices: str = Form(""),
+        correct_answer: str = Form(""),
+        points: float = Form(1),
+        position: int = Form(1),
+        feedback_correct: str = Form(""),
+        feedback_incorrect: str = Form(""),
+        save_to_bank: str = Form(""),
+    ):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/assessment")
+        if isinstance(user, RedirectResponse):
+            return user
+        qtype = _normalize_question_type(question_type)
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            raise HTTPException(400, "Question text is required.")
+        if points < 0:
+            raise HTTPException(400, "Question points cannot be negative.")
+        options = _choices(qtype, choices)
+        answer = _validate_correct_answer(qtype, options, correct_answer)
+        now = utcnow()
+        with db() as conn:
+            _author_access(conn, item_id, user)
+            _insert_id(
+                conn,
+                """INSERT INTO nuvedra_assessment_questions
+                   (item_id,question_type,prompt,choices_json,correct_answer,points,position,feedback_correct,feedback_incorrect,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, qtype, clean_prompt, json.dumps(options), answer or None, points, max(1, position), feedback_correct.strip(), feedback_incorrect.strip(), now, now),
+            )
+            if save_to_bank == "1":
+                _insert_id(
+                    conn,
+                    """INSERT INTO nuvedra_question_bank
+                       (owner_email,question_type,prompt,choices_json,correct_answer,points,tags,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (user["email"].lower(), qtype, clean_prompt, json.dumps(options), answer or None, points, "", now, now),
+                )
+            audit(conn, user["email"], "assessment_question_created", "item", str(item_id), qtype, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/items/{item_id}/assessment", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/items/{{item_id}}/assessment/questions/{{question_id}}/update", response_model=None)
+    async def update_question(
+        item_id: int,
+        question_id: int,
+        request: Request,
+        question_type: str = Form(...),
+        prompt: str = Form(...),
+        choices: str = Form(""),
+        correct_answer: str = Form(""),
+        points: float = Form(1),
+        position: int = Form(1),
+        feedback_correct: str = Form(""),
+        feedback_incorrect: str = Form(""),
+    ):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/assessment")
+        if isinstance(user, RedirectResponse):
+            return user
+        qtype = _normalize_question_type(question_type)
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            raise HTTPException(400, "Question text is required.")
+        if points < 0:
+            raise HTTPException(400, "Question points cannot be negative.")
+        options = _choices(qtype, choices)
+        answer = _validate_correct_answer(qtype, options, correct_answer)
+        with db() as conn:
+            _author_access(conn, item_id, user)
+            found = rows(execute(conn, "SELECT id FROM nuvedra_assessment_questions WHERE id=? AND item_id=?", (question_id, item_id)))
+            if not found:
+                raise HTTPException(404, "Question not found.")
+            execute(
+                conn,
+                """UPDATE nuvedra_assessment_questions
+                   SET question_type=?,prompt=?,choices_json=?,correct_answer=?,points=?,position=?,feedback_correct=?,feedback_incorrect=?,updated_at=?
+                   WHERE id=? AND item_id=?""",
+                (qtype, clean_prompt, json.dumps(options), answer or None, points, max(1, position), feedback_correct.strip(), feedback_incorrect.strip(), utcnow(), question_id, item_id),
+            )
+            audit(conn, user["email"], "assessment_question_updated", "question", str(question_id), qtype, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/items/{item_id}/assessment", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/items/{{item_id}}/assessment/questions/{{question_id}}/delete", response_model=None)
+    async def delete_question(item_id: int, question_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/assessment")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            _author_access(conn, item_id, user)
+            execute(conn, "DELETE FROM nuvedra_assessment_questions WHERE id=? AND item_id=?", (question_id, item_id))
+            audit(conn, user["email"], "assessment_question_deleted", "question", str(question_id), "", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/items/{item_id}/assessment", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/items/{{item_id}}/assessment/bank/{{bank_id}}/import", response_model=None)
+    async def import_bank_question(item_id: int, bank_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/assessment")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            _author_access(conn, item_id, user)
+            found = rows(execute(conn, "SELECT * FROM nuvedra_question_bank WHERE id=? AND lower(owner_email)=?", (bank_id, user["email"].lower())))
+            if not found:
+                raise HTTPException(404, "Question bank item not found.")
+            source = found[0]
+            next_position = rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS value FROM nuvedra_assessment_questions WHERE item_id=?", (item_id,)))[0]["value"]
+            now = utcnow()
+            _insert_id(
+                conn,
+                """INSERT INTO nuvedra_assessment_questions
+                   (item_id,question_type,prompt,choices_json,correct_answer,points,position,feedback_correct,feedback_incorrect,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, source["question_type"], source["prompt"], source["choices_json"], source.get("correct_answer"), source.get("points") or 1, int(next_position or 1), "", "", now, now),
+            )
+            audit(conn, user["email"], "question_bank_imported", "item", str(item_id), str(bank_id), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/items/{item_id}/assessment", status_code=303)
+
+    @app.get("/learn/assessments/{item_id}", response_class=HTMLResponse, response_model=None)
+    async def student_assessment(item_id: int, request: Request):
+        user = academic_access.google_user(request)
+        if not user:
+            return academic_access.login_redirect(f"/learn/assessments/{item_id}")
+        with db() as conn:
+            course_id, item, module, access = _student_access(conn, item_id, user)
+            questions = _questions(conn, item_id)
+            attempts = rows(
+                execute(
+                    conn,
+                    "SELECT * FROM nuvedra_assessment_attempts WHERE item_id=? AND lower(student_email)=? ORDER BY attempt_number DESC",
+                    (item_id, user["email"].lower()),
+                )
+            )
+            active = next((row for row in attempts if str(row.get("status")) == "in_progress"), None)
+        settings = _assessment_settings(item)
+        submitted = [row for row in attempts if str(row.get("status")) != "in_progress"]
+        attempts_remaining = max(0, settings["attempts"] - len(submitted))
+        history = "".join(
+            f'<li><strong>Attempt {int(row.get("attempt_number") or 1)}</strong> · {_esc(row.get("status"))} · '
+            f'{("Pending manual grading" if row.get("score_total") is None else f"{float(row.get("score_total") or 0):g} pts")} · {_esc(row.get("submitted_at") or "")}</li>'
+            for row in submitted
+        ) or '<li data-i18n-en="No submitted attempts yet." data-i18n-es="Todavía no hay intentos entregados.">No submitted attempts yet.</li>'
+
+        assessment_form = ""
+        if active:
+            with db() as conn:
+                previous_answers = rows(execute(conn, "SELECT question_id,answer_text FROM nuvedra_assessment_answers WHERE attempt_id=?", (int(active["id"]),)))
+            answers = {int(row["question_id"]): str(row.get("answer_text") or "") for row in previous_answers}
+            question_blocks = "".join(
+                f'<fieldset class="studio-panel"><legend><strong>{index}. {_esc(question.get("prompt"))}</strong> <span class="studio-badge">{float(question.get("points") or 0):g} pts</span></legend>{_answer_input(question, answers.get(int(question["id"]), ""))}</fieldset>'
+                for index, question in enumerate(questions, 1)
+            )
+            deadline = _deadline_ms(str(active.get("started_at") or ""), settings["time_limit"])
+            timer = (
+                f'<p class="studio-notice" data-assessment-timer data-deadline="{deadline}"><strong data-i18n-en="Time remaining" data-i18n-es="Tiempo restante">Time remaining</strong>: <span data-assessment-clock>--:--</span></p>'
+                if deadline
+                else ""
+            )
+            assessment_form = f"""
+            {timer}
+            <form method="post" action="/learn/assessments/{item_id}/attempts/{int(active['id'])}/submit" data-assessment-attempt>
+              {question_blocks}
+              <button class="studio-button" data-i18n-en="Submit assessment" data-i18n-es="Entregar evaluación">Submit assessment</button>
+            </form>
+            """
+        elif attempts_remaining > 0 and questions:
+            assessment_form = f"""
+            <form method="post" action="/learn/assessments/{item_id}/start">
+              <button class="studio-button" data-i18n-en="Start assessment" data-i18n-es="Comenzar evaluación">Start assessment</button>
+            </form>
+            """
+        elif not questions:
+            assessment_form = '<p class="studio-notice" data-i18n-en="This assessment does not contain questions yet." data-i18n-es="Esta evaluación todavía no contiene preguntas.">This assessment does not contain questions yet.</p>'
+        else:
+            assessment_form = '<p class="studio-notice" data-i18n-en="You have used all available attempts." data-i18n-es="Ha utilizado todos los intentos disponibles.">You have used all available attempts.</p>'
+
+        timer_script = """
+        <script>
+        (() => {
+          const box = document.querySelector('[data-assessment-timer]');
+          const form = document.querySelector('[data-assessment-attempt]');
+          if (!box || !form) return;
+          const clock = box.querySelector('[data-assessment-clock]');
+          const deadline = Number(box.dataset.deadline || 0);
+          let submitted = false;
+          const tick = () => {
+            const remaining = Math.max(0, deadline - Date.now());
+            const total = Math.ceil(remaining / 1000);
+            const minutes = Math.floor(total / 60);
+            const seconds = total % 60;
+            if (clock) clock.textContent = `${minutes}:${String(seconds).padStart(2,'0')}`;
+            if (remaining <= 0 && !submitted) {
+              submitted = true;
+              form.requestSubmit();
+              return;
+            }
+            if (!submitted) window.setTimeout(tick, 500);
+          };
+          tick();
+        })();
+        </script>
+        """
+        body = f"""{_assets()}
+        <main class="studio-shell" data-studio-root data-testid="student-assessment">
+          <nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav>
+          <header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Assessment" data-i18n-es="Evaluación">Assessment</p><h2>{_esc(item.get('title'))}</h2><div>{sanitize_html(str(item.get('body_html') or ''))}</div></div></header>
+          <section class="studio-summary-grid"><article class="studio-panel"><strong>{settings['attempts']}</strong><span data-i18n-en="Allowed attempts" data-i18n-es="Intentos permitidos">Allowed attempts</span></article><article class="studio-panel"><strong>{attempts_remaining}</strong><span data-i18n-en="Attempts remaining" data-i18n-es="Intentos restantes">Attempts remaining</span></article><article class="studio-panel"><strong>{settings['time_limit'] or '∞'}</strong><span data-i18n-en="Minutes" data-i18n-es="Minutos">Minutes</span></article><article class="studio-panel"><strong>{len(questions)}</strong><span data-i18n-en="Questions" data-i18n-es="Preguntas">Questions</span></article></section>
+          <section class="studio-section">{assessment_form}</section>
+          <section class="studio-panel"><h3 data-i18n-en="Attempt history" data-i18n-es="Historial de intentos">Attempt history</h3><ul>{history}</ul></section>
+        </main>{timer_script}"""
+        return academic_access.portal_page("Assessment", body, user)
+
+    @app.post("/learn/assessments/{item_id}/start", response_model=None)
+    async def start_attempt(item_id: int, request: Request):
+        user = academic_access.google_user(request)
+        if not user:
+            return academic_access.login_redirect(f"/learn/assessments/{item_id}")
+        with db() as conn:
+            _course_id, item, _module, _access = _student_access(conn, item_id, user)
+            questions = _questions(conn, item_id)
+            if not questions:
+                raise HTTPException(409, "This assessment does not contain questions.")
+            settings = _assessment_settings(item)
+            existing_active = rows(
+                execute(
+                    conn,
+                    "SELECT id FROM nuvedra_assessment_attempts WHERE item_id=? AND lower(student_email)=? AND status='in_progress'",
+                    (item_id, user["email"].lower()),
+                )
+            )
+            if existing_active:
+                return RedirectResponse(f"/learn/assessments/{item_id}", status_code=303)
+            count = rows(
+                execute(
+                    conn,
+                    "SELECT COUNT(*) AS total FROM nuvedra_assessment_attempts WHERE item_id=? AND lower(student_email)=? AND status<>'in_progress'",
+                    (item_id, user["email"].lower()),
+                )
+            )[0]["total"]
+            if int(count or 0) >= settings["attempts"]:
+                raise HTTPException(409, "No attempts remain.")
+            attempt_number = int(count or 0) + 1
+            attempt_id = _insert_id(
+                conn,
+                """INSERT INTO nuvedra_assessment_attempts
+                   (item_id,student_email,attempt_number,status,started_at,score_auto,has_manual_items)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (item_id, user["email"].lower(), attempt_number, "in_progress", utcnow(), 0, 0),
+            )
+            audit(conn, user["email"], "assessment_attempt_started", "attempt", str(attempt_id), str(item_id), request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/assessments/{item_id}", status_code=303)
+
+    @app.post("/learn/assessments/{item_id}/attempts/{attempt_id}/submit", response_model=None)
+    async def submit_attempt(item_id: int, attempt_id: int, request: Request):
+        user = academic_access.google_user(request)
+        if not user:
+            return academic_access.login_redirect(f"/learn/assessments/{item_id}")
+        form = await request.form()
+        with db() as conn:
+            _course_id, item, _module, _access = _student_access(conn, item_id, user)
+            attempts = rows(
+                execute(
+                    conn,
+                    """SELECT * FROM nuvedra_assessment_attempts
+                       WHERE id=? AND item_id=? AND lower(student_email)=? AND status='in_progress'""",
+                    (attempt_id, item_id, user["email"].lower()),
+                )
+            )
+            if not attempts:
+                raise HTTPException(409, "This attempt is not active.")
+            attempt = attempts[0]
+            questions = _questions(conn, item_id)
+            if not questions:
+                raise HTTPException(409, "This assessment does not contain questions.")
+            settings = _assessment_settings(item)
+            now = utcnow()
+            late = False
+            if settings["time_limit"] > 0:
+                elapsed = (_parse_iso(now) - _parse_iso(str(attempt.get("started_at") or now))).total_seconds()
+                late = elapsed > settings["time_limit"] * 60 + 30
+
+            auto_score = 0.0
+            has_manual = False
+            for question in questions:
+                qid = int(question["id"])
+                answer = str(form.get(f"q_{qid}") or "").strip()
+                is_correct, points_awarded = _grade_answer(question, answer)
+                if is_correct is None:
+                    has_manual = True
+                else:
+                    auto_score += float(points_awarded or 0)
+                found = rows(execute(conn, "SELECT id FROM nuvedra_assessment_answers WHERE attempt_id=? AND question_id=?", (attempt_id, qid)))
+                params = (
+                    answer,
+                    is_correct,
+                    points_awarded,
+                    now,
+                )
+                if found:
+                    execute(
+                        conn,
+                        "UPDATE nuvedra_assessment_answers SET answer_text=?,is_correct=?,points_awarded=?,updated_at=? WHERE attempt_id=? AND question_id=?",
+                        params + (attempt_id, qid),
+                    )
+                else:
+                    execute(
+                        conn,
+                        """INSERT INTO nuvedra_assessment_answers
+                           (attempt_id,question_id,answer_text,is_correct,points_awarded,created_at,updated_at)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (attempt_id, qid, answer, is_correct, points_awarded, now, now),
+                    )
+
+            total_score = None if has_manual else auto_score
+            status = "submitted_late" if late else "submitted"
+            execute(
+                conn,
+                """UPDATE nuvedra_assessment_attempts
+                   SET status=?,submitted_at=?,score_auto=?,score_total=?,has_manual_items=?
+                   WHERE id=?""",
+                (status, now, auto_score, total_score, 1 if has_manual else 0, attempt_id),
+            )
+            submission_id = _upsert_submission(conn, item_id, user["email"], int(attempt.get("attempt_number") or 1), status)
+            _sync_auto_grade(conn, submission_id, auto_score, user["email"], fully_auto=not has_manual)
+            audit(
+                conn,
+                user["email"],
+                "structured_assessment_submitted",
+                "attempt",
+                str(attempt_id),
+                f"{status}:{auto_score:g}",
+                request.client.host if request.client else "",
+            )
+        return RedirectResponse(f"/learn/assessments/{item_id}", status_code=303)
+
+    print(
+        "NUVEDRA Assessments v2 registered: question bank, MCQ, true/false, short answer, essay, attempts, timer, and automatic grading.",
+        flush=True,
+    )
