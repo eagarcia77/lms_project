@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import html
+import json
+from pathlib import PurePath
+from typing import Any
+from urllib.parse import quote, urlparse
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_authoring_v6 import sanitize_html
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+LIBRARY_PREFIX = "/faculty/library"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+AUTHOR_SQL_ROLES = ("instructor", "teaching_assistant", "course_builder", "facilitator")
+ASSET_TYPES = {"pdf", "document", "presentation", "spreadsheet", "image", "video", "audio", "h5p", "3d", "360", "scorm", "other"}
+ACCESSIBILITY_REQUIRED = {"image", "video", "audio", "h5p", "3d", "360"}
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+    ".mp3", ".wav", ".m4a", ".mp4", ".webm", ".mov",
+    ".h5p", ".glb", ".gltf", ".zip"
+}
+
+
+def _esc(value: Any, *, attr: bool = False) -> str:
+    return html.escape(str(value or ""), quote=attr)
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _blob_type() -> str:
+    return "BYTEA" if database_url().startswith("postgres") else "BLOB"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def ensure_content_library_schema() -> None:
+    pk = _pk()
+    blob = _blob_type()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_library_assets (
+            id {pk}, owner_email TEXT NOT NULL, name TEXT NOT NULL, asset_type TEXT NOT NULL,
+            mime_type TEXT, description TEXT, accessibility_text TEXT, tags TEXT,
+            source_url TEXT, file_name TEXT, file_size INTEGER NOT NULL DEFAULT 0,
+            file_bytes {blob}, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_library_uses (
+            id {pk}, asset_id INTEGER NOT NULL, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL, attached_by TEXT NOT NULL, attached_at TEXT NOT NULL
+        )""")
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _asset(conn: Any, asset_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_library_assets WHERE id=?", (asset_id,)))
+    if not found:
+        raise HTTPException(404, "Library asset not found.")
+    return found[0]
+
+
+def _owner_asset(conn: Any, asset_id: int, email: str) -> dict[str, Any]:
+    asset = _asset(conn, asset_id)
+    if str(asset.get("owner_email") or "").lower() != email.lower():
+        raise HTTPException(403, "You do not own this library asset.")
+    return asset
+
+
+def _safe_source_url(value: str) -> str:
+    clean = value.strip()
+    if not clean:
+        return ""
+    parsed = urlparse(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(400, "Resource URL must use http or https.")
+    return clean
+
+
+def _asset_type(value: str) -> str:
+    clean = value.strip().lower()
+    if clean not in ASSET_TYPES:
+        raise HTTPException(400, "Unsupported library asset type.")
+    return clean
+
+
+def _author_courses(conn: Any, email: str) -> list[dict[str, Any]]:
+    role_list = ",".join("?" for _ in AUTHOR_SQL_ROLES)
+    return rows(execute(conn, f"""SELECT e.course_id,c.course_code,c.title,c.status
+        FROM nexus_admin_enrollments e JOIN nexus_admin_courses c ON c.id=e.course_id
+        WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ({role_list})
+        ORDER BY c.title""", (email.lower(),) + AUTHOR_SQL_ROLES))
+
+
+def _library_item_type(asset_type: str) -> str:
+    return {
+        "pdf": "pdf", "document": "document", "presentation": "presentation",
+        "spreadsheet": "spreadsheet", "image": "image", "video": "video",
+        "audio": "audio", "h5p": "h5p", "3d": "ar", "360": "360",
+        "scorm": "interactive", "other": "link",
+    }.get(asset_type, "link")
+
+
+def _next_position(conn: Any, module_id: int) -> int:
+    found = rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS value FROM nexus_content_items WHERE module_id=?", (module_id,)))
+    return int(found[0].get("value") or 1) if found else 1
+
+
+def _insert_library_item(conn: Any, module_id: int, asset: dict[str, Any], user_email: str) -> int:
+    course_id = academic_access.module_course_id(conn, module_id)
+    academic_access.require_course_role(conn, course_id, user_email, academic_access.AUTHOR_ROLES)
+    href = str(asset.get("source_url") or "").strip() or f"/library/assets/{int(asset['id'])}/download"
+    body = f"<p>{sanitize_html(str(asset.get('description') or ''))}</p>" if asset.get("description") else ""
+    metadata = {
+        "source": "nuvedra_content_library",
+        "library_asset_id": int(asset["id"]),
+        "accessibility_text": str(asset.get("accessibility_text") or ""),
+        "tags": str(asset.get("tags") or ""),
+    }
+    params = (
+        module_id,
+        _library_item_type(str(asset.get("asset_type") or "other")),
+        str(asset.get("name") or "Library resource"),
+        body,
+        href,
+        None,
+        json.dumps(metadata, ensure_ascii=False),
+        None,
+        None,
+        _next_position(conn, module_id),
+        "draft",
+        utcnow(),
+        utcnow(),
+    )
+    sql = """INSERT INTO nexus_content_items
+        (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _download_allowed(conn: Any, asset: dict[str, Any], email: str) -> bool:
+    if str(asset.get("owner_email") or "").lower() == email.lower():
+        return True
+    found = rows(execute(conn, """SELECT u.id FROM nuvedra_library_uses u
+        JOIN nexus_admin_enrollments e ON e.course_id=u.course_id
+        WHERE u.asset_id=? AND lower(e.user_email)=? AND e.status='active' LIMIT 1""",
+        (int(asset["id"]), email.lower())))
+    return bool(found)
+
+
+def register_content_library(app: FastAPI) -> None:
+    ensure_content_library_schema()
+
+    @app.get(LIBRARY_PREFIX, response_class=HTMLResponse, response_model=None)
+    async def content_library(request: Request, q: str = Query(""), course_id: int | None = Query(None)):
+        user = _author(request, LIBRARY_PREFIX)
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            courses = _author_courses(conn, user["email"])
+            allowed_course_ids = {int(row["course_id"]) for row in courses}
+            modules: list[dict[str, Any]] = []
+            if course_id is not None:
+                if course_id not in allowed_course_ids:
+                    raise HTTPException(403, "You do not have author access to this course.")
+                modules = rows(execute(conn, "SELECT id,title,position FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+            search = q.strip().lower()
+            if search:
+                pattern = f"%{search}%"
+                assets = rows(execute(conn, """SELECT * FROM nuvedra_library_assets
+                    WHERE lower(owner_email)=? AND status='active'
+                    AND (lower(name) LIKE ? OR lower(COALESCE(tags,'')) LIKE ? OR lower(asset_type) LIKE ?)
+                    ORDER BY updated_at DESC,id DESC""", (user["email"].lower(), pattern, pattern, pattern)))
+            else:
+                assets = rows(execute(conn, "SELECT * FROM nuvedra_library_assets WHERE lower(owner_email)=? AND status='active' ORDER BY updated_at DESC,id DESC", (user["email"].lower(),)))
+
+        course_options = ''.join(f'<option value="{int(row["course_id"])}"{" selected" if course_id == int(row["course_id"]) else ""}>{_esc(row.get("course_code"))}: {_esc(row.get("title"))}</option>' for row in courses)
+        module_options = ''.join(f'<option value="{int(row["id"])}">{int(row.get("position") or 1)}. {_esc(row.get("title"))}</option>' for row in modules)
+        cards = []
+        for asset in assets:
+            aid = int(asset["id"])
+            source = "Uploaded file" if asset.get("file_bytes") is not None else "External resource"
+            attach = ""
+            if module_options:
+                attach = f'''<form method="post" action="{LIBRARY_PREFIX}/assets/{aid}/attach"><label><span data-i18n-en="Add to module" data-i18n-es="Añadir al módulo">Add to module</span><select name="module_id" required><option value="">Select a module</option>{module_options}</select></label><button class="studio-button" data-i18n-en="Add as draft content" data-i18n-es="Añadir como contenido borrador">Add as draft content</button></form>'''
+            cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{_esc(asset.get('asset_type'))} · {_esc(source)}</p><h3>{_esc(asset.get('name'))}</h3><p>{_esc(asset.get('description'))}</p><p><small>{_esc(asset.get('tags'))}</small></p><p><a href="/library/assets/{aid}/download" target="_blank" rel="noopener" data-i18n-en="Open resource" data-i18n-es="Abrir recurso">Open resource</a></p>{attach}<form method="post" action="{LIBRARY_PREFIX}/assets/{aid}/archive"><button class="studio-button studio-button--quiet" data-i18n-en="Archive" data-i18n-es="Archivar">Archive</button></form></article>''')
+
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="content-library-v1">
+        <nav class="studio-breadcrumbs"><a href="/portal" data-i18n-en="My courses" data-i18n-es="Mis cursos">My courses</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Content Library" data-i18n-es="Biblioteca de contenido">Content Library</p><h2 data-i18n-en="Reusable teaching resources" data-i18n-es="Recursos docentes reutilizables">Reusable teaching resources</h2><p data-i18n-en="Store links or files once and reuse them across the courses you teach." data-i18n-es="Guarde enlaces o archivos una vez y reutilícelos en los cursos que imparte.">Store links or files once and reuse them across the courses you teach.</p></div></header>
+        <section class="studio-panel"><h3 data-i18n-en="Add resource" data-i18n-es="Añadir recurso">Add resource</h3><form method="post" action="{LIBRARY_PREFIX}/assets" enctype="multipart/form-data"><div class="studio-form-grid"><label><span data-i18n-en="Name" data-i18n-es="Nombre">Name</span><input name="name" required maxlength="180"></label><label><span data-i18n-en="Type" data-i18n-es="Tipo">Type</span><select name="asset_type" required><option value="pdf">PDF</option><option value="document">Word / document</option><option value="presentation">PowerPoint / presentation</option><option value="spreadsheet">Spreadsheet</option><option value="image">Image</option><option value="video">Video</option><option value="audio">Audio</option><option value="h5p">H5P</option><option value="3d">3D / GLB / glTF</option><option value="360">360°</option><option value="scorm">SCORM / ZIP</option><option value="other">Other</option></select></label></div><label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description"></textarea></label><label><span data-i18n-en="Accessibility alternative / alt text" data-i18n-es="Alternativa accesible / texto alternativo">Accessibility alternative / alt text</span><textarea name="accessibility_text"></textarea></label><label><span data-i18n-en="Tags" data-i18n-es="Etiquetas">Tags</span><input name="tags" placeholder="APA7, module 1, XR"></label><label><span data-i18n-en="External URL (optional)" data-i18n-es="URL externo (opcional)">External URL (optional)</span><input type="url" name="source_url"></label><label><span data-i18n-en="Or upload a file (max 20 MB)" data-i18n-es="O suba un archivo (máx. 20 MB)">Or upload a file (max 20 MB)</span><input type="file" name="upload" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.png,.jpg,.jpeg,.gif,.webp,.svg,.mp3,.wav,.m4a,.mp4,.webm,.mov,.h5p,.glb,.gltf,.zip"></label><button class="studio-button" data-i18n-en="Save to library" data-i18n-es="Guardar en biblioteca">Save to library</button></form></section>
+        <section class="studio-panel"><form method="get" action="{LIBRARY_PREFIX}"><div class="studio-form-grid"><label><span data-i18n-en="Search" data-i18n-es="Buscar">Search</span><input name="q" value="{_esc(q, attr=True)}"></label><label><span data-i18n-en="Course for reuse" data-i18n-es="Curso para reutilizar">Course for reuse</span><select name="course_id"><option value="">Choose a course</option>{course_options}</select></label></div><button class="studio-button studio-button--quiet" data-i18n-en="Apply" data-i18n-es="Aplicar">Apply</button></form></section>
+        <section class="studio-section"><h2 data-i18n-en="My resources" data-i18n-es="Mis recursos">My resources</h2><div class="studio-grid">{''.join(cards) or '<section class="studio-empty" data-i18n-en="Your content library is empty." data-i18n-es="Su biblioteca de contenido está vacía.">Your content library is empty.</section>'}</div></section></main>'''
+        return academic_access.portal_page("Content Library", body, user)
+
+    @app.post(f"{LIBRARY_PREFIX}/assets", response_model=None)
+    async def add_asset(request: Request, name: str = Form(...), asset_type: str = Form(...), description: str = Form(""), accessibility_text: str = Form(""), tags: str = Form(""), source_url: str = Form(""), upload: UploadFile | None = File(None)):
+        user = _author(request, LIBRARY_PREFIX)
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_name = name.strip()
+        if not clean_name:
+            raise HTTPException(400, "Resource name is required.")
+        kind = _asset_type(asset_type)
+        accessible = accessibility_text.strip()
+        if kind in ACCESSIBILITY_REQUIRED and not accessible:
+            raise HTTPException(400, "An accessibility alternative is required for this resource type.")
+        url = _safe_source_url(source_url)
+        data: bytes | None = None
+        file_name = ""
+        mime_type = ""
+        if upload and upload.filename:
+            file_name = PurePath(upload.filename).name
+            extension = PurePath(file_name).suffix.lower()
+            if extension not in ALLOWED_EXTENSIONS:
+                raise HTTPException(400, "This file extension is not allowed in Content Library v1.")
+            data = await upload.read(MAX_UPLOAD_BYTES + 1)
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "The uploaded file exceeds the 20 MB Content Library v1 limit.")
+            mime_type = str(upload.content_type or "application/octet-stream")
+        if data is None and not url:
+            raise HTTPException(400, "Upload a file or provide an external URL.")
+        now = utcnow()
+        params = (user["email"].lower(), clean_name, kind, mime_type or None, description.strip(), accessible, tags.strip(), url or None, file_name or None, len(data or b""), data, "active", now, now)
+        sql = """INSERT INTO nuvedra_library_assets (owner_email,name,asset_type,mime_type,description,accessibility_text,tags,source_url,file_name,file_size,file_bytes,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        with db() as conn:
+            if database_url().startswith("postgres"):
+                row = execute(conn, sql + " RETURNING id", params).fetchone(); asset_id = int(row[0])
+            else:
+                asset_id = int(execute(conn, sql, params).lastrowid)
+            audit(conn, user["email"], "content_library_asset_created", "library_asset", str(asset_id), kind, request.client.host if request.client else "")
+        return RedirectResponse(LIBRARY_PREFIX, status_code=303)
+
+    @app.post(f"{LIBRARY_PREFIX}/assets/{{asset_id}}/attach", response_model=None)
+    async def attach_asset(asset_id: int, request: Request, module_id: int = Form(...)):
+        user = _author(request, LIBRARY_PREFIX)
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            asset = _owner_asset(conn, asset_id, user["email"])
+            if str(asset.get("status")) != "active":
+                raise HTTPException(409, "Archived library assets cannot be attached.")
+            course_id = academic_access.module_course_id(conn, module_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            item_id = _insert_library_item(conn, module_id, asset, user["email"])
+            execute(conn, "INSERT INTO nuvedra_library_uses (asset_id,course_id,module_id,item_id,attached_by,attached_at) VALUES (?,?,?,?,?,?)", (asset_id, course_id, module_id, item_id, user["email"], utcnow()))
+            audit(conn, user["email"], "content_library_asset_attached", "item", str(item_id), str(asset_id), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/items/{item_id}/edit", status_code=303)
+
+    @app.post(f"{LIBRARY_PREFIX}/assets/{{asset_id}}/archive", response_model=None)
+    async def archive_asset(asset_id: int, request: Request):
+        user = _author(request, LIBRARY_PREFIX)
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            _owner_asset(conn, asset_id, user["email"])
+            execute(conn, "UPDATE nuvedra_library_assets SET status='archived',updated_at=? WHERE id=?", (utcnow(), asset_id))
+            audit(conn, user["email"], "content_library_asset_archived", "library_asset", str(asset_id), "archived", request.client.host if request.client else "")
+        return RedirectResponse(LIBRARY_PREFIX, status_code=303)
+
+    @app.get("/library/assets/{asset_id}/download", response_model=None)
+    async def download_asset(asset_id: int, request: Request):
+        user = academic_access.google_user(request)
+        if not user:
+            return academic_access.login_redirect(f"/library/assets/{asset_id}/download")
+        with db() as conn:
+            asset = _asset(conn, asset_id)
+            if not _download_allowed(conn, asset, user["email"]):
+                raise HTTPException(403, "You do not have access to this resource.")
+        if asset.get("file_bytes") is not None:
+            filename = str(asset.get("file_name") or asset.get("name") or f"asset-{asset_id}")
+            headers = {"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"}
+            return Response(content=bytes(asset["file_bytes"]), media_type=str(asset.get("mime_type") or "application/octet-stream"), headers=headers)
+        url = str(asset.get("source_url") or "")
+        if not url:
+            raise HTTPException(404, "This resource has no file or URL.")
+        return RedirectResponse(url, status_code=307)
+
+    print("NUVEDRA Content Library v1 registered: reusable files/links, accessibility metadata, course attachment, and protected downloads.", flush=True)
