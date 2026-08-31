@@ -44,6 +44,8 @@ def main() -> None:
             'NUVEDRA_ASSESSMENTS_V2',
             'data-assessment-builder-link',
             'data-question-form',
+            'NUVEDRA_GRADEBOOK_V2',
+            'data-attempt-review-link',
         ),
     )
     require(
@@ -84,6 +86,22 @@ def main() -> None:
             'NUVEDRA AutoGrade',
             'data-testid="assessment-builder"',
             'data-testid="student-assessment"',
+            'NUVEDRA_GRADEBOOK_V2_FEEDBACK_LINK',
+            'View feedback',
+        ),
+    )
+    require(
+        "app/gradebook_v2.py",
+        (
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_answer_reviews',
+            '/courses/{{course_id}}/attempts',
+            '/attempts/{{attempt_id}}/review',
+            '/answers/{{answer_id}}/review',
+            '/learn/assessments/{item_id}/attempts/{attempt_id}/feedback',
+            'assessment_answer_reviewed',
+            'data-testid="structured-attempts-review"',
+            'data-testid="attempt-review"',
+            'data-testid="student-attempt-feedback"',
         ),
     )
     require(
@@ -93,6 +111,8 @@ def main() -> None:
             'register_gradebook(app)',
             'from app.assessment_engine import register_assessment_engine',
             'register_assessment_engine(app)',
+            'from app.gradebook_v2 import register_gradebook_v2',
+            'register_gradebook_v2(app)',
         ),
     )
     require(
@@ -115,6 +135,8 @@ def main() -> None:
         (
             'NUVEDRA_ASSESSMENTS_V2_SMOKE',
             'tools/smoke_test_assessments_v2.py',
+            'NUVEDRA_GRADEBOOK_V2_SMOKE',
+            'tools/smoke_test_gradebook_v2.py',
         ),
     )
     require(
@@ -127,7 +149,33 @@ def main() -> None:
             'essay question authoring',
         ),
     )
-    print("Visual Course Studio, Gradebook v1, and Assessments v2 source validated with functional smoke coverage.", flush=True)
+    require(
+        "tools/smoke_test_gradebook_v2.py",
+        (
+            'data-testid="structured-attempts-review"',
+            'data-testid="attempt-review"',
+            'manual essay grading',
+            'data-testid="student-attempt-feedback"',
+            '3 / 3',
+        ),
+    )
+    require(
+        "app/static/styles.css",
+        (
+            'NUVEDRA_LOGO_VISIBILITY_V2',
+            '.site-header .brand img',
+            'max-width:none',
+        ),
+    )
+    require(
+        "app/static/assets/nuvedra-logo.svg",
+        (
+            'viewBox="-8 -6 288 92"',
+            'preserveAspectRatio="xMinYMid meet"',
+            '>NUVEDRA</text>',
+        ),
+    )
+    print("Visual Course Studio, Gradebook v1/v2, Assessments v2, manual essay review, and full NUVEDRA logo source validated with functional smoke coverage.", flush=True)
 
 
 if __name__ == "__main__":
