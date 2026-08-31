@@ -61,6 +61,21 @@ def patch_internal_library_urls() -> None:
     COURSE_EDITOR.write_text(editor, encoding="utf-8")
 
 
+def patch_library_query_handling() -> None:
+    text = MODULE.read_text(encoding="utf-8")
+    text = replace_once(
+        text,
+        '    async def content_library(request: Request, q: str = Query(""), course_id: int | None = Query(None)):\n',
+        '    async def content_library(request: Request, q: str = Query(""), course_id: str = Query("")):\n',
+        "blank-safe course filter signature",
+    )
+    old = '''            allowed_course_ids = {int(row["course_id"]) for row in courses}\n            modules: list[dict[str, Any]] = []\n            if course_id is not None:\n                if course_id not in allowed_course_ids:\n                    raise HTTPException(403, "You do not have author access to this course.")\n                modules = rows(execute(conn, "SELECT id,title,position FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))\n'''
+    new = '''            allowed_course_ids = {int(row["course_id"]) for row in courses}\n            modules: list[dict[str, Any]] = []\n            selected_course_id: int | None = None\n            if course_id.strip():\n                try:\n                    selected_course_id = int(course_id)\n                except ValueError as exc:\n                    raise HTTPException(400, "Invalid course filter.") from exc\n                if selected_course_id not in allowed_course_ids:\n                    raise HTTPException(403, "You do not have author access to this course.")\n                modules = rows(execute(conn, "SELECT id,title,position FROM nexus_modules WHERE course_id=? ORDER BY position,id", (selected_course_id,)))\n'''
+    text = replace_once(text, old, new, "blank-safe course filter parsing")
+    text = text.replace('course_id == int(row["course_id"])', 'selected_course_id == int(row["course_id"])')
+    MODULE.write_text(text, encoding="utf-8")
+
+
 def patch_studio_js() -> None:
     text = STUDIO_JS.read_text(encoding="utf-8")
     if TAG in text:
@@ -106,6 +121,7 @@ def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Content Library v1 source template is missing.")
     MODULE.write_text(SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    patch_library_query_handling()
     patch_academic_portal()
     patch_internal_library_urls()
     patch_studio_js()
