@@ -6,6 +6,7 @@ SOURCE = Path("tools/student_experience_v2_module.py.txt")
 MODULE = Path("app/student_experience.py")
 ACADEMIC_PORTAL = Path("app/academic_portal.py")
 PORTAL_HOME = Path("app/google_hub_safe.py")
+ROLE_SMOKE = Path("tools/smoke_test_academic_roles.py")
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -79,6 +80,18 @@ def patch_portal_dashboard_link() -> None:
     PORTAL_HOME.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
+def patch_role_smoke_compatibility() -> None:
+    """Keep the role smoke test structural instead of language-dependent."""
+    text = ROLE_SMOKE.read_text(encoding="utf-8")
+    old = "        if 'Responder evaluación' not in item.text:\n            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')\n"
+    new = "        if f'action=\"/learn/items/{item_id}/submit\"' not in item.text:\n            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')\n"
+    if old in text:
+        text = text.replace(old, new, 1)
+    elif new not in text:
+        raise RuntimeError("Student Experience v2 could not modernize the academic-role submission-form smoke assertion.")
+    ROLE_SMOKE.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Student Experience v2 source template is missing.")
@@ -86,7 +99,8 @@ def main() -> None:
     patch_module_legacy_submissions()
     patch_academic_portal()
     patch_portal_dashboard_link()
-    print("NUVEDRA Student Experience v2 installed: dashboard, progress, continue learning, to-do, and completion tracking.", flush=True)
+    patch_role_smoke_compatibility()
+    print("NUVEDRA Student Experience v2 installed: dashboard, progress, continue learning, to-do, completion tracking, and language-neutral role validation.", flush=True)
 
 
 if __name__ == "__main__":
