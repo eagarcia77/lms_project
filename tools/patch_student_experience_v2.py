@@ -6,7 +6,6 @@ SOURCE = Path("tools/student_experience_v2_module.py.txt")
 MODULE = Path("app/student_experience.py")
 ACADEMIC_PORTAL = Path("app/academic_portal.py")
 PORTAL_HOME = Path("app/google_hub_safe.py")
-TAG = "NUVEDRA_STUDENT_EXPERIENCE_V2"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -26,14 +25,14 @@ def patch_module_legacy_submissions() -> None:
         "legacy submission lookup",
     )
     marker = '        completion_button=""\n'
-    block = '''        assessment=""
+    block = """        assessment=""
         if str(item.get("item_type")) in academic_access.ASSESSMENT_TYPES and str(access.get("course_role"))=="student":
             existing=submissions[0] if submissions else {}
             saved='<p class="studio-notice" data-i18n-en="Your response has been submitted. You can update it while the activity remains available." data-i18n-es="Su respuesta está entregada. Puede actualizarla mientras la actividad esté disponible.">Your response has been submitted. You can update it while the activity remains available.</p>' if submissions else ""
             assessment=f'''<section class="studio-panel"><h3 data-i18n-en="Submit response" data-i18n-es="Entregar respuesta">Submit response</h3>{saved}<form method="post" action="/learn/items/{item_id}/submit"><label><span data-i18n-en="Response" data-i18n-es="Respuesta">Response</span><textarea name="response_text" required>{_esc(existing.get('response_text'))}</textarea></label><label><span data-i18n-en="Evidence link (optional)" data-i18n-es="Enlace de evidencia (opcional)">Evidence link (optional)</span><input type="url" name="response_url" value="{_esc(existing.get('response_url'),attr=True)}"></label><button class="studio-button" data-i18n-en="Save and submit" data-i18n-es="Guardar y entregar">Save and submit</button></form></section>'''
         elif str(item.get("item_type")) in academic_access.ASSESSMENT_TYPES:
             assessment='<p class="studio-notice" data-i18n-en="Observers can view this activity but cannot submit responses." data-i18n-es="Los observadores pueden consultar esta actividad, pero no enviar respuestas.">Observers can view this activity but cannot submit responses.</p>'
-'''
+"""
     if block not in text:
         if marker not in text:
             raise RuntimeError("Student Experience v2 could not restore legacy assessment submissions.")
