@@ -107,11 +107,20 @@ def main() -> None:
 
     PATH.write_text(text, encoding="utf-8")
 
-    # Keep the Gradebook installation in the same deterministic post-V3 patch phase.
+    # Keep Gradebook and Assessments in the same deterministic post-V3 patch phase.
     from patch_gradebook_v1 import main as patch_gradebook_v1
     patch_gradebook_v1()
 
-    print("NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, and Gradebook v1.", flush=True)
+    from patch_assessments_v2 import main as patch_assessments_v2
+    patch_assessments_v2()
+
+    from patch_assessments_smoke import main as patch_assessments_smoke
+    patch_assessments_smoke()
+
+    print(
+        "NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, Gradebook v1, Assessments v2, and functional assessment validation.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

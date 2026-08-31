@@ -21,6 +21,8 @@ def main() -> None:
             'data-testid="instructor-course-preview"',
             'data-testid="instructor-item-preview"',
             'NUVEDRA_VISUAL_STUDIO_PREVIEW_V1',
+            'NUVEDRA_ASSESSMENT_EDITOR_V2',
+            'Structured questions',
             'visual_studio_item_created',
             'visual_studio_item_updated',
             'assessment_response_type',
@@ -39,6 +41,9 @@ def main() -> None:
             'data-select-type',
             'NUVEDRA_GRADEBOOK_V1',
             'data-gradebook-link',
+            'NUVEDRA_ASSESSMENTS_V2',
+            'data-assessment-builder-link',
+            'data-question-form',
         ),
     )
     require(
@@ -64,13 +69,65 @@ def main() -> None:
         ),
     )
     require(
+        "app/assessment_engine.py",
+        (
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_questions',
+            'CREATE TABLE IF NOT EXISTS nuvedra_question_bank',
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_attempts',
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_answers',
+            '/items/{{item_id}}/assessment',
+            '/assessment/questions',
+            '/assessment/bank/{{bank_id}}/import',
+            '/learn/assessments/{item_id}',
+            '/learn/assessments/{item_id}/start',
+            'structured_assessment_submitted',
+            'NUVEDRA AutoGrade',
+            'data-testid="assessment-builder"',
+            'data-testid="student-assessment"',
+        ),
+    )
+    require(
         "app/academic_portal.py",
         (
             'from app.gradebook import register_gradebook',
             'register_gradebook(app)',
+            'from app.assessment_engine import register_assessment_engine',
+            'register_assessment_engine(app)',
         ),
     )
-    print("Visual Course Studio and Gradebook v1 source validated.", flush=True)
+    require(
+        "app/student_portal.py",
+        (
+            'def _student_item_href',
+            '/learn/assessments/{item_id}',
+            'Use the structured assessment workflow for this item.',
+        ),
+    )
+    require(
+        "app/platform_upgrade.py",
+        (
+            'gradebook.google_user = academic_user',
+            '("app.gradebook", "app.assessment_engine")',
+        ),
+    )
+    require(
+        "tools/smoke_test_course_editor_access.py",
+        (
+            'NUVEDRA_ASSESSMENTS_V2_SMOKE',
+            'tools/smoke_test_assessments_v2.py',
+        ),
+    )
+    require(
+        "tools/smoke_test_assessments_v2.py",
+        (
+            'data-testid="assessment-builder"',
+            'question-bank import',
+            'data-assessment-timer',
+            'Automatic grading expected 4 points',
+            'essay question authoring',
+        ),
+    )
+    print("Visual Course Studio, Gradebook v1, and Assessments v2 source validated with functional smoke coverage.", flush=True)
 
 
 if __name__ == "__main__":
