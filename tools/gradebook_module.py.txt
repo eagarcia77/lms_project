@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import csv
+import io
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+from app.academic_access import AUTHOR_ROLES, esc, google_user, login_redirect, portal_page, require_course_role
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+GRADEBOOK_PREFIX = "/faculty/studio"
+
+
+def ensure_gradebook_schema() -> None:
+    pk = "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with db() as conn:
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_grades (
+                id {pk},
+                submission_id INTEGER NOT NULL UNIQUE,
+                points_awarded REAL,
+                feedback TEXT,
+                status TEXT NOT NULL DEFAULT 'graded',
+                graded_by TEXT NOT NULL,
+                graded_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = google_user(request)
+    if not user:
+        return login_redirect(return_to)
+    return user
+
+
+def _course_access(conn: Any, course_id: int, user: dict[str, Any]) -> dict[str, Any]:
+    return require_course_role(conn, course_id, user["email"], AUTHOR_ROLES)
+
+
+def _submission_rows(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(
+        execute(
+            conn,
+            """SELECT s.id AS submission_id,s.student_email,s.response_text,s.response_url,
+                      s.status AS submission_status,s.submitted_at,s.updated_at AS submission_updated_at,
+                      i.id AS item_id,i.title AS item_title,i.points,i.due_at,
+                      m.id AS module_id,m.title AS module_title,m.position AS module_position,
+                      g.points_awarded,g.feedback,g.status AS grade_status,g.graded_by,g.graded_at
+               FROM nuvedra_submissions s
+               JOIN nexus_content_items i ON i.id=s.item_id
+               JOIN nexus_modules m ON m.id=i.module_id
+               LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+               WHERE m.course_id=?
+               ORDER BY m.position,i.position,i.id,lower(s.student_email),s.id""",
+            (course_id,),
+        )
+    )
+
+
+def _grade_summary(data: list[dict[str, Any]]) -> tuple[float, float, int, int]:
+    earned = 0.0
+    possible = 0.0
+    graded = 0
+    submitted = len(data)
+    for row in data:
+        if row.get("points_awarded") is None:
+            continue
+        graded += 1
+        earned += float(row.get("points_awarded") or 0)
+        if row.get("points") is not None:
+            possible += float(row.get("points") or 0)
+    return earned, possible, graded, submitted
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def register_gradebook(app: FastAPI) -> None:
+    ensure_gradebook_schema()
+
+    @app.get(f"{GRADEBOOK_PREFIX}/courses/{{course_id}}/gradebook", response_class=HTMLResponse, response_model=None)
+    async def instructor_gradebook(course_id: int, request: Request):
+        user = _author(request, f"{GRADEBOOK_PREFIX}/courses/{course_id}/gradebook")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            access = _course_access(conn, course_id, user)
+            data = _submission_rows(conn, course_id)
+        earned, possible, graded, submitted = _grade_summary(data)
+        table_rows = []
+        for row in data:
+            max_points = row.get("points")
+            max_attr = f' max="{esc(max_points, attr=True)}"' if max_points not in (None, "") else ""
+            score = "" if row.get("points_awarded") is None else str(row.get("points_awarded"))
+            evidence = (
+                f'<a href="{esc(row.get("response_url"), attr=True)}" target="_blank" rel="noopener" data-i18n-en="Open evidence" data-i18n-es="Abrir evidencia">Open evidence</a>'
+                if row.get("response_url") else ""
+            )
+            table_rows.append(
+                f'''<tr>
+                  <td><strong>{esc(row.get("student_email"))}</strong><br><small>{esc(row.get("submitted_at"))}</small></td>
+                  <td><strong>{esc(row.get("module_title"))}</strong><br>{esc(row.get("item_title"))}<br><small>{esc(max_points) if max_points not in (None, "") else "—"} pts</small></td>
+                  <td><details><summary data-i18n-en="View response" data-i18n-es="Ver respuesta">View response</summary><p>{esc(row.get("response_text"))}</p>{evidence}</details></td>
+                  <td>
+                    <form method="post" action="{GRADEBOOK_PREFIX}/submissions/{int(row['submission_id'])}/grade" class="studio-grade-form">
+                      <label><span data-i18n-en="Score" data-i18n-es="Puntuación">Score</span><input type="number" name="points_awarded" min="0" step="0.01"{max_attr} value="{esc(score, attr=True)}" required></label>
+                      <label><span data-i18n-en="Feedback" data-i18n-es="Retroalimentación">Feedback</span><textarea name="feedback" rows="3">{esc(row.get("feedback"))}</textarea></label>
+                      <button class="studio-button" data-i18n-en="Save grade" data-i18n-es="Guardar calificación">Save grade</button>
+                    </form>
+                  </td>
+                </tr>'''
+            )
+        rows_html = "".join(table_rows) or '<tr><td colspan="4" data-i18n-en="No submissions yet." data-i18n-es="Todavía no hay entregas.">No submissions yet.</td></tr>'
+        body = f'''{_assets()}
+        <main class="studio-shell" data-studio-root data-testid="course-gradebook">
+          <nav class="studio-breadcrumbs"><a href="{GRADEBOOK_PREFIX}/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav>
+          <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Gradebook" data-i18n-es="Libro de calificaciones">Gradebook</p><h2>{esc(access.get('course_code'))}: {esc(access.get('title'))}</h2><p data-i18n-en="Review student submissions, assign scores, and provide feedback." data-i18n-es="Revise las entregas, asigne puntuaciones y ofrezca retroalimentación.">Review student submissions, assign scores, and provide feedback.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{GRADEBOOK_PREFIX}/courses/{course_id}/gradebook.csv" data-i18n-en="Export CSV" data-i18n-es="Exportar CSV">Export CSV</a></div></header>
+          <section class="studio-summary-grid"><article class="studio-panel"><strong>{submitted}</strong><span data-i18n-en="Submissions" data-i18n-es="Entregas">Submissions</span></article><article class="studio-panel"><strong>{graded}</strong><span data-i18n-en="Graded" data-i18n-es="Calificadas">Graded</span></article><article class="studio-panel"><strong>{earned:g}</strong><span data-i18n-en="Points awarded" data-i18n-es="Puntos otorgados">Points awarded</span></article><article class="studio-panel"><strong>{possible:g}</strong><span data-i18n-en="Possible graded points" data-i18n-es="Puntos posibles calificados">Possible graded points</span></article></section>
+          <section class="studio-panel"><div style="overflow:auto"><table><thead><tr><th data-i18n-en="Student" data-i18n-es="Estudiante">Student</th><th data-i18n-en="Assessment" data-i18n-es="Evaluación">Assessment</th><th data-i18n-en="Submission" data-i18n-es="Entrega">Submission</th><th data-i18n-en="Grade and feedback" data-i18n-es="Calificación y retroalimentación">Grade and feedback</th></tr></thead><tbody>{rows_html}</tbody></table></div></section>
+        </main>'''
+        return portal_page("Gradebook", body, user)
+
+    @app.post(f"{GRADEBOOK_PREFIX}/submissions/{{submission_id}}/grade", response_model=None)
+    async def grade_submission(submission_id: int, request: Request, points_awarded: float = Form(...), feedback: str = Form("")):
+        user = _author(request, "/portal")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            found = rows(
+                execute(
+                    conn,
+                    """SELECT s.id,s.student_email,i.points,i.title AS item_title,m.course_id
+                       FROM nuvedra_submissions s
+                       JOIN nexus_content_items i ON i.id=s.item_id
+                       JOIN nexus_modules m ON m.id=i.module_id
+                       WHERE s.id=?""",
+                    (submission_id,),
+                )
+            )
+            if not found:
+                raise HTTPException(404, "Submission not found.")
+            submission = found[0]
+            course_id = int(submission["course_id"])
+            _course_access(conn, course_id, user)
+            if points_awarded < 0:
+                raise HTTPException(400, "The score cannot be negative.")
+            max_points = submission.get("points")
+            if max_points not in (None, "") and points_awarded > float(max_points):
+                raise HTTPException(400, "The score cannot exceed the points available for this assessment.")
+            now = utcnow()
+            grade = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+            if grade:
+                execute(conn, "UPDATE nuvedra_grades SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE submission_id=?", (points_awarded, feedback.strip(), user["email"], now, now, submission_id))
+            else:
+                execute(conn, "INSERT INTO nuvedra_grades (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,?,?,?,?)", (submission_id, points_awarded, feedback.strip(), "graded", user["email"], now, now))
+            audit(conn, user["email"], "submission_graded", "submission", str(submission_id), f"{points_awarded:g}", request.client.host if request.client else "")
+        return RedirectResponse(f"{GRADEBOOK_PREFIX}/courses/{course_id}/gradebook", status_code=303)
+
+    @app.get(f"{GRADEBOOK_PREFIX}/courses/{{course_id}}/gradebook.csv", response_model=None)
+    async def export_gradebook(course_id: int, request: Request):
+        user = _author(request, f"{GRADEBOOK_PREFIX}/courses/{course_id}/gradebook")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            access = _course_access(conn, course_id, user)
+            data = _submission_rows(conn, course_id)
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["Student", "Module", "Assessment", "Points possible", "Points awarded", "Feedback", "Submitted at", "Graded at"])
+        for row in data:
+            writer.writerow([row.get("student_email"), row.get("module_title"), row.get("item_title"), row.get("points"), row.get("points_awarded"), row.get("feedback"), row.get("submitted_at"), row.get("graded_at")])
+        filename = f"{str(access.get('course_code') or 'course').replace(' ', '_')}-gradebook.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/learn/courses/{course_id}/grades", response_class=HTMLResponse, response_model=None)
+    async def student_grades(course_id: int, request: Request):
+        user = google_user(request)
+        if not user:
+            return login_redirect(f"/learn/courses/{course_id}/grades")
+        with db() as conn:
+            access = require_course_role(conn, course_id, user["email"], {"student"})
+            data = rows(
+                execute(
+                    conn,
+                    """SELECT i.title AS item_title,i.points,m.title AS module_title,
+                              s.submitted_at,g.points_awarded,g.feedback,g.graded_at
+                       FROM nuvedra_submissions s
+                       JOIN nexus_content_items i ON i.id=s.item_id
+                       JOIN nexus_modules m ON m.id=i.module_id
+                       LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+                       WHERE m.course_id=? AND lower(s.student_email)=?
+                       ORDER BY m.position,i.position,i.id""",
+                    (course_id, user["email"].lower()),
+                )
+            )
+        cards = []
+        for row in data:
+            score = "Pending" if row.get("points_awarded") is None else f"{float(row.get('points_awarded') or 0):g} / {float(row.get('points') or 0):g}"
+            feedback = esc(row.get("feedback") or "No feedback yet.")
+            cards.append(f'<article class="studio-panel"><p class="studio-eyebrow">{esc(row.get("module_title"))}</p><h3>{esc(row.get("item_title"))}</h3><p><strong>{esc(score)}</strong></p><p>{feedback}</p><small>{esc(row.get("graded_at") or row.get("submitted_at"))}</small></article>')
+        content = "".join(cards) or '<section class="studio-empty" data-i18n-en="No graded work is available yet." data-i18n-es="Todavía no hay trabajos calificados disponibles.">No graded work is available yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-grades"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="My grades" data-i18n-es="Mis calificaciones">My grades</p><h2>{esc(access.get('course_code'))}: {esc(access.get('title'))}</h2></div></header><section class="studio-grid">{content}</section></main>'''
+        return portal_page("My grades", body, user)
+
+    print("NUVEDRA Gradebook registered: instructor grading, feedback, CSV export, and student grade view.", flush=True)

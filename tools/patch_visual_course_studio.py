@@ -106,7 +106,12 @@ def main() -> None:
         text = text.replace(marker, PREVIEW_ROUTES + "\n" + marker, 1)
 
     PATH.write_text(text, encoding="utf-8")
-    print("NUVEDRA Visual Course Studio hardened: nullable due dates and instructor-safe previews.", flush=True)
+
+    # Keep the Gradebook installation in the same deterministic post-V3 patch phase.
+    from patch_gradebook_v1 import main as patch_gradebook_v1
+    patch_gradebook_v1()
+
+    print("NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, and Gradebook v1.", flush=True)
 
 
 if __name__ == "__main__":
