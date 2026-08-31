@@ -114,11 +114,20 @@ def main() -> None:
     from patch_assessments_v2 import main as patch_assessments_v2
     patch_assessments_v2()
 
+    from patch_gradebook_v2 import main as patch_gradebook_v2
+    patch_gradebook_v2()
+
     from patch_assessments_smoke import main as patch_assessments_smoke
     patch_assessments_smoke()
 
+    from patch_gradebook_v2_smoke import main as patch_gradebook_v2_smoke
+    patch_gradebook_v2_smoke()
+
+    from patch_logo_visibility import main as patch_logo_visibility
+    patch_logo_visibility()
+
     print(
-        "NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, Gradebook v1, Assessments v2, and functional assessment validation.",
+        "NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, Gradebook v1, Assessments v2, Gradebook v2, logo visibility, and functional validation.",
         flush=True,
     )
 

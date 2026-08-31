@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import html
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _esc(value: Any, *, attr: bool = False) -> str:
+    return html.escape(str(value or ""), quote=attr)
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def ensure_gradebook_v2_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(
+            conn,
+            f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_answer_reviews (
+                id {pk},
+                answer_id INTEGER NOT NULL UNIQUE,
+                feedback TEXT,
+                reviewed_by TEXT NOT NULL,
+                reviewed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""",
+        )
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _course_access(conn: Any, course_id: int, user: dict[str, Any]) -> dict[str, Any]:
+    return academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+
+
+def _attempt_bundle(conn: Any, attempt_id: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int]:
+    found = rows(
+        execute(
+            conn,
+            """SELECT a.*,i.title AS item_title,i.points AS item_points,i.id AS item_id,
+                      m.id AS module_id,m.title AS module_title,m.course_id,
+                      c.course_code,c.title AS course_title
+               FROM nuvedra_assessment_attempts a
+               JOIN nexus_content_items i ON i.id=a.item_id
+               JOIN nexus_modules m ON m.id=i.module_id
+               JOIN nexus_admin_courses c ON c.id=m.course_id
+               WHERE a.id=?""",
+            (attempt_id,),
+        )
+    )
+    if not found:
+        raise HTTPException(404, "Assessment attempt not found.")
+    attempt = found[0]
+    item = {"id": attempt["item_id"], "title": attempt["item_title"], "points": attempt.get("item_points")}
+    module = {"id": attempt["module_id"], "title": attempt["module_title"]}
+    return attempt, item, module, int(attempt["course_id"])
+
+
+def _attempt_answers(conn: Any, attempt_id: int) -> list[dict[str, Any]]:
+    return rows(
+        execute(
+            conn,
+            """SELECT a.id AS answer_id,a.answer_text,a.is_correct,a.points_awarded,
+                      q.id AS question_id,q.question_type,q.prompt,q.correct_answer,q.points AS points_possible,
+                      q.feedback_correct,q.feedback_incorrect,q.position,
+                      r.feedback AS instructor_feedback,r.reviewed_by,r.reviewed_at
+               FROM nuvedra_assessment_answers a
+               JOIN nuvedra_assessment_questions q ON q.id=a.question_id
+               LEFT JOIN nuvedra_assessment_answer_reviews r ON r.answer_id=a.id
+               WHERE a.attempt_id=?
+               ORDER BY q.position,q.id""",
+            (attempt_id,),
+        )
+    )
+
+
+def _is_latest_submitted_attempt(conn: Any, attempt: dict[str, Any]) -> bool:
+    latest = rows(
+        execute(
+            conn,
+            """SELECT MAX(attempt_number) AS value
+               FROM nuvedra_assessment_attempts
+               WHERE item_id=? AND lower(student_email)=? AND status<>'in_progress'""",
+            (attempt["item_id"], str(attempt["student_email"]).lower()),
+        )
+    )
+    return bool(latest and int(latest[0].get("value") or 0) == int(attempt.get("attempt_number") or 0))
+
+
+def _sync_gradebook_if_latest(conn: Any, attempt: dict[str, Any], reviewer_email: str) -> None:
+    if not _is_latest_submitted_attempt(conn, attempt):
+        return
+    submission = rows(
+        execute(
+            conn,
+            "SELECT id FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?",
+            (attempt["item_id"], str(attempt["student_email"]).lower()),
+        )
+    )
+    if not submission:
+        return
+    submission_id = int(submission[0]["id"])
+    if attempt.get("score_total") is None:
+        execute(conn, "DELETE FROM nuvedra_grades WHERE submission_id=?", (submission_id,))
+        return
+    now = utcnow()
+    score = float(attempt.get("score_total") or 0)
+    feedback = "Reviewed in NUVEDRA Assessments. See per-question feedback for details."
+    grade = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+    if grade:
+        execute(
+            conn,
+            """UPDATE nuvedra_grades
+               SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=?
+               WHERE submission_id=?""",
+            (score, feedback, reviewer_email, now, now, submission_id),
+        )
+    else:
+        execute(
+            conn,
+            """INSERT INTO nuvedra_grades
+               (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (submission_id, score, feedback, "graded", reviewer_email, now, now),
+        )
+
+
+def _recalculate_attempt(conn: Any, attempt_id: int, reviewer_email: str) -> tuple[float, bool]:
+    attempt, _item, _module, _course_id = _attempt_bundle(conn, attempt_id)
+    answers = _attempt_answers(conn, attempt_id)
+    incomplete = any(answer.get("points_awarded") is None for answer in answers)
+    total = sum(float(answer.get("points_awarded") or 0) for answer in answers)
+    execute(
+        conn,
+        "UPDATE nuvedra_assessment_attempts SET score_total=?,has_manual_items=? WHERE id=?",
+        (None if incomplete else total, 1 if incomplete else 0, attempt_id),
+    )
+    attempt["score_total"] = None if incomplete else total
+    attempt["has_manual_items"] = 1 if incomplete else 0
+    _sync_gradebook_if_latest(conn, attempt, reviewer_email)
+    return total, incomplete
+
+
+def register_gradebook_v2(app: FastAPI) -> None:
+    ensure_gradebook_v2_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/attempts", response_class=HTMLResponse, response_model=None)
+    async def course_attempt_review(course_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/courses/{course_id}/attempts")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            access = _course_access(conn, course_id, user)
+            attempts = rows(
+                execute(
+                    conn,
+                    """SELECT a.*,i.title AS item_title,m.title AS module_title
+                       FROM nuvedra_assessment_attempts a
+                       JOIN nexus_content_items i ON i.id=a.item_id
+                       JOIN nexus_modules m ON m.id=i.module_id
+                       WHERE m.course_id=? AND a.status<>'in_progress'
+                       ORDER BY a.submitted_at DESC,a.id DESC""",
+                    (course_id,),
+                )
+            )
+        pending = sum(1 for row in attempts if row.get("score_total") is None)
+        rows_html = "".join(
+            f'''<tr>
+              <td><strong>{_esc(row.get("student_email"))}</strong></td>
+              <td>{_esc(row.get("module_title"))}<br><strong>{_esc(row.get("item_title"))}</strong></td>
+              <td>{int(row.get("attempt_number") or 1)}</td>
+              <td>{_esc(row.get("status"))}</td>
+              <td>{"Pending manual review" if row.get("score_total") is None else f"{float(row.get('score_total') or 0):g} pts"}</td>
+              <td><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/attempts/{int(row['id'])}/review" data-i18n-en="Review" data-i18n-es="Revisar">Review</a></td>
+            </tr>'''
+            for row in attempts
+        ) or '<tr><td colspan="6" data-i18n-en="No submitted structured assessments yet." data-i18n-es="Todavía no hay evaluaciones estructuradas entregadas.">No submitted structured assessments yet.</td></tr>'
+        body = f'''{_assets()}
+        <main class="studio-shell" data-studio-root data-testid="structured-attempts-review">
+          <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Back to Gradebook" data-i18n-es="Volver a calificaciones">Back to Gradebook</a></nav>
+          <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Gradebook v2" data-i18n-es="Calificaciones v2">Gradebook v2</p><h2>{_esc(access.get('course_code'))}: {_esc(access.get('title'))}</h2><p data-i18n-en="Review structured assessment attempts and score essay or manually adjusted responses." data-i18n-es="Revise los intentos estructurados y califique ensayos o respuestas ajustadas manualmente.">Review structured assessment attempts and score essay or manually adjusted responses.</p></div></header>
+          <section class="studio-summary-grid"><article class="studio-panel"><strong>{len(attempts)}</strong><span data-i18n-en="Submitted attempts" data-i18n-es="Intentos entregados">Submitted attempts</span></article><article class="studio-panel"><strong>{pending}</strong><span data-i18n-en="Pending manual review" data-i18n-es="Pendientes de revisión manual">Pending manual review</span></article></section>
+          <section class="studio-panel"><div style="overflow:auto"><table><thead><tr><th>Student</th><th>Assessment</th><th>Attempt</th><th>Status</th><th>Score</th><th></th></tr></thead><tbody>{rows_html}</tbody></table></div></section>
+        </main>'''
+        return academic_access.portal_page("Assessment review", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/attempts/{{attempt_id}}/review", response_class=HTMLResponse, response_model=None)
+    async def review_attempt(attempt_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/attempts/{attempt_id}/review")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            attempt, item, module, course_id = _attempt_bundle(conn, attempt_id)
+            access = _course_access(conn, course_id, user)
+            answers = _attempt_answers(conn, attempt_id)
+        answer_cards = []
+        for index, answer in enumerate(answers, 1):
+            possible = float(answer.get("points_possible") or 0)
+            awarded = "" if answer.get("points_awarded") is None else f"{float(answer.get('points_awarded') or 0):g}"
+            auto_note = "Manual response" if answer.get("is_correct") is None else ("Automatically correct" if int(answer.get("is_correct") or 0) == 1 else "Automatically incorrect")
+            answer_cards.append(f'''<article class="studio-panel">
+              <p class="studio-eyebrow">#{index} · {_esc(answer.get('question_type'))} · {possible:g} pts</p>
+              <h3>{_esc(answer.get('prompt'))}</h3>
+              <div class="studio-notice"><strong data-i18n-en="Student response" data-i18n-es="Respuesta del estudiante">Student response</strong><p>{_esc(answer.get('answer_text'))}</p></div>
+              <p><strong>{_esc(auto_note)}</strong></p>
+              <form method="post" action="{STUDIO_PREFIX}/attempts/{attempt_id}/answers/{int(answer['answer_id'])}/review">
+                <div class="studio-form-grid">
+                  <label><span data-i18n-en="Points awarded" data-i18n-es="Puntos otorgados">Points awarded</span><input type="number" name="points_awarded" min="0" max="{possible:g}" step="0.01" value="{_esc(awarded, attr=True)}" required></label>
+                  <label class="studio-form-grid__wide"><span data-i18n-en="Instructor feedback" data-i18n-es="Retroalimentación del instructor">Instructor feedback</span><textarea name="feedback">{_esc(answer.get('instructor_feedback'))}</textarea></label>
+                </div>
+                <button class="studio-button" data-i18n-en="Save question review" data-i18n-es="Guardar revisión de pregunta">Save question review</button>
+              </form>
+            </article>''')
+        score = "Pending manual review" if attempt.get("score_total") is None else f"{float(attempt.get('score_total') or 0):g} pts"
+        body = f'''{_assets()}
+        <main class="studio-shell" data-studio-root data-testid="attempt-review">
+          <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/attempts" data-i18n-en="Back to attempts" data-i18n-es="Volver a intentos">Back to attempts</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}/gradebook">Gradebook</a></nav>
+          <header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Structured assessment review" data-i18n-es="Revisión de evaluación estructurada">Structured assessment review</p><h2>{_esc(item.get('title'))}</h2><p>{_esc(access.get('course_code'))} · {_esc(module.get('title'))} · {_esc(attempt.get('student_email'))} · Attempt {int(attempt.get('attempt_number') or 1)}</p></div></header>
+          <section class="studio-summary-grid"><article class="studio-panel"><strong>{float(attempt.get('score_auto') or 0):g}</strong><span data-i18n-en="Auto score" data-i18n-es="Puntuación automática">Auto score</span></article><article class="studio-panel"><strong>{_esc(score)}</strong><span data-i18n-en="Current total" data-i18n-es="Total actual">Current total</span></article><article class="studio-panel"><strong>{len(answers)}</strong><span data-i18n-en="Questions" data-i18n-es="Preguntas">Questions</span></article></section>
+          <section class="studio-section">{"".join(answer_cards) or '<section class="studio-empty">No answers found.</section>'}</section>
+        </main>'''
+        return academic_access.portal_page("Attempt review", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/attempts/{{attempt_id}}/answers/{{answer_id}}/review", response_model=None)
+    async def save_answer_review(attempt_id: int, answer_id: int, request: Request, points_awarded: float = Form(...), feedback: str = Form("")):
+        user = _author(request, f"{STUDIO_PREFIX}/attempts/{attempt_id}/review")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            attempt, _item, _module, course_id = _attempt_bundle(conn, attempt_id)
+            _course_access(conn, course_id, user)
+            found = rows(
+                execute(
+                    conn,
+                    """SELECT a.id,q.points AS points_possible
+                       FROM nuvedra_assessment_answers a
+                       JOIN nuvedra_assessment_questions q ON q.id=a.question_id
+                       WHERE a.id=? AND a.attempt_id=?""",
+                    (answer_id, attempt_id),
+                )
+            )
+            if not found:
+                raise HTTPException(404, "Assessment answer not found.")
+            possible = float(found[0].get("points_possible") or 0)
+            if points_awarded < 0 or points_awarded > possible:
+                raise HTTPException(400, "Points awarded must be between zero and the points available for this question.")
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_assessment_answers SET points_awarded=?,updated_at=? WHERE id=? AND attempt_id=?", (points_awarded, now, answer_id, attempt_id))
+            review = rows(execute(conn, "SELECT id FROM nuvedra_assessment_answer_reviews WHERE answer_id=?", (answer_id,)))
+            if review:
+                execute(conn, "UPDATE nuvedra_assessment_answer_reviews SET feedback=?,reviewed_by=?,reviewed_at=?,updated_at=? WHERE answer_id=?", (feedback.strip(), user["email"], now, now, answer_id))
+            else:
+                execute(conn, "INSERT INTO nuvedra_assessment_answer_reviews (answer_id,feedback,reviewed_by,reviewed_at,updated_at) VALUES (?,?,?,?,?)", (answer_id, feedback.strip(), user["email"], now, now))
+            total, incomplete = _recalculate_attempt(conn, attempt_id, user["email"])
+            audit(conn, user["email"], "assessment_answer_reviewed", "answer", str(answer_id), f"{points_awarded:g}:{'pending' if incomplete else f'{total:g}'}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/attempts/{attempt_id}/review", status_code=303)
+
+    @app.get("/learn/assessments/{item_id}/attempts/{attempt_id}/feedback", response_class=HTMLResponse, response_model=None)
+    async def student_attempt_feedback(item_id: int, attempt_id: int, request: Request):
+        user = academic_access.google_user(request)
+        if not user:
+            return academic_access.login_redirect(f"/learn/assessments/{item_id}/attempts/{attempt_id}/feedback")
+        with db() as conn:
+            attempt, item, module, course_id = _attempt_bundle(conn, attempt_id)
+            academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            if int(attempt.get("item_id") or 0) != item_id or str(attempt.get("student_email") or "").lower() != user["email"].lower() or str(attempt.get("status")) == "in_progress":
+                raise HTTPException(403, "This attempt is not available to this student.")
+            answers = _attempt_answers(conn, attempt_id)
+        cards = []
+        for index, answer in enumerate(answers, 1):
+            points = "Pending" if answer.get("points_awarded") is None else f"{float(answer.get('points_awarded') or 0):g} / {float(answer.get('points_possible') or 0):g}"
+            feedback = answer.get("instructor_feedback") or (answer.get("feedback_correct") if answer.get("is_correct") == 1 else answer.get("feedback_incorrect")) or "No feedback yet."
+            cards.append(f'<article class="studio-panel"><p class="studio-eyebrow">#{index} · {_esc(answer.get("question_type"))}</p><h3>{_esc(answer.get("prompt"))}</h3><p><strong data-i18n-en="Your response" data-i18n-es="Su respuesta">Your response:</strong> {_esc(answer.get("answer_text"))}</p><p><strong>{_esc(points)}</strong></p><p>{_esc(feedback)}</p></article>')
+        total = "Pending manual review" if attempt.get("score_total") is None else f"{float(attempt.get('score_total') or 0):g} pts"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-attempt-feedback"><nav class="studio-breadcrumbs"><a href="/learn/assessments/{item_id}" data-i18n-en="Back to assessment" data-i18n-es="Volver a la evaluación">Back to assessment</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Attempt feedback" data-i18n-es="Retroalimentación del intento">Attempt feedback</p><h2>{_esc(item.get('title'))}</h2><p>{_esc(module.get('title'))} · Attempt {int(attempt.get('attempt_number') or 1)} · {_esc(total)}</p></div></header><section class="studio-section">{"".join(cards)}</section></main>'''
+        return academic_access.portal_page("Attempt feedback", body, user)
+
+    print("NUVEDRA Gradebook v2 registered: structured-attempt review, manual question scoring, per-question feedback, and student feedback view.", flush=True)
