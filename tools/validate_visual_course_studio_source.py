@@ -39,6 +39,9 @@ def main() -> None:
             'data-select-type',
             'NUVEDRA_GRADEBOOK_V1',
             'data-gradebook-link',
+            'NUVEDRA_ASSESSMENTS_V2',
+            'data-assessment-builder-link',
+            'data-question-form',
         ),
     )
     require(
@@ -64,13 +67,48 @@ def main() -> None:
         ),
     )
     require(
+        "app/assessment_engine.py",
+        (
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_questions',
+            'CREATE TABLE IF NOT EXISTS nuvedra_question_bank',
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_attempts',
+            'CREATE TABLE IF NOT EXISTS nuvedra_assessment_answers',
+            '/items/{{item_id}}/assessment',
+            '/assessment/questions',
+            '/assessment/bank/{{bank_id}}/import',
+            '/learn/assessments/{item_id}',
+            '/learn/assessments/{item_id}/start',
+            'structured_assessment_submitted',
+            'NUVEDRA AutoGrade',
+            'data-testid="assessment-builder"',
+            'data-testid="student-assessment"',
+        ),
+    )
+    require(
         "app/academic_portal.py",
         (
             'from app.gradebook import register_gradebook',
             'register_gradebook(app)',
+            'from app.assessment_engine import register_assessment_engine',
+            'register_assessment_engine(app)',
         ),
     )
-    print("Visual Course Studio and Gradebook v1 source validated.", flush=True)
+    require(
+        "app/student_portal.py",
+        (
+            'def _student_item_href',
+            '/learn/assessments/{item_id}',
+            'Use the structured assessment workflow for this item.',
+        ),
+    )
+    require(
+        "app/platform_upgrade.py",
+        (
+            'gradebook.google_user = academic_user',
+            '("app.gradebook", "app.assessment_engine")',
+        ),
+    )
+    print("Visual Course Studio, Gradebook v1, and Assessments v2 source validated.", flush=True)
 
 
 if __name__ == "__main__":
