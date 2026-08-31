@@ -30,6 +30,15 @@ def main() -> None:
             'due_at=due_at.strip(), status="draft")',
             'due_at=str(item.get("due_at") or ""), status="draft")',
             'due_at=str(source.get("due_at") or ""), status="draft")',
+            'def _content_resource_url(value: Any)',
+            '/library/assets/',
+        ),
+    )
+    require(
+        "app/unified_authoring.py",
+        (
+            'def _content_resource_url(value: Any)',
+            '_content_resource_url(external_url) or None',
         ),
     )
     require(
@@ -46,6 +55,8 @@ def main() -> None:
             'data-question-form',
             'NUVEDRA_GRADEBOOK_V2',
             'data-attempt-review-link',
+            'NUVEDRA_CONTENT_LIBRARY_V1',
+            'data-content-library-link',
         ),
     )
     require(
@@ -105,6 +116,29 @@ def main() -> None:
         ),
     )
     require(
+        "app/student_experience.py",
+        (
+            'data-testid="student-dashboard"',
+            'data-testid="student-course-v2"',
+            'data-testid="student-item-v2"',
+            '/learn/todo',
+            'student_content_completion_changed',
+        ),
+    )
+    require(
+        "app/content_library.py",
+        (
+            'CREATE TABLE IF NOT EXISTS nuvedra_library_assets',
+            'CREATE TABLE IF NOT EXISTS nuvedra_library_uses',
+            'data-testid="content-library-v1"',
+            '/library/assets/{asset_id}/download',
+            'content_library_asset_created',
+            'content_library_asset_attached',
+            'MAX_UPLOAD_BYTES = 20 * 1024 * 1024',
+            'ACCESSIBILITY_REQUIRED',
+        ),
+    )
+    require(
         "app/academic_portal.py",
         (
             'from app.gradebook import register_gradebook',
@@ -113,6 +147,10 @@ def main() -> None:
             'register_assessment_engine(app)',
             'from app.gradebook_v2 import register_gradebook_v2',
             'register_gradebook_v2(app)',
+            'from app.student_experience import register_student_experience',
+            'register_student_experience(app)',
+            'from app.content_library import register_content_library',
+            'register_content_library(app)',
         ),
     )
     require(
@@ -137,6 +175,10 @@ def main() -> None:
             'tools/smoke_test_assessments_v2.py',
             'NUVEDRA_GRADEBOOK_V2_SMOKE',
             'tools/smoke_test_gradebook_v2.py',
+            'NUVEDRA_STUDENT_EXPERIENCE_V2_SMOKE',
+            'tools/smoke_test_student_experience_v2.py',
+            'NUVEDRA_CONTENT_LIBRARY_V1_SMOKE',
+            'tools/smoke_test_content_library_v1.py',
         ),
     )
     require(
@@ -160,6 +202,17 @@ def main() -> None:
         ),
     )
     require(
+        "tools/smoke_test_content_library_v1.py",
+        (
+            'data-testid="content-library-v1"',
+            'accessibility requirement',
+            'library file upload',
+            'attach library asset',
+            'protected student download',
+            'unrelated user download protection',
+        ),
+    )
+    require(
         "app/static/styles.css",
         (
             'NUVEDRA_LOGO_VISIBILITY_V2',
@@ -175,7 +228,7 @@ def main() -> None:
             '>NUVEDRA</text>',
         ),
     )
-    print("Visual Course Studio, Gradebook v1/v2, Assessments v2, manual essay review, and full NUVEDRA logo source validated with functional smoke coverage.", flush=True)
+    print("Visual Course Studio, Gradebook v1/v2, Assessments v2, Student Experience v2, Content Library v1, and full NUVEDRA logo source validated with functional smoke coverage.", flush=True)
 
 
 if __name__ == "__main__":
