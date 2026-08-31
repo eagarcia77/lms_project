@@ -75,29 +75,11 @@ def replace_required(text: str, old: str, new: str) -> str:
 def main() -> None:
     text = PATH.read_text(encoding="utf-8")
 
-    text = replace_required(
-        text,
-        'due_at=due_at.strip() or None, status="draft")',
-        'due_at=due_at.strip(), status="draft")',
-    )
-    text = replace_required(
-        text,
-        'due_at=item.get("due_at"), status="draft")',
-        'due_at=str(item.get("due_at") or ""), status="draft")',
-    )
-    text = replace_required(
-        text,
-        'due_at=source.get("due_at"), status="draft")',
-        'due_at=str(source.get("due_at") or ""), status="draft")',
-    )
-    text = text.replace(
-        'href="{PREFIX}/items/{item_id}/preview"',
-        'href="{STUDIO_PREFIX}/items/{item_id}/preview"',
-    )
-    text = text.replace(
-        'href="/learn/courses/{course_id}"',
-        'href="{STUDIO_PREFIX}/courses/{course_id}/preview"',
-    )
+    text = replace_required(text, 'due_at=due_at.strip() or None, status="draft")', 'due_at=due_at.strip(), status="draft")')
+    text = replace_required(text, 'due_at=item.get("due_at"), status="draft")', 'due_at=str(item.get("due_at") or ""), status="draft")')
+    text = replace_required(text, 'due_at=source.get("due_at"), status="draft")', 'due_at=str(source.get("due_at") or ""), status="draft")')
+    text = text.replace('href="{PREFIX}/items/{item_id}/preview"', 'href="{STUDIO_PREFIX}/items/{item_id}/preview"')
+    text = text.replace('href="/learn/courses/{course_id}"', 'href="{STUDIO_PREFIX}/courses/{course_id}/preview"')
 
     if TAG not in text:
         marker = '    @app.get(f"{STUDIO_PREFIX}/items/{{item_id}}/edit", response_class=HTMLResponse, response_model=None)\n'
@@ -107,7 +89,6 @@ def main() -> None:
 
     PATH.write_text(text, encoding="utf-8")
 
-    # Keep Gradebook and Assessments in the same deterministic post-V3 patch phase.
     from patch_gradebook_v1 import main as patch_gradebook_v1
     patch_gradebook_v1()
 
@@ -117,17 +98,23 @@ def main() -> None:
     from patch_gradebook_v2 import main as patch_gradebook_v2
     patch_gradebook_v2()
 
+    from patch_student_experience_v2 import main as patch_student_experience_v2
+    patch_student_experience_v2()
+
     from patch_assessments_smoke import main as patch_assessments_smoke
     patch_assessments_smoke()
 
     from patch_gradebook_v2_smoke import main as patch_gradebook_v2_smoke
     patch_gradebook_v2_smoke()
 
+    from patch_student_experience_smoke import main as patch_student_experience_smoke
+    patch_student_experience_smoke()
+
     from patch_logo_visibility import main as patch_logo_visibility
     patch_logo_visibility()
 
     print(
-        "NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, Gradebook v1, Assessments v2, Gradebook v2, logo visibility, and functional validation.",
+        "NUVEDRA Visual Course Studio hardened: nullable due dates, instructor-safe previews, Gradebook v1, Assessments v2, Gradebook v2, Student Experience v2, logo visibility, and functional validation.",
         flush=True,
     )
 
