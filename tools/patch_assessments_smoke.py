@@ -7,6 +7,9 @@ TAG = "NUVEDRA_ASSESSMENTS_V2_SMOKE"
 
 
 def main() -> None:
+    from patch_assessment_editor_settings import main as patch_assessment_editor_settings
+    patch_assessment_editor_settings()
+
     text = PATH.read_text(encoding="utf-8")
     if "import subprocess\n" not in text:
         text = text.replace("import os\n", "import os\nimport subprocess\nimport sys\n", 1)
@@ -17,7 +20,7 @@ def main() -> None:
         block = "    # NUVEDRA_ASSESSMENTS_V2_SMOKE\n    subprocess.run(\n        [sys.executable, 'tools/smoke_test_assessments_v2.py'],\n        check=True,\n        env={**os.environ, 'PYTHONPATH': '.'},\n    )\n\n"
         text = text.replace(marker, block + marker, 1)
     PATH.write_text(text, encoding="utf-8")
-    print("Assessments v2 functional smoke test attached to Course Studio validation.", flush=True)
+    print("Assessments v2 editor settings and functional smoke validation attached to Course Studio.", flush=True)
 
 
 if __name__ == "__main__":
