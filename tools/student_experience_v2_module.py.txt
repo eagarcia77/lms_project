@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STRUCTURED_TYPES = {"assessment", "quiz"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _esc(value: Any, *, attr: bool = False) -> str:
+    return academic_access.esc(value, attr=attr)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _student(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_student_experience_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_content_progress (
+            id {pk}, item_id INTEGER NOT NULL, student_email TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'completed', completed_at TEXT,
+            updated_at TEXT NOT NULL, UNIQUE(item_id,student_email)
+        )""")
+
+
+def _published_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.*,m.id AS module_id,m.title AS module_title,m.position AS module_position
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND m.status='published' AND i.status='published'
+        ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+
+def _completion_map(conn: Any, course_id: int, email: str) -> dict[int, bool]:
+    items = _published_items(conn, course_id)
+    ids = [int(item["id"]) for item in items]
+    result = {item_id: False for item_id in ids}
+    if not ids:
+        return result
+    placeholders = ",".join("?" for _ in ids)
+    for row in rows(execute(conn, f"SELECT item_id,status FROM nuvedra_content_progress WHERE item_id IN ({placeholders}) AND lower(student_email)=?", tuple(ids) + (email.lower(),))):
+        result[int(row["item_id"])] = str(row.get("status")) == "completed"
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_submissions WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status='submitted'", tuple(ids) + (email.lower(),))):
+        result[int(row["item_id"])] = True
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_assessment_attempts WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status<>'in_progress'", tuple(ids) + (email.lower(),))):
+        result[int(row["item_id"])] = True
+    return result
+
+
+def _course_progress(conn: Any, course_id: int, email: str):
+    items = _published_items(conn, course_id)
+    completion = _completion_map(conn, course_id, email)
+    completed = sum(1 for item in items if completion.get(int(item["id"]), False))
+    total = len(items)
+    percent = round((completed / total) * 100) if total else 0
+    return completed, total, percent, items, completion
+
+
+def _item_href(item: dict[str, Any]) -> str:
+    item_id = int(item["id"])
+    return f"/learn/assessments/{item_id}" if str(item.get("item_type")) in STRUCTURED_TYPES else f"/learn/items/{item_id}"
+
+
+def _due_label(value: Any) -> tuple[str, str]:
+    due = _parse_iso(value)
+    if due is None:
+        return "", ""
+    state = "Overdue" if due < datetime.now(timezone.utc) else "Due"
+    return state, due.astimezone().strftime("%b %d, %Y · %I:%M %p")
+
+
+def _todo_rows(conn: Any, email: str) -> list[dict[str, Any]]:
+    data = rows(execute(conn, """SELECT i.*,m.title AS module_title,c.id AS course_id,c.course_code,c.title AS course_title
+        FROM nexus_admin_enrollments e
+        JOIN nexus_admin_courses c ON c.id=e.course_id
+        JOIN nexus_modules m ON m.course_id=c.id
+        JOIN nexus_content_items i ON i.module_id=m.id
+        WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role='student'
+          AND c.status='active' AND m.status='published' AND i.status='published'
+          AND i.due_at IS NOT NULL AND TRIM(i.due_at)<>''
+        ORDER BY i.due_at,c.course_code,m.position,i.position,i.id""", (email.lower(),)))
+    maps: dict[int, dict[int, bool]] = {}
+    result = []
+    for row in data:
+        cid = int(row["course_id"])
+        maps.setdefault(cid, _completion_map(conn, cid, email))
+        if not maps[cid].get(int(row["id"]), False):
+            result.append(row)
+    return result
+
+
+def _mark_completed(conn: Any, item_id: int, email: str, completed: bool) -> None:
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_content_progress WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    status = "completed" if completed else "not_started"
+    completed_at = now if completed else None
+    if found:
+        execute(conn, "UPDATE nuvedra_content_progress SET status=?,completed_at=?,updated_at=? WHERE id=?", (status, completed_at, now, int(found[0]["id"])))
+    else:
+        execute(conn, "INSERT INTO nuvedra_content_progress (item_id,student_email,status,completed_at,updated_at) VALUES (?,?,?,?,?)", (item_id, email.lower(), status, completed_at, now))
+
+
+def register_student_experience(app: FastAPI) -> None:
+    ensure_student_experience_schema()
+    academic_access.remove_route(app, "/learn/courses/{course_id}", "GET")
+    academic_access.remove_route(app, "/learn/items/{item_id}", "GET")
+
+    @app.get("/learn/dashboard", response_class=HTMLResponse, response_model=None)
+    async def student_dashboard(request: Request):
+        user = _student(request, "/learn/dashboard")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            enrollments = rows(execute(conn, """SELECT e.course_id,c.course_code,c.title,c.description
+                FROM nexus_admin_enrollments e JOIN nexus_admin_courses c ON c.id=e.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role='student' AND c.status='active'
+                ORDER BY c.title""", (user["email"].lower(),)))
+            cards=[]; overall_completed=0; overall_total=0
+            for row in enrollments:
+                completed,total,percent,items,completion=_course_progress(conn,int(row["course_id"]),user["email"])
+                overall_completed+=completed; overall_total+=total
+                next_item=next((item for item in items if not completion.get(int(item["id"]),False)),None)
+                href=_item_href(next_item) if next_item else f"/learn/courses/{int(row['course_id'])}"
+                cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{_esc(row.get('course_code'))}</p><h3>{_esc(row.get('title'))}</h3><p>{_esc(row.get('description'))}</p><p><strong>{percent}%</strong> · {completed}/{total} <span data-i18n-en="completed" data-i18n-es="completados">completed</span></p><progress max="100" value="{percent}" style="width:100%">{percent}%</progress><div class="studio-actions" style="margin-top:16px"><a class="studio-button" href="{href}" data-i18n-en="Continue learning" data-i18n-es="Continuar aprendiendo">Continue learning</a><a class="studio-button studio-button--quiet" href="/learn/courses/{int(row['course_id'])}/grades" data-i18n-en="Grades" data-i18n-es="Calificaciones">Grades</a></div></article>''')
+            todos=_todo_rows(conn,user["email"])
+        overall_percent=round((overall_completed/overall_total)*100) if overall_total else 0
+        todo_html="".join(f'''<li><a href="{_item_href(item)}"><strong>{_esc(item.get('course_code'))}</strong> · {_esc(item.get('title'))}</a><br><small>{_esc(_due_label(item.get('due_at'))[0])}: {_esc(_due_label(item.get('due_at'))[1])}</small></li>''' for item in todos[:8]) or '<li data-i18n-en="You are caught up." data-i18n-es="Está al día.">You are caught up.</li>'
+        body=f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-dashboard"><nav class="studio-breadcrumbs"><a href="/portal" data-i18n-en="My courses" data-i18n-es="Mis cursos">My courses</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Student dashboard" data-i18n-es="Panel del estudiante">Student dashboard</p><h2 data-i18n-en="Keep moving forward" data-i18n-es="Continúe avanzando">Keep moving forward</h2><p data-i18n-en="See your progress, continue where you left off, and review upcoming work." data-i18n-es="Consulte su progreso, continúe donde se quedó y revise los próximos trabajos.">See your progress, continue where you left off, and review upcoming work.</p></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{len(enrollments)}</strong><span data-i18n-en="Active courses" data-i18n-es="Cursos activos">Active courses</span></article><article class="studio-panel"><strong>{overall_percent}%</strong><span data-i18n-en="Overall progress" data-i18n-es="Progreso general">Overall progress</span></article><article class="studio-panel"><strong>{overall_completed}/{overall_total}</strong><span data-i18n-en="Completed items" data-i18n-es="Elementos completados">Completed items</span></article><article class="studio-panel"><strong>{len(todos)}</strong><span data-i18n-en="Due items" data-i18n-es="Trabajos con fecha límite">Due items</span></article></section><section class="studio-section"><h2 data-i18n-en="My courses" data-i18n-es="Mis cursos">My courses</h2><div class="studio-grid">{''.join(cards) or '<section class="studio-empty">No active student courses.</section>'}</div></section><section class="studio-panel"><div class="studio-actions"><h2 style="margin-right:auto" data-i18n-en="To-do" data-i18n-es="Pendientes">To-do</h2><a class="studio-button studio-button--quiet" href="/learn/todo" data-i18n-en="View all" data-i18n-es="Ver todos">View all</a></div><ol>{todo_html}</ol></section></main>'''
+        return academic_access.portal_page("Student dashboard", body, user)
+
+    @app.get("/learn/todo", response_class=HTMLResponse, response_model=None)
+    async def student_todo(request: Request):
+        user=_student(request,"/learn/todo")
+        if isinstance(user,RedirectResponse): return user
+        with db() as conn: data=_todo_rows(conn,user["email"])
+        cards=[]
+        for item in data:
+            state,due=_due_label(item.get("due_at"))
+            cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{_esc(item.get('course_code'))} · {_esc(item.get('module_title'))}</p><h3>{_esc(item.get('title'))}</h3><p><strong>{_esc(state)}:</strong> {_esc(due)}</p><a class="studio-button" href="{_item_href(item)}" data-i18n-en="Open" data-i18n-es="Abrir">Open</a></article>''')
+        body=f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-todo"><nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="To-do" data-i18n-es="Pendientes">To-do</p><h2 data-i18n-en="Upcoming and overdue work" data-i18n-es="Trabajos próximos y atrasados">Upcoming and overdue work</h2></div></header><section class="studio-grid">{''.join(cards) or '<section class="studio-empty" data-i18n-en="Nothing is due right now." data-i18n-es="No hay trabajos pendientes con fecha límite.">Nothing is due right now.</section>'}</section></main>'''
+        return academic_access.portal_page("To-do",body,user)
+
+    @app.get("/learn/courses/{course_id}", response_class=HTMLResponse, response_model=None)
+    async def student_course_v2(course_id:int,request:Request):
+        user=_student(request,f"/learn/courses/{course_id}")
+        if isinstance(user,RedirectResponse): return user
+        with db() as conn:
+            access=academic_access.require_course_role(conn,course_id,user["email"],academic_access.STUDENT_ROLES)
+            if str(access.get("course_status"))!="active": raise HTTPException(403,"This course is not available yet.")
+            modules=rows(execute(conn,"SELECT * FROM nexus_modules WHERE course_id=? AND status='published' ORDER BY position,id",(course_id,)))
+            completed,total,percent,_items,completion=_course_progress(conn,course_id,user["email"])
+            sections=[]; first_incomplete=None
+            for module in modules:
+                items=rows(execute(conn,"SELECT * FROM nexus_content_items WHERE module_id=? AND status='published' ORDER BY position,id",(int(module["id"]),)))
+                module_completed=sum(1 for item in items if completion.get(int(item["id"]),False)); links=[]
+                for item in items:
+                    done=completion.get(int(item["id"]),False)
+                    if not done and first_incomplete is None: first_incomplete=item
+                    state="✓" if done else "○"; due_state,due_label=_due_label(item.get("due_at")); due_html=f'<small> · {_esc(due_state)} {_esc(due_label)}</small>' if due_label else ""
+                    links.append(f'<li><span aria-hidden="true">{state}</span> <a href="{_item_href(item)}">{_esc(item.get("title"))}</a> <small>({_esc(item.get("item_type"))})</small>{due_html}</li>')
+                sections.append(f'''<section class="studio-panel"><p class="studio-eyebrow">Module {int(module.get('position') or 1)} · {module_completed}/{len(items)} completed</p><h3>{_esc(module.get('title'))}</h3><p>{_esc(module.get('description'))}</p><ol>{''.join(links) or '<li>No published content yet.</li>'}</ol></section>''')
+            continue_href=_item_href(first_incomplete) if first_incomplete else ""
+        continue_button=f'<a class="studio-button" href="{continue_href}" data-i18n-en="Continue learning" data-i18n-es="Continuar aprendiendo">Continue learning</a>' if continue_href else ''
+        body=f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-course-v2"><nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a><span>/</span><a href="/portal" data-i18n-en="My courses" data-i18n-es="Mis cursos">My courses</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{_esc(access.get('course_code'))}</p><h2>{_esc(access.get('title'))}</h2><p>{_esc(access.get('description'))}</p></div><div class="studio-actions">{continue_button}<a class="studio-button studio-button--quiet" href="/learn/courses/{course_id}/grades" data-i18n-en="Grades" data-i18n-es="Calificaciones">Grades</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{percent}%</strong><span data-i18n-en="Course progress" data-i18n-es="Progreso del curso">Course progress</span></article><article class="studio-panel"><strong>{completed}/{total}</strong><span data-i18n-en="Completed" data-i18n-es="Completados">Completed</span></article></section><progress max="100" value="{percent}" style="width:100%;margin:0 0 24px">{percent}%</progress><section class="studio-section">{''.join(sections) or '<section class="studio-empty">The instructor has not published modules yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Course",body,user)
+
+    @app.get("/learn/items/{item_id}", response_class=HTMLResponse, response_model=None)
+    async def student_item_v2(item_id:int,request:Request):
+        user=_student(request,f"/learn/items/{item_id}")
+        if isinstance(user,RedirectResponse): return user
+        with db() as conn:
+            course_id,item,module=academic_access.item_bundle(conn,item_id)
+            access=academic_access.require_course_role(conn,course_id,user["email"],academic_access.STUDENT_ROLES)
+            if str(access.get("course_status"))!="active" or str(item.get("status"))!="published" or str(module.get("status"))!="published": raise HTTPException(403,"This content is not published.")
+            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)
+            completion=_completion_map(conn,course_id,user["email"]); completed=completion.get(item_id,False)
+        external=f'<p><a class="studio-button studio-button--quiet" href="{_esc(item.get("external_url"),attr=True)}" target="_blank" rel="noopener">Open resource</a></p>' if item.get("external_url") else ""
+        embed=f'<iframe src="{_esc(item.get("embed_url"),attr=True)}" title="{_esc(item.get("title"),attr=True)}" allow="fullscreen; xr-spatial-tracking" style="width:100%;min-height:520px;border:1px solid var(--studio-line);border-radius:16px"></iframe>' if item.get("embed_url") else ""
+        completion_button=""
+        if str(access.get("course_role"))=="student" and str(item.get("item_type")) not in academic_access.ASSESSMENT_TYPES:
+            label="Mark incomplete" if completed else "Mark complete"; es_label="Marcar incompleto" if completed else "Marcar completado"; action="0" if completed else "1"
+            completion_button=f'''<form method="post" action="/learn/items/{item_id}/complete"><input type="hidden" name="completed" value="{action}"><button class="studio-button studio-button--quiet" data-i18n-en="{label}" data-i18n-es="{es_label}">{label}</button></form>'''
+        state_text="Completed" if completed else "Not completed"
+        body=f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-item-v2"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{_esc(item.get('item_type'))} · {state_text}</p><h2>{_esc(item.get('title'))}</h2></div><div class="studio-actions">{completion_button}</div></header><article class="studio-panel content-body">{item.get('body_html') or ''}{external}{embed}</article></main>'''
+        return academic_access.portal_page("Content",body,user)
+
+    @app.post("/learn/items/{item_id}/complete", response_model=None)
+    async def set_item_completion(item_id:int,request:Request,completed:str=Form("1")):
+        user=_student(request,f"/learn/items/{item_id}")
+        if isinstance(user,RedirectResponse): return user
+        with db() as conn:
+            course_id,item,module=academic_access.item_bundle(conn,item_id)
+            access=academic_access.require_course_role(conn,course_id,user["email"],{"student"})
+            if str(access.get("course_status"))!="active" or str(item.get("status"))!="published" or str(module.get("status"))!="published": raise HTTPException(403,"This content is not available.")
+            if str(item.get("item_type")) in academic_access.ASSESSMENT_TYPES: raise HTTPException(409,"Assessment completion is determined by submission status.")
+            done=completed=="1"; _mark_completed(conn,item_id,user["email"],done)
+            audit(conn,user["email"],"student_content_completion_changed","item",str(item_id),"completed" if done else "not_started",request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/items/{item_id}",status_code=303)
+
+    print("NUVEDRA Student Experience v2 registered: dashboard, progress, continue learning, to-do, and explicit content completion.", flush=True)
