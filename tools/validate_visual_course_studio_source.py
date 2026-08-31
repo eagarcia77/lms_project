@@ -54,8 +54,8 @@ def main() -> None:
         "app/gradebook.py",
         (
             'CREATE TABLE IF NOT EXISTS nuvedra_grades',
-            '/courses/{course_id}/gradebook',
-            '/submissions/{submission_id}/grade',
+            '/courses/{{course_id}}/gradebook',
+            '/submissions/{{submission_id}}/grade',
             'gradebook.csv',
             '/learn/courses/{course_id}/grades',
             'submission_graded',
