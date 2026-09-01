@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+AUTHOR_SQL_ROLES = ("instructor", "teaching_assistant", "course_builder", "facilitator")
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _authored_courses(conn: Any, email: str, exclude_course_id: int | None = None) -> list[dict[str, Any]]:
+    role_marks = ",".join("?" for _ in AUTHOR_SQL_ROLES)
+    params: tuple[Any, ...] = (email.lower(),) + AUTHOR_SQL_ROLES
+    sql = f"""SELECT DISTINCT c.id,c.course_code,c.title,c.term,c.status
+        FROM nexus_admin_enrollments e JOIN nexus_admin_courses c ON c.id=e.course_id
+        WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ({role_marks})"""
+    if exclude_course_id is not None:
+        sql += " AND c.id<>?"
+        params += (exclude_course_id,)
+    sql += " ORDER BY c.title,c.course_code"
+    return rows(execute(conn, sql, params))
+
+
+def _source_modules(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, "SELECT * FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+
+
+def _module_selection(form: Any, available: list[dict[str, Any]]) -> list[int]:
+    allowed = {int(module["id"]) for module in available}
+    raw = [str(value) for value in form.getlist("module_ids")]
+    if not raw:
+        return [int(module["id"]) for module in available]
+    selected: list[int] = []
+    for value in raw:
+        if not value.isdigit() or int(value) not in allowed:
+            raise HTTPException(400, "Invalid module selection.")
+        selected.append(int(value))
+    return selected
+
+
+def _copy_questions(conn: Any, source_item_id: int, target_item_id: int) -> None:
+    legacy = rows(execute(conn, "SELECT * FROM nexus_assessment_questions WHERE item_id=? ORDER BY position,id", (source_item_id,)))
+    for question in legacy:
+        execute(conn, """INSERT INTO nexus_assessment_questions
+            (item_id,question_type,prompt,options_json,answer_json,points,position)
+            VALUES (?,?,?,?,?,?,?)""", (
+                target_item_id, question.get("question_type"), question.get("prompt"),
+                question.get("options_json"), question.get("answer_json"),
+                question.get("points"), question.get("position") or 1,
+            ))
+
+    structured = rows(execute(conn, "SELECT * FROM nuvedra_assessment_questions WHERE item_id=? ORDER BY position,id", (source_item_id,)))
+    for question in structured:
+        now = utcnow()
+        execute(conn, """INSERT INTO nuvedra_assessment_questions
+            (item_id,question_type,prompt,choices_json,correct_answer,points,position,
+             feedback_correct,feedback_incorrect,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (
+                target_item_id, question.get("question_type"), question.get("prompt"),
+                question.get("choices_json") or "[]", question.get("correct_answer"),
+                question.get("points") or 1, question.get("position") or 1,
+                question.get("feedback_correct"), question.get("feedback_incorrect"), now, now,
+            ))
+
+
+def _copy_library_use(conn: Any, source_item_id: int, target_course_id: int, target_module_id: int, target_item_id: int, actor: str) -> None:
+    uses = rows(execute(conn, "SELECT asset_id FROM nuvedra_library_uses WHERE item_id=? ORDER BY id", (source_item_id,)))
+    for use in uses:
+        execute(conn, "INSERT INTO nuvedra_library_uses (asset_id,course_id,module_id,item_id,attached_by,attached_at) VALUES (?,?,?,?,?,?)", (
+            int(use["asset_id"]), target_course_id, target_module_id, target_item_id, actor, utcnow(),
+        ))
+
+
+def _copy_rubrics(conn: Any, source_course_id: int, target_course_id: int, item_map: dict[int, int], actor: str) -> int:
+    rubric_map: dict[int, int] = {}
+    copied = 0
+    for rubric in rows(execute(conn, "SELECT * FROM nuvedra_rubrics WHERE course_id=? AND status='active' ORDER BY id", (source_course_id,))):
+        now = utcnow()
+        new_rubric_id = _insert_id(conn, """INSERT INTO nuvedra_rubrics
+            (course_id,title,description,status,created_by,created_at,updated_at)
+            VALUES (?,?,?,'active',?,?,?)""", (
+                target_course_id, rubric.get("title"), rubric.get("description"), actor, now, now,
+            ))
+        rubric_map[int(rubric["id"])] = new_rubric_id
+        copied += 1
+        criterion_map: dict[int, int] = {}
+        criteria = rows(execute(conn, "SELECT * FROM nuvedra_rubric_criteria WHERE rubric_id=? ORDER BY position,id", (int(rubric["id"]),)))
+        for criterion in criteria:
+            new_criterion_id = _insert_id(conn, """INSERT INTO nuvedra_rubric_criteria
+                (rubric_id,title,description,position,created_at) VALUES (?,?,?,?,?)""", (
+                    new_rubric_id, criterion.get("title"), criterion.get("description"), criterion.get("position") or 1, now,
+                ))
+            criterion_map[int(criterion["id"])] = new_criterion_id
+            levels = rows(execute(conn, "SELECT * FROM nuvedra_rubric_levels WHERE criterion_id=? ORDER BY position,id", (int(criterion["id"]),)))
+            for level in levels:
+                execute(conn, """INSERT INTO nuvedra_rubric_levels
+                    (criterion_id,label,description,points,position,created_at) VALUES (?,?,?,?,?,?)""", (
+                        new_criterion_id, level.get("label"), level.get("description"), level.get("points") or 0,
+                        level.get("position") or 1, now,
+                    ))
+    links = rows(execute(conn, """SELECT l.rubric_id,l.item_id FROM nuvedra_rubric_links l
+        JOIN nuvedra_rubrics r ON r.id=l.rubric_id WHERE r.course_id=?""", (source_course_id,)))
+    for link in links:
+        source_item_id = int(link["item_id"])
+        source_rubric_id = int(link["rubric_id"])
+        if source_item_id in item_map and source_rubric_id in rubric_map:
+            execute(conn, "INSERT INTO nuvedra_rubric_links (rubric_id,item_id,created_by,created_at) VALUES (?,?,?,?)", (
+                rubric_map[source_rubric_id], item_map[source_item_id], actor, utcnow(),
+            ))
+    return copied
+
+
+def _copy_outcomes(conn: Any, source_course_id: int, target_course_id: int, item_map: dict[int, int], actor: str) -> int:
+    outcome_map: dict[int, int] = {}
+    copied = 0
+    outcomes = rows(execute(conn, "SELECT * FROM nuvedra_outcomes WHERE course_id=? AND status='active' ORDER BY id", (source_course_id,)))
+    for outcome in outcomes:
+        now = utcnow()
+        new_outcome_id = _insert_id(conn, """INSERT INTO nuvedra_outcomes
+            (course_id,code,title,description,status,created_by,created_at,updated_at)
+            VALUES (?,?,?,?,'active',?,?,?)""", (
+                target_course_id, outcome.get("code"), outcome.get("title"), outcome.get("description"), actor, now, now,
+            ))
+        outcome_map[int(outcome["id"])] = new_outcome_id
+        copied += 1
+    links = rows(execute(conn, """SELECT ol.outcome_id,ol.item_id FROM nuvedra_outcome_links ol
+        JOIN nuvedra_outcomes o ON o.id=ol.outcome_id WHERE o.course_id=?""", (source_course_id,)))
+    for link in links:
+        source_item_id = int(link["item_id"])
+        source_outcome_id = int(link["outcome_id"])
+        if source_item_id in item_map and source_outcome_id in outcome_map:
+            execute(conn, "INSERT INTO nuvedra_outcome_links (outcome_id,item_id,created_by,created_at) VALUES (?,?,?,?)", (
+                outcome_map[source_outcome_id], item_map[source_item_id], actor, utcnow(),
+            ))
+    return copied
+
+
+def _copy_content(
+    conn: Any,
+    source_course_id: int,
+    target_course_id: int,
+    selected_module_ids: list[int],
+    actor: str,
+    *,
+    copy_questions: bool,
+    copy_rubrics: bool,
+    copy_outcomes: bool,
+) -> dict[str, int]:
+    source_modules = _source_modules(conn, source_course_id)
+    allowed = {int(module["id"]) for module in source_modules}
+    if any(module_id not in allowed for module_id in selected_module_ids):
+        raise HTTPException(400, "One or more selected modules do not belong to the source course.")
+
+    position_row = rows(execute(conn, "SELECT COALESCE(MAX(position),0) AS value FROM nexus_modules WHERE course_id=?", (target_course_id,)))
+    next_module_position = int(position_row[0].get("value") or 0) + 1 if position_row else 1
+    module_map: dict[int, int] = {}
+    item_map: dict[int, int] = {}
+    module_count = 0
+    item_count = 0
+
+    for source_module in source_modules:
+        source_module_id = int(source_module["id"])
+        if source_module_id not in selected_module_ids:
+            continue
+        now = utcnow()
+        target_module_id = _insert_id(conn, """INSERT INTO nexus_modules
+            (course_id,title,description,learning_outcomes,estimated_minutes,position,status,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,'draft',?,?)""", (
+                target_course_id, source_module.get("title"), source_module.get("description"),
+                source_module.get("learning_outcomes"), source_module.get("estimated_minutes") or 60,
+                next_module_position, now, now,
+            ))
+        next_module_position += 1
+        module_map[source_module_id] = target_module_id
+        module_count += 1
+
+        drafts = rows(execute(conn, "SELECT * FROM nexus_module_drafts WHERE module_id=?", (source_module_id,)))
+        if drafts:
+            draft = drafts[0]
+            execute(conn, "INSERT INTO nexus_module_drafts (module_id,title,body_html,updated_by,updated_at) VALUES (?,?,?,?,?)", (
+                target_module_id, draft.get("title") or source_module.get("title"), draft.get("body_html") or "", actor, utcnow(),
+            ))
+
+        source_items = rows(execute(conn, "SELECT * FROM nexus_content_items WHERE module_id=? ORDER BY position,id", (source_module_id,)))
+        for source_item in source_items:
+            target_item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?, 'draft',?,?)""", (
+                    target_module_id, source_item.get("item_type"), source_item.get("title"), source_item.get("body_html"),
+                    source_item.get("external_url"), source_item.get("embed_url"), source_item.get("metadata_json") or "{}",
+                    source_item.get("points"), None, source_item.get("position") or 1, utcnow(), utcnow(),
+                ))
+            source_item_id = int(source_item["id"])
+            item_map[source_item_id] = target_item_id
+            item_count += 1
+            if copy_questions:
+                _copy_questions(conn, source_item_id, target_item_id)
+            _copy_library_use(conn, source_item_id, target_course_id, target_module_id, target_item_id, actor)
+
+    rubric_count = _copy_rubrics(conn, source_course_id, target_course_id, item_map, actor) if copy_rubrics else 0
+    outcome_count = _copy_outcomes(conn, source_course_id, target_course_id, item_map, actor) if copy_outcomes else 0
+    return {"modules": module_count, "items": item_count, "rubrics": rubric_count, "outcomes": outcome_count}
+
+
+def _new_course(conn: Any, source: dict[str, Any], code: str, title: str, term: str, actor: str) -> int:
+    clean_code = code.strip()
+    clean_title = title.strip()
+    if not clean_code or not clean_title:
+        raise HTTPException(400, "Course code and title are required.")
+    if rows(execute(conn, "SELECT id FROM nexus_admin_courses WHERE lower(course_code)=?", (clean_code.lower(),))):
+        raise HTTPException(409, "A course with this code already exists.")
+    now = utcnow()
+    course_id = _insert_id(conn, """INSERT INTO nexus_admin_courses
+        (course_code,title,description,term,status,instructor_email,start_date,end_date,created_by,created_at,updated_at)
+        VALUES (?,?,?,?, 'draft', ?,NULL,NULL,?,?,?)""", (
+            clean_code, clean_title, source.get("description") or "", term.strip(), actor, actor, now, now,
+        ))
+    execute(conn, "INSERT INTO nexus_admin_enrollments (course_id,user_email,course_role,status,created_at) VALUES (?,?, 'instructor','active',?)", (
+        course_id, actor.lower(), now,
+    ))
+    return course_id
+
+
+def register_course_copy_import(app: FastAPI) -> None:
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/copy", response_class=HTMLResponse, response_model=None)
+    async def copy_course_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/copy")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            source = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            modules = _source_modules(conn, course_id)
+            targets = _authored_courses(conn, user["email"], exclude_course_id=course_id)
+        module_checks = "".join(
+            f'''<label style="display:block"><input type="checkbox" name="module_ids" value="{int(module['id'])}" checked> <strong>{academic_access.esc(module.get('title'))}</strong> <small>· {academic_access.esc(module.get('status'))}</small></label>'''
+            for module in modules
+        ) or '<p class="studio-notice" data-i18n-en="This course has no modules yet." data-i18n-es="Este curso todavía no tiene módulos.">This course has no modules yet.</p>'
+        target_options = "".join(
+            f'<option value="{int(course["id"])}">{academic_access.esc(course.get("course_code"))} · {academic_access.esc(course.get("title"))}</option>'
+            for course in targets
+        )
+        options = '''<label><input type="checkbox" name="copy_questions" value="1" checked> <span data-i18n-en="Copy assessment questions" data-i18n-es="Copiar preguntas de evaluaciones">Copy assessment questions</span></label><label><input type="checkbox" name="copy_rubrics" value="1" checked> <span data-i18n-en="Copy rubrics" data-i18n-es="Copiar rúbricas">Copy rubrics</span></label><label><input type="checkbox" name="copy_outcomes" value="1" checked> <span data-i18n-en="Copy learning outcomes" data-i18n-es="Copiar resultados de aprendizaje">Copy learning outcomes</span></label>'''
+        default_code = f"{str(source.get('course_code') or 'COURSE')}-COPY"
+        default_title = f"{str(source.get('title') or 'Course')} (Copy)"
+        import_panel = f'''<section class="studio-panel"><h3 data-i18n-en="Import into an existing course" data-i18n-es="Importar a un curso existente">Import into an existing course</h3><p data-i18n-en="Selected modules are appended as drafts. Existing content is not replaced." data-i18n-es="Los módulos seleccionados se añaden como borradores. El contenido existente no se reemplaza.">Selected modules are appended as drafts. Existing content is not replaced.</p><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/copy/import" class="studio-form"><label><span data-i18n-en="Target course" data-i18n-es="Curso destino">Target course</span><select name="target_course_id" required>{target_options}</select></label><fieldset><legend data-i18n-en="Modules" data-i18n-es="Módulos">Modules</legend>{module_checks}</fieldset>{options}<button class="studio-button" data-i18n-en="Import selected content" data-i18n-es="Importar contenido seleccionado">Import selected content</button></form></section>''' if targets else '<section class="studio-panel"><p data-i18n-en="No other authored course is available as an import target." data-i18n-es="No hay otro curso con permisos de autor disponible como destino.">No other authored course is available as an import target.</p></section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="course-copy-import-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Course Copy & Import" data-i18n-es="Copia e importación de curso">Course Copy & Import</p><h2>{academic_access.esc(source.get('course_code'))}: {academic_access.esc(source.get('title'))}</h2><p data-i18n-en="Copy reusable course design without carrying student enrollments, submissions, grades, notifications, or old due dates." data-i18n-es="Copie el diseño reutilizable sin trasladar matrículas de estudiantes, entregas, calificaciones, notificaciones ni fechas de entrega antiguas.">Copy reusable course design without carrying student enrollments, submissions, grades, notifications, or old due dates.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Create a new course copy" data-i18n-es="Crear una copia nueva del curso">Create a new course copy</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/copy/new" class="studio-form"><div class="studio-form-grid"><label><span data-i18n-en="New course code" data-i18n-es="Código del curso nuevo">New course code</span><input name="course_code" value="{academic_access.esc(default_code, attr=True)}" required></label><label><span data-i18n-en="New course title" data-i18n-es="Título del curso nuevo">New course title</span><input name="title" value="{academic_access.esc(default_title, attr=True)}" required></label></div><label><span data-i18n-en="Term" data-i18n-es="Periodo">Term</span><input name="term" value="{academic_access.esc(source.get('term') or '', attr=True)}"></label><fieldset><legend data-i18n-en="Modules" data-i18n-es="Módulos">Modules</legend>{module_checks}</fieldset>{options}<button class="studio-button" data-i18n-en="Create course copy" data-i18n-es="Crear copia del curso">Create course copy</button></form></section>{import_panel}<section class="studio-panel"><h3 data-i18n-en="Safety rules" data-i18n-es="Reglas de seguridad">Safety rules</h3><ul><li data-i18n-en="Copied modules and items always start as drafts." data-i18n-es="Los módulos y elementos copiados siempre comienzan como borradores.">Copied modules and items always start as drafts.</li><li data-i18n-en="Due dates are cleared so old deadlines are never reused accidentally." data-i18n-es="Las fechas de entrega se eliminan para evitar reutilizar fechas antiguas por error.">Due dates are cleared so old deadlines are never reused accidentally.</li><li data-i18n-en="Students, observers, submissions, attempts, grades, discussion posts, assignment files, announcements, calendar events, and notifications are never copied." data-i18n-es="Nunca se copian estudiantes, observadores, entregas, intentos, calificaciones, mensajes de foros, archivos de entregas, anuncios, eventos de calendario ni notificaciones.">Students, observers, submissions, attempts, grades, discussion posts, assignment files, announcements, calendar events, and notifications are never copied.</li></ul></section></main>'''
+        return academic_access.portal_page("Course Copy & Import", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/copy/new", response_model=None)
+    async def create_course_copy(course_id: int, request: Request, course_code: str = Form(...), title: str = Form(...), term: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/copy")
+        if isinstance(user, RedirectResponse):
+            return user
+        form = await request.form()
+        with db() as conn:
+            source = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            modules = _source_modules(conn, course_id)
+            selected = _module_selection(form, modules)
+            target_course_id = _new_course(conn, source, course_code, title, term, user["email"])
+            summary = _copy_content(conn, course_id, target_course_id, selected, user["email"],
+                copy_questions=form.get("copy_questions") == "1",
+                copy_rubrics=form.get("copy_rubrics") == "1",
+                copy_outcomes=form.get("copy_outcomes") == "1")
+            audit(conn, user["email"], "course_copy_created", "course", str(target_course_id),
+                  f"source={course_id}; modules={summary['modules']}; items={summary['items']}; rubrics={summary['rubrics']}; outcomes={summary['outcomes']}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{target_course_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/copy/import", response_model=None)
+    async def import_course_content(course_id: int, request: Request, target_course_id: int = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/copy")
+        if isinstance(user, RedirectResponse):
+            return user
+        if target_course_id == course_id:
+            raise HTTPException(400, "The source and target course must be different.")
+        form = await request.form()
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            academic_access.require_course_role(conn, target_course_id, user["email"], academic_access.AUTHOR_ROLES)
+            modules = _source_modules(conn, course_id)
+            selected = _module_selection(form, modules)
+            summary = _copy_content(conn, course_id, target_course_id, selected, user["email"],
+                copy_questions=form.get("copy_questions") == "1",
+                copy_rubrics=form.get("copy_rubrics") == "1",
+                copy_outcomes=form.get("copy_outcomes") == "1")
+            audit(conn, user["email"], "course_content_imported", "course", str(target_course_id),
+                  f"source={course_id}; modules={summary['modules']}; items={summary['items']}; rubrics={summary['rubrics']}; outcomes={summary['outcomes']}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{target_course_id}", status_code=303)
+
+    print("NUVEDRA Course Copy & Import v1 registered: safe draft copies, selective module import, assessment questions, Content Library links, rubrics, outcomes, and learner-data exclusion.", flush=True)
