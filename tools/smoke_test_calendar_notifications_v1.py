@@ -114,7 +114,7 @@ def main() -> None:
         expect(client.post(f"/portal/notifications/{notification_id}/read"), 303, "mark notification read")
         notification_page = client.get("/portal/notifications")
         expect(notification_page, 200, "notification center after read")
-        require(notification_page, ">0</h2>", "zero unread notifications")
+        require(notification_page, ": 0</h2>", "zero unread notifications")
 
         expect(client.get(f"/faculty/studio/courses/{course_id}/calendar"), 403, "student instructor-calendar protection")
 
