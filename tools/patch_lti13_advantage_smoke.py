@@ -27,7 +27,16 @@ def main() -> None:
 """
         text = text[:index] + block + text[index:]
     PATH.write_text(text, encoding="utf-8")
-    print("LTI 1.3 / Advantage v1 functional validation attached to Course Studio smoke tests.", flush=True)
+
+    # LTI 1.3 production hardening is intentionally installed after the full
+    # Advantage v1 module has been generated and its baseline smoke is wired.
+    from patch_lti13_production_hardening import main as patch_lti13_production_hardening
+    patch_lti13_production_hardening()
+
+    from patch_lti13_production_hardening_smoke import main as patch_lti13_production_hardening_smoke
+    patch_lti13_production_hardening_smoke()
+
+    print("LTI 1.3 / Advantage v1 and production hardening functional validation attached to Course Studio smoke tests.", flush=True)
 
 
 if __name__ == "__main__":
