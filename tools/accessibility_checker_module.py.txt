@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import json
+import re
+from html.parser import HTMLParser
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import db, execute, rows
+
+STUDIO_PREFIX = "/faculty/studio"
+MEDIA_TYPES = {"image", "video", "audio", "h5p", "simulation", "ar", "vr", "360"}
+XR_TYPES = {"ar", "vr", "360"}
+AMBIGUOUS_LINK_TEXT = {"click here", "here", "read more", "more", "link", "learn more", "más", "aquí", "haz clic aquí"}
+
+
+class _AccessibilityHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.images: list[dict[str, str]] = []
+        self.iframes: list[dict[str, str]] = []
+        self.headings: list[int] = []
+        self.anchor_stack: list[list[str]] = []
+        self.anchor_texts: list[str] = []
+        self.tables: list[dict[str, bool]] = []
+        self._table_stack: list[dict[str, bool]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {str(key).lower(): str(value or "") for key, value in attrs}
+        tag = tag.lower()
+        if tag == "img":
+            self.images.append(values)
+        elif tag == "iframe":
+            self.iframes.append(values)
+        elif re.fullmatch(r"h[1-6]", tag):
+            self.headings.append(int(tag[1]))
+        elif tag == "a":
+            self.anchor_stack.append([])
+        elif tag == "table":
+            state = {"th": False, "caption": False}
+            self._table_stack.append(state)
+        elif tag == "th" and self._table_stack:
+            self._table_stack[-1]["th"] = True
+        elif tag == "caption" and self._table_stack:
+            self._table_stack[-1]["caption"] = True
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "a" and self.anchor_stack:
+            text = " ".join("".join(self.anchor_stack.pop()).split())
+            self.anchor_texts.append(text)
+        elif tag == "table" and self._table_stack:
+            self.tables.append(self._table_stack.pop())
+
+    def handle_data(self, data: str) -> None:
+        if self.anchor_stack:
+            self.anchor_stack[-1].append(data)
+
+
+def _metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _issue(code: str, severity: str, wcag: str, en: str, es: str) -> dict[str, str]:
+    return {"code": code, "severity": severity, "wcag": wcag, "en": en, "es": es}
+
+
+def check_item_payload(
+    *,
+    item_type: str,
+    title: str,
+    body_html: str,
+    external_url: str = "",
+    embed_url: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    parser = _AccessibilityHTMLParser()
+    try:
+        parser.feed(str(body_html or ""))
+    except Exception:
+        pass
+
+    meta = metadata or {}
+    accessible = str(meta.get("accessible_alternative") or meta.get("accessibility_text") or "").strip()
+    issues: list[dict[str, str]] = []
+    clean_title = str(title or "").strip()
+    clean_type = str(item_type or "").strip().lower()
+    clean_body = str(body_html or "")
+
+    if not clean_title:
+        issues.append(_issue("TITLE_MISSING", "error", "2.4.6", "Add a descriptive content title.", "Añada un título descriptivo al contenido."))
+
+    for image in parser.images:
+        if "alt" not in image:
+            issues.append(_issue("IMG_ALT_MISSING", "error", "1.1.1", "An image is missing an alt attribute.", "Una imagen no tiene atributo alt."))
+        elif image.get("alt", "") == "":
+            issues.append(_issue("IMG_ALT_EMPTY_REVIEW", "info", "1.1.1", "An image uses empty alt text. Confirm that it is decorative.", "Una imagen usa texto alt vacío. Confirme que sea decorativa."))
+
+    for iframe in parser.iframes:
+        if not iframe.get("title", "").strip():
+            issues.append(_issue("IFRAME_TITLE_MISSING", "error", "4.1.2", "An embedded frame is missing a descriptive title.", "Un marco incrustado no tiene un título descriptivo."))
+
+    for text in parser.anchor_texts:
+        normalized = text.strip().lower()
+        if not normalized:
+            issues.append(_issue("LINK_TEXT_EMPTY", "error", "2.4.4", "A link has no accessible text.", "Un enlace no tiene texto accesible."))
+        elif normalized in AMBIGUOUS_LINK_TEXT:
+            issues.append(_issue("LINK_TEXT_AMBIGUOUS", "warning", "2.4.4", f"Replace ambiguous link text such as “{text}” with a descriptive label.", f"Sustituya el texto ambiguo “{text}” por una etiqueta descriptiva."))
+
+    if parser.headings:
+        if parser.headings[0] == 1:
+            issues.append(_issue("BODY_H1_REVIEW", "warning", "1.3.1", "Avoid a second H1 inside the content body; the item title already identifies the page.", "Evite un segundo H1 dentro del contenido; el título del elemento ya identifica la página."))
+        for previous, current in zip(parser.headings, parser.headings[1:]):
+            if current - previous > 1:
+                issues.append(_issue("HEADING_LEVEL_SKIP", "warning", "1.3.1", f"Heading structure skips from H{previous} to H{current}.", f"La estructura de encabezados salta de H{previous} a H{current}."))
+                break
+
+    for table in parser.tables:
+        if not table.get("th"):
+            issues.append(_issue("TABLE_HEADERS_MISSING", "error", "1.3.1", "A data table does not identify header cells with TH elements.", "Una tabla de datos no identifica encabezados con elementos TH."))
+        if not table.get("caption"):
+            issues.append(_issue("TABLE_CAPTION_RECOMMENDED", "warning", "1.3.1", "Add a concise table caption or an equivalent nearby description.", "Añada un título breve a la tabla o una descripción equivalente cercana."))
+
+    if clean_type in MEDIA_TYPES and not accessible:
+        issues.append(_issue("ACCESSIBLE_ALTERNATIVE_MISSING", "error", "1.1.1", "This multimedia or immersive resource needs an accessible alternative.", "Este recurso multimedia o inmersivo necesita una alternativa accesible."))
+    elif clean_type in XR_TYPES and len(accessible) < 20:
+        issues.append(_issue("XR_ALTERNATIVE_REVIEW", "warning", "1.1.1", "Expand the non-immersive alternative so learners can obtain equivalent information without XR.", "Amplíe la alternativa no inmersiva para que el estudiante obtenga información equivalente sin XR."))
+
+    visible_text = re.sub(r"<[^>]+>", " ", clean_body)
+    visible_text = " ".join(visible_text.split())
+    if not visible_text and not str(external_url or "").strip() and not str(embed_url or "").strip():
+        issues.append(_issue("CONTENT_EMPTY", "warning", "3.1.1", "The item has no readable content or linked resource.", "El elemento no tiene contenido legible ni recurso enlazado."))
+
+    if re.search(r"(?:^|[;\s])(?:color|background(?:-color)?)\s*:", clean_body, flags=re.I):
+        issues.append(_issue("CONTRAST_MANUAL_REVIEW", "info", "1.4.3", "Inline colors were detected. Verify color contrast with an automated contrast tool or WAVE.", "Se detectaron colores en línea. Verifique el contraste con una herramienta automática o WAVE."))
+
+    errors = sum(1 for issue in issues if issue["severity"] == "error")
+    warnings = sum(1 for issue in issues if issue["severity"] == "warning")
+    infos = sum(1 for issue in issues if issue["severity"] == "info")
+    return {
+        "issues": issues,
+        "errors": errors,
+        "warnings": warnings,
+        "info": infos,
+        "blocking": errors > 0,
+        "status": "needs-review" if errors else ("recommendations" if warnings else "pass"),
+    }
+
+
+def check_item_row(item: dict[str, Any]) -> dict[str, Any]:
+    return check_item_payload(
+        item_type=str(item.get("item_type") or ""),
+        title=str(item.get("title") or ""),
+        body_html=str(item.get("body_html") or ""),
+        external_url=str(item.get("external_url") or ""),
+        embed_url=str(item.get("embed_url") or ""),
+        metadata=_metadata(item.get("metadata_json")),
+    )
+
+
+def blocking_summary(report: dict[str, Any]) -> str:
+    codes = [str(issue.get("code")) for issue in report.get("issues", []) if issue.get("severity") == "error"]
+    return ", ".join(codes[:5]) or "accessibility requirements"
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _severity_label(severity: str) -> tuple[str, str]:
+    return {
+        "error": ("Error", "Error"),
+        "warning": ("Recommendation", "Recomendación"),
+        "info": ("Manual review", "Revisión manual"),
+    }.get(severity, (severity.title(), severity.title()))
+
+
+def _issue_html(issue: dict[str, str]) -> str:
+    en_label, es_label = _severity_label(issue["severity"])
+    return (
+        f'<li><strong data-i18n-en="{academic_access.esc(en_label, attr=True)}" data-i18n-es="{academic_access.esc(es_label, attr=True)}">{academic_access.esc(en_label)}</strong> '
+        f'<code>{academic_access.esc(issue["code"])}</code> · WCAG {academic_access.esc(issue["wcag"])}<br>'
+        f'<span data-i18n-en="{academic_access.esc(issue["en"], attr=True)}" data-i18n-es="{academic_access.esc(issue["es"], attr=True)}">{academic_access.esc(issue["en"])}</span></li>'
+    )
+
+
+def register_accessibility_checker(app: FastAPI) -> None:
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/accessibility", response_class=HTMLResponse, response_model=None)
+    async def course_accessibility_report(course_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/courses/{course_id}/accessibility")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            items = rows(execute(conn, """SELECT i.*,m.title AS module_title,m.position AS module_position
+                FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+                WHERE m.course_id=? ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+        total_errors = 0
+        total_warnings = 0
+        cards: list[str] = []
+        for item in items:
+            report = check_item_row(item)
+            total_errors += int(report["errors"])
+            total_warnings += int(report["warnings"])
+            issue_list = "".join(_issue_html(issue) for issue in report["issues"]) or '<li data-i18n-en="Accessibility check passed." data-i18n-es="La verificación de accesibilidad fue aprobada.">Accessibility check passed.</li>'
+            status_en = "Needs review" if report["blocking"] else ("Recommendations" if report["warnings"] else "Passed")
+            status_es = "Requiere revisión" if report["blocking"] else ("Recomendaciones" if report["warnings"] else "Aprobado")
+            cards.append(f'''<article class="studio-panel" data-accessibility-item="{int(item["id"])}" data-accessibility-status="{report["status"]}"><p class="studio-eyebrow">{academic_access.esc(item.get('module_title'))} · {academic_access.esc(item.get('item_type'))}</p><h3>{academic_access.esc(item.get('title'))}</h3><p><strong data-i18n-en="{status_en}" data-i18n-es="{status_es}">{status_en}</strong> · {int(report['errors'])} errors · {int(report['warnings'])} recommendations</p><ul>{issue_list}</ul><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/items/{int(item['id'])}/accessibility" data-i18n-en="Open report" data-i18n-es="Abrir informe">Open report</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/items/{int(item['id'])}/edit" data-i18n-en="Edit content" data-i18n-es="Editar contenido">Edit content</a></div></article>''')
+
+        overall = "pass" if total_errors == 0 else "needs-review"
+        body = f'''<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script><main class="studio-shell" data-studio-root data-testid="accessibility-checker-v1" data-accessibility-status="{overall}"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Accessibility Checker v1" data-i18n-es="Verificador de accesibilidad v1">Accessibility Checker v1</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Automated pre-publication checks for WCAG-oriented content quality. Manual review is still required for contrast, meaning, captions, and equivalent learning experience." data-i18n-es="Verificaciones automáticas antes de publicar orientadas a WCAG. Aún se requiere revisión manual de contraste, significado, subtítulos y experiencia de aprendizaje equivalente.">Automated pre-publication checks for WCAG-oriented content quality. Manual review is still required for contrast, meaning, captions, and equivalent learning experience.</p></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{len(items)}</strong><span data-i18n-en="Items checked" data-i18n-es="Elementos revisados">Items checked</span></article><article class="studio-panel"><strong>{total_errors}</strong><span data-i18n-en="Blocking errors" data-i18n-es="Errores bloqueantes">Blocking errors</span></article><article class="studio-panel"><strong>{total_warnings}</strong><span data-i18n-en="Recommendations" data-i18n-es="Recomendaciones">Recommendations</span></article></section><section class="studio-section"><div class="studio-grid">{''.join(cards) or '<section class="studio-empty" data-i18n-en="No course content to check yet." data-i18n-es="Todavía no hay contenido para verificar.">No course content to check yet.</section>'}</div></section></main>'''
+        return academic_access.portal_page("Accessibility Checker", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/items/{{item_id}}/accessibility", response_class=HTMLResponse, response_model=None)
+    async def item_accessibility_report(item_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/items/{item_id}/accessibility")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = academic_access.item_bundle(conn, item_id)
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+        report = check_item_row(item)
+        issue_list = "".join(_issue_html(issue) for issue in report["issues"]) or '<li data-i18n-en="Accessibility check passed." data-i18n-es="La verificación de accesibilidad fue aprobada.">Accessibility check passed.</li>'
+        status_en = "Publication blocked until errors are corrected" if report["blocking"] else "Accessibility check passed"
+        status_es = "La publicación está bloqueada hasta corregir los errores" if report["blocking"] else "La verificación de accesibilidad fue aprobada"
+        body = f'''<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script><main class="studio-shell" data-studio-root data-testid="item-accessibility-report" data-accessibility-status="{report['status']}"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/accessibility" data-i18n-en="Course accessibility report" data-i18n-es="Informe de accesibilidad del curso">Course accessibility report</a><span>/</span><a href="{STUDIO_PREFIX}/items/{item_id}/edit" data-i18n-en="Edit content" data-i18n-es="Editar contenido">Edit content</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(course.get('course_code'))} · {academic_access.esc(module.get('title'))}</p><h2>{academic_access.esc(item.get('title'))}</h2><p><strong data-i18n-en="{academic_access.esc(status_en, attr=True)}" data-i18n-es="{academic_access.esc(status_es, attr=True)}">{academic_access.esc(status_en)}</strong></p></div></header><section class="studio-panel"><h3 data-i18n-en="Findings" data-i18n-es="Hallazgos">Findings</h3><ul>{issue_list}</ul></section><section class="studio-panel"><p data-i18n-en="Passing this automated check does not replace human accessibility review or WAVE testing." data-i18n-es="Aprobar esta verificación automática no sustituye la revisión humana de accesibilidad ni las pruebas con WAVE.">Passing this automated check does not replace human accessibility review or WAVE testing.</p></section></main>'''
+        return academic_access.portal_page("Accessibility report", body, user)
+
+    print("NUVEDRA Accessibility Checker v1 registered: WCAG-oriented content audit and pre-publication blocking checks.", flush=True)
