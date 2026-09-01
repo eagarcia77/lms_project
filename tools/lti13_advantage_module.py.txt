@@ -1,0 +1,836 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import secrets
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any
+
+import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+LTI_VERSION = "1.3.0"
+LTI_CLAIM = "https://purl.imsglobal.org/spec/lti/claim/"
+DL_CLAIM = "https://purl.imsglobal.org/spec/lti-dl/claim/"
+AGS_CLAIM = "https://purl.imsglobal.org/spec/lti-ags/claim/"
+AGS_SCOPE_LINEITEM = "https://purl.imsglobal.org/spec/lti-ags/scope/lineitem"
+AGS_SCOPE_LINEITEM_READ = "https://purl.imsglobal.org/spec/lti-ags/scope/lineitem.readonly"
+AGS_SCOPE_RESULT = "https://purl.imsglobal.org/spec/lti-ags/scope/result.readonly"
+AGS_SCOPE_SCORE = "https://purl.imsglobal.org/spec/lti-ags/scope/score"
+ALLOWED_SCOPES = {AGS_SCOPE_LINEITEM, AGS_SCOPE_LINEITEM_READ, AGS_SCOPE_RESULT, AGS_SCOPE_SCORE}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64ud(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _json_b64(value: Any) -> str:
+    return _b64u(json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _safe_https_url(value: str, label: str) -> str:
+    clean = value.strip()
+    parsed = urllib.parse.urlparse(clean)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(400, f"{label} must be an HTTPS URL without embedded credentials.")
+    host = parsed.hostname.lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise HTTPException(400, f"{label} cannot target a local host.")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        ip = None
+    if ip is not None and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast):
+        raise HTTPException(400, f"{label} cannot target a private or local address.")
+    return clean
+
+
+def _redirect_uris(value: str) -> list[str]:
+    raw = value.replace(",", "\n").splitlines()
+    uris = []
+    for entry in raw:
+        if entry.strip():
+            uris.append(_safe_https_url(entry, "Redirect URI"))
+    if not uris:
+        raise HTTPException(400, "At least one HTTPS redirect URI is required.")
+    return list(dict.fromkeys(uris))
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _platform_issuer(request: Request) -> str:
+    configured = os.getenv("NUVEDRA_LTI13_ISSUER", "").strip().rstrip("/")
+    return configured or str(request.base_url).rstrip("/")
+
+
+def _absolute(request: Request, path: str) -> str:
+    return str(request.base_url).rstrip("/") + path
+
+
+def _subject(client_id: str, email: str) -> str:
+    return hashlib.sha256(f"{client_id}|{email.lower()}".encode("utf-8")).hexdigest()[:40]
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def ensure_lti13_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_platform_keys (
+            id {pk}, kid TEXT NOT NULL UNIQUE, private_pem TEXT NOT NULL,
+            public_jwk_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_tools (
+            id {pk}, course_id INTEGER NOT NULL, title TEXT NOT NULL, client_id TEXT NOT NULL,
+            auth_login_url TEXT NOT NULL, jwks_url TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+            target_link_uri TEXT NOT NULL, deep_link_url TEXT, deployment_id TEXT NOT NULL UNIQUE,
+            share_email INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_resources (
+            id {pk}, tool_id INTEGER NOT NULL, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL UNIQUE, title TEXT NOT NULL, target_link_uri TEXT NOT NULL,
+            custom_parameters TEXT, status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_launches (
+            id {pk}, launch_token TEXT NOT NULL UNIQUE, tool_id INTEGER NOT NULL, course_id INTEGER NOT NULL,
+            module_id INTEGER, item_id INTEGER, user_email TEXT NOT NULL, message_type TEXT NOT NULL,
+            target_link_uri TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            authorized_at TEXT, deep_link_returned_at TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_tokens (
+            id {pk}, token_hash TEXT NOT NULL UNIQUE, client_id TEXT NOT NULL, scopes TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_assertion_jtis (
+            id {pk}, jti_hash TEXT NOT NULL UNIQUE, client_id TEXT NOT NULL, expires_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_lineitems (
+            id {pk}, tool_id INTEGER NOT NULL, course_id INTEGER NOT NULL, item_id INTEGER,
+            label TEXT NOT NULL, score_maximum REAL NOT NULL, resource_id TEXT, tag TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti13_scores (
+            id {pk}, lineitem_id INTEGER NOT NULL, user_id TEXT NOT NULL, score_given REAL,
+            score_maximum REAL, activity_progress TEXT, grading_progress TEXT, comment TEXT,
+            timestamp TEXT, updated_at TEXT NOT NULL, UNIQUE(lineitem_id,user_id)
+        )""")
+        _ensure_platform_key(conn)
+
+
+def _ensure_platform_key(conn: Any) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_lti13_platform_keys WHERE status='active' ORDER BY id DESC LIMIT 1"))
+    if found:
+        return found[0]
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+    numbers = private.public_key().public_numbers()
+    kid = secrets.token_urlsafe(18)
+    jwk = {
+        "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
+        "n": _b64u(numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")),
+        "e": _b64u(numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")),
+    }
+    now = utcnow()
+    _insert_id(conn, "INSERT INTO nuvedra_lti13_platform_keys (kid,private_pem,public_jwk_json,status,created_at) VALUES (?,?,?,'active',?)", (kid, private_pem, json.dumps(jwk, separators=(",", ":")), now))
+    return rows(execute(conn, "SELECT * FROM nuvedra_lti13_platform_keys WHERE kid=?", (kid,)))[0]
+
+
+def _sign_jwt(conn: Any, payload: dict[str, Any]) -> str:
+    key = _ensure_platform_key(conn)
+    header = {"alg": "RS256", "typ": "JWT", "kid": key["kid"]}
+    signing_input = f"{_json_b64(header)}.{_json_b64(payload)}"
+    private = serialization.load_pem_private_key(str(key["private_pem"]).encode("ascii"), password=None)
+    signature = private.sign(signing_input.encode("ascii"), padding.PKCS1v15(), hashes.SHA256())
+    return signing_input + "." + _b64u(signature)
+
+
+def _jwt_parts(token: str) -> tuple[dict[str, Any], dict[str, Any], bytes, bytes]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(401, "Invalid JWT.")
+    try:
+        header = json.loads(_b64ud(parts[0]))
+        payload = json.loads(_b64ud(parts[1]))
+        signature = _b64ud(parts[2])
+    except Exception as exc:
+        raise HTTPException(401, "Invalid JWT encoding.") from exc
+    return header, payload, f"{parts[0]}.{parts[1]}".encode("ascii"), signature
+
+
+def _fetch_jwks(url: str) -> dict[str, Any]:
+    safe = _safe_https_url(url, "JWKS URL")
+    try:
+        response = httpx.get(safe, timeout=5.0, follow_redirects=False, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise HTTPException(502, "Unable to retrieve the external tool JWKS.") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("keys"), list):
+        raise HTTPException(502, "External tool JWKS is invalid.")
+    return data
+
+
+def _rsa_public_key(jwk: dict[str, Any]):
+    if jwk.get("kty") != "RSA" or not jwk.get("n") or not jwk.get("e"):
+        raise HTTPException(401, "Unsupported external tool signing key.")
+    n = int.from_bytes(_b64ud(str(jwk["n"])), "big")
+    e = int.from_bytes(_b64ud(str(jwk["e"])), "big")
+    return rsa.RSAPublicNumbers(e, n).public_key()
+
+
+def _audience_matches(value: Any, expected: str) -> bool:
+    if isinstance(value, str):
+        return value == expected
+    if isinstance(value, list):
+        return expected in value
+    return False
+
+
+def _verify_tool_jwt(token: str, tool: dict[str, Any], *, audience: str, issuer: str | None = None) -> dict[str, Any]:
+    header, payload, signed, signature = _jwt_parts(token)
+    if header.get("alg") != "RS256":
+        raise HTTPException(401, "Only RS256 tool assertions are supported.")
+    keys = _fetch_jwks(str(tool["jwks_url"])).get("keys", [])
+    kid = str(header.get("kid") or "")
+    candidates = [key for key in keys if not kid or str(key.get("kid") or "") == kid]
+    if not candidates:
+        raise HTTPException(401, "External tool signing key was not found.")
+    verified = False
+    for jwk in candidates:
+        try:
+            _rsa_public_key(jwk).verify(signature, signed, padding.PKCS1v15(), hashes.SHA256())
+            verified = True
+            break
+        except Exception:
+            continue
+    if not verified:
+        raise HTTPException(401, "External tool JWT signature is invalid.")
+    now = int(time.time())
+    try:
+        exp = int(payload.get("exp"))
+    except Exception as exc:
+        raise HTTPException(401, "External tool JWT is missing a valid expiration.") from exc
+    if exp < now - 30 or exp > now + 600:
+        raise HTTPException(401, "External tool JWT expiration is invalid.")
+    if payload.get("nbf") is not None and int(payload["nbf"]) > now + 30:
+        raise HTTPException(401, "External tool JWT is not yet valid.")
+    if issuer is not None and str(payload.get("iss") or "") != issuer:
+        raise HTTPException(401, "External tool JWT issuer is invalid.")
+    if not _audience_matches(payload.get("aud"), audience):
+        raise HTTPException(401, "External tool JWT audience is invalid.")
+    return payload
+
+
+def _tool(conn: Any, tool_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT t.*,c.course_code,c.title AS course_title,c.status AS course_status
+        FROM nuvedra_lti13_tools t JOIN nexus_admin_courses c ON c.id=t.course_id WHERE t.id=?""", (tool_id,)))
+    if not found:
+        raise HTTPException(404, "LTI 1.3 tool registration not found.")
+    return found[0]
+
+
+def _resource(conn: Any, resource_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT r.*,t.client_id,t.auth_login_url,t.jwks_url,t.redirect_uris,t.deployment_id,
+        t.share_email,t.status AS tool_status,c.course_code,c.title AS course_title,c.status AS course_status,
+        m.status AS module_status,i.status AS item_status,i.points
+        FROM nuvedra_lti13_resources r JOIN nuvedra_lti13_tools t ON t.id=r.tool_id
+        JOIN nexus_admin_courses c ON c.id=r.course_id JOIN nexus_modules m ON m.id=r.module_id
+        JOIN nexus_content_items i ON i.id=r.item_id WHERE r.id=?""", (resource_id,)))
+    if not found:
+        raise HTTPException(404, "LTI 1.3 resource not found.")
+    return found[0]
+
+
+def _lineitem(conn: Any, lineitem_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT li.*,t.client_id,t.deployment_id,t.course_id AS tool_course_id
+        FROM nuvedra_lti13_lineitems li JOIN nuvedra_lti13_tools t ON t.id=li.tool_id WHERE li.id=?""", (lineitem_id,)))
+    if not found:
+        raise HTTPException(404, "Line item not found.")
+    return found[0]
+
+
+def _role_claim(role: str) -> list[str]:
+    base = "http://purl.imsglobal.org/vocab/lis/v2/membership#"
+    if role == "student": return [base + "Learner"]
+    if role == "observer": return [base + "Observer"]
+    return [base + "Instructor"]
+
+
+def _custom_parameters(value: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in str(value or "").splitlines():
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if key and len(key) <= 120:
+            result[key] = val.strip()[:1000]
+    return result
+
+
+def _upsert_progress(conn: Any, item_id: int, email: str, completed: bool) -> None:
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_content_progress WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    status = "completed" if completed else "not_started"
+    completed_at = now if completed else None
+    if found:
+        execute(conn, "UPDATE nuvedra_content_progress SET status=?,completed_at=?,updated_at=? WHERE id=?", (status, completed_at, now, int(found[0]["id"])))
+    else:
+        execute(conn, "INSERT INTO nuvedra_content_progress (item_id,student_email,status,completed_at,updated_at) VALUES (?,?,?,?,?)", (item_id, email.lower(), status, completed_at, now))
+
+
+def _launch_redirect(conn: Any, request: Request, tool: dict[str, Any], user: dict[str, Any], *, message_type: str, target_link_uri: str, module_id: int | None = None, item_id: int | None = None) -> RedirectResponse:
+    token = secrets.token_urlsafe(32)
+    now_dt = datetime.now(timezone.utc)
+    created = now_dt.isoformat()
+    expires = datetime.fromtimestamp(now_dt.timestamp() + 600, tz=timezone.utc).isoformat()
+    _insert_id(conn, """INSERT INTO nuvedra_lti13_launches
+        (launch_token,tool_id,course_id,module_id,item_id,user_email,message_type,target_link_uri,created_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""", (token, int(tool["id"]), int(tool["course_id"]), module_id, item_id, user["email"].lower(), message_type, target_link_uri, created, expires))
+    params = {
+        "iss": _platform_issuer(request),
+        "login_hint": token,
+        "target_link_uri": target_link_uri,
+        "lti_message_hint": token,
+        "client_id": str(tool["client_id"]),
+        "lti_deployment_id": str(tool["deployment_id"]),
+    }
+    location = str(tool["auth_login_url"]) + ("&" if "?" in str(tool["auth_login_url"]) else "?") + urllib.parse.urlencode(params)
+    return RedirectResponse(location, status_code=303, headers={"Cache-Control": "no-store"})
+
+
+def _registered_redirects(tool: dict[str, Any]) -> list[str]:
+    return [line.strip() for line in str(tool.get("redirect_uris") or "").splitlines() if line.strip()]
+
+
+def _tool_by_client(conn: Any, client_id: str) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_lti13_tools WHERE client_id=? AND status='active' ORDER BY id LIMIT 1", (client_id,)))
+    if not found:
+        raise HTTPException(401, "Unknown LTI 1.3 client.")
+    return found[0]
+
+
+def _token_record(conn: Any, request: Request, required: set[str]) -> dict[str, Any]:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "Bearer token required.", headers={"WWW-Authenticate": "Bearer"})
+    raw = auth.split(" ", 1)[1].strip()
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    found = rows(execute(conn, "SELECT * FROM nuvedra_lti13_tokens WHERE token_hash=?", (digest,)))
+    if not found:
+        raise HTTPException(401, "Invalid bearer token.", headers={"WWW-Authenticate": "Bearer"})
+    record = found[0]
+    expires = _parse_iso(record.get("expires_at"))
+    if expires is None or expires <= datetime.now(timezone.utc):
+        raise HTTPException(401, "Bearer token expired.", headers={"WWW-Authenticate": "Bearer"})
+    scopes = set(str(record.get("scopes") or "").split())
+    if not (required & scopes):
+        raise HTTPException(403, "The access token does not include the required scope.")
+    return record
+
+
+def _lineitem_json(request: Request, row: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "id": _absolute(request, f"/lti13/ags/lineitems/{int(row['id'])}"),
+        "label": str(row.get("label") or "Line item"),
+        "scoreMaximum": float(row.get("score_maximum") or 0),
+    }
+    if row.get("resource_id"): result["resourceId"] = str(row["resource_id"])
+    if row.get("tag"): result["tag"] = str(row["tag"])
+    return result
+
+
+def _student_email_for_subject(conn: Any, course_id: int, client_id: str, user_id: str) -> str | None:
+    enrolled = rows(execute(conn, """SELECT lower(user_email) AS email FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role='student'""", (course_id,)))
+    for row in enrolled:
+        email = str(row["email"])
+        if _subject(client_id, email) == user_id:
+            return email
+    return None
+
+
+def _sync_ags_grade(conn: Any, lineitem: dict[str, Any], user_id: str, score_given: float, score_maximum: float, actor: str) -> None:
+    item_id = lineitem.get("item_id")
+    if item_id in (None, "") or score_maximum <= 0:
+        return
+    email = _student_email_for_subject(conn, int(lineitem["course_id"]), str(lineitem["client_id"]), user_id)
+    if not email:
+        return
+    item = rows(execute(conn, "SELECT points FROM nexus_content_items WHERE id=?", (int(item_id),)))
+    if not item:
+        return
+    possible = float(item[0].get("points") or 0)
+    if possible <= 0:
+        possible = float(score_maximum)
+        execute(conn, "UPDATE nexus_content_items SET points=?,updated_at=? WHERE id=?", (possible, utcnow(), int(item_id)))
+    awarded = max(0.0, min(possible, (float(score_given) / float(score_maximum)) * possible))
+    now = utcnow()
+    submission = rows(execute(conn, "SELECT id FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?", (int(item_id), email)))
+    if submission:
+        submission_id = int(submission[0]["id"])
+        execute(conn, "UPDATE nuvedra_submissions SET status='submitted',updated_at=? WHERE id=?", (now, submission_id))
+    else:
+        submission_id = _insert_id(conn, """INSERT INTO nuvedra_submissions
+            (item_id,student_email,response_text,response_url,status,submitted_at,updated_at)
+            VALUES (?,?,?,'','submitted',?,?)""", (int(item_id), email, "LTI 1.3 / AGS score received.", now, now))
+    grade = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+    if grade:
+        execute(conn, "UPDATE nuvedra_grades SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE submission_id=?", (awarded, "Grade synchronized through LTI 1.3 Assignment and Grade Services.", actor, now, now, submission_id))
+    else:
+        execute(conn, "INSERT INTO nuvedra_grades (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,?,?,?,?)", (submission_id, awarded, "Grade synchronized through LTI 1.3 Assignment and Grade Services.", "graded", actor, now, now))
+    _upsert_progress(conn, int(item_id), email, True)
+
+
+def register_lti13_advantage(app: FastAPI) -> None:
+    ensure_lti13_schema()
+
+    @app.get("/lti13/config", response_model=None)
+    async def lti13_config(request: Request):
+        return JSONResponse({
+            "issuer": _platform_issuer(request),
+            "authorization_endpoint": _absolute(request, "/lti13/authorize"),
+            "token_endpoint": _absolute(request, "/lti13/token"),
+            "jwks_uri": _absolute(request, "/lti13/jwks"),
+        })
+
+    @app.get("/lti13/jwks", response_model=None)
+    async def lti13_jwks():
+        with db() as conn:
+            keys = rows(execute(conn, "SELECT public_jwk_json FROM nuvedra_lti13_platform_keys WHERE status='active' ORDER BY id"))
+        return JSONResponse({"keys": [json.loads(str(row["public_jwk_json"])) for row in keys]})
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/lti13", response_class=HTMLResponse, response_model=None)
+    async def lti13_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/lti13")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            tools = rows(execute(conn, "SELECT * FROM nuvedra_lti13_tools WHERE course_id=? ORDER BY id DESC", (course_id,)))
+            modules = rows(execute(conn, "SELECT id,title,status FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+            resources = rows(execute(conn, """SELECT r.*,t.title AS tool_title FROM nuvedra_lti13_resources r
+                JOIN nuvedra_lti13_tools t ON t.id=r.tool_id WHERE r.course_id=? ORDER BY r.id DESC""", (course_id,)))
+        tool_options = "".join(f'<option value="{int(t["id"])}">{academic_access.esc(t.get("title"))}</option>' for t in tools if t.get("status") == "active")
+        module_options = "".join(f'<option value="{int(m["id"])}">{academic_access.esc(m.get("title"))} · {academic_access.esc(m.get("status"))}</option>' for m in modules)
+        tool_cards = []
+        for tool in tools:
+            deep = ""
+            if tool.get("deep_link_url"):
+                deep = f'''<form method="post" action="{STUDIO_PREFIX}/lti13/{int(tool['id'])}/deep-link" class="studio-form"><label><span data-i18n-en="Module for imported links" data-i18n-es="Módulo para enlaces importados">Module for imported links</span><select name="module_id" required>{module_options}</select></label><button class="studio-button studio-button--quiet" data-i18n-en="Open Deep Linking" data-i18n-es="Abrir Deep Linking">Open Deep Linking</button></form>'''
+            tool_cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">LTI 1.3 · {academic_access.esc(tool.get('status'))}</p><h3>{academic_access.esc(tool.get('title'))}</h3><p><small>Client ID: {academic_access.esc(tool.get('client_id'))}<br>Deployment ID: {academic_access.esc(tool.get('deployment_id'))}</small></p><p><small>Email sharing: {'On' if int(tool.get('share_email') or 0) else 'Off'}</small></p>{deep}<form method="post" action="{STUDIO_PREFIX}/lti13/{int(tool['id'])}/toggle"><button class="studio-button studio-button--quiet">{'Disable' if tool.get('status')=='active' else 'Enable'}</button></form></article>''')
+        resource_cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(r.get('tool_title'))} · {academic_access.esc(r.get('status'))}</p><h3>{academic_access.esc(r.get('title'))}</h3><p>{academic_access.esc(r.get('target_link_uri'))}</p><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/learn/lti13/{int(r['id'])}/login" target="_blank" rel="noopener">Preview</a><form method="post" action="{STUDIO_PREFIX}/lti13/resources/{int(r['id'])}/toggle"><button class="studio-button">{'Unpublish' if r.get('status')=='published' else 'Publish'}</button></form></div></article>''' for r in resources) or '<section class="studio-empty">No LTI 1.3 resources yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="lti13-advantage-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a><span>/</span><a href="/lti13/config" target="_blank">Platform configuration</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="LTI 1.3 / Advantage v1" data-i18n-es="LTI 1.3 / Advantage v1">LTI 1.3 / Advantage v1</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Register modern LTI tools using OIDC/JWT, Deep Linking, and Assignment & Grade Services. This implementation does not claim 1EdTech certification." data-i18n-es="Registre herramientas LTI modernas con OIDC/JWT, Deep Linking y Assignment & Grade Services. Esta implementación no afirma certificación de 1EdTech.">Register modern LTI tools using OIDC/JWT, Deep Linking, and Assignment & Grade Services. This implementation does not claim 1EdTech certification.</p></div></header><section class="studio-grid"><article class="studio-panel"><h3 data-i18n-en="Register LTI 1.3 tool" data-i18n-es="Registrar herramienta LTI 1.3">Register LTI 1.3 tool</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/lti13/tools" class="studio-form"><label>Title<input name="title" required maxlength="180"></label><label>Client ID<input name="client_id" required maxlength="255"></label><label>OIDC login initiation URL<input type="url" name="auth_login_url" required></label><label>Tool JWKS URL<input type="url" name="jwks_url" required></label><label>Registered redirect URIs<textarea name="redirect_uris" rows="3" required placeholder="https://tool.example/lti/launch"></textarea></label><label>Default target link URI<input type="url" name="target_link_uri" required></label><label>Deep Linking target URI (optional)<input type="url" name="deep_link_url"></label><label><input type="checkbox" name="share_email" value="1"> Share learner email with this tool</label><button class="studio-button">Register tool</button></form></article><article class="studio-panel"><h3 data-i18n-en="Create resource link" data-i18n-es="Crear enlace de recurso">Create resource link</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/lti13/resources" class="studio-form"><label>Tool<select name="tool_id" required>{tool_options}</select></label><label>Module<select name="module_id" required>{module_options}</select></label><label>Title<input name="title" required maxlength="180"></label><label>Target link URI (blank = tool default)<input type="url" name="target_link_uri"></label><label>Points (optional)<input type="number" name="points" min="0" step="0.01"></label><label>Custom parameters<textarea name="custom_parameters" rows="4" placeholder="mode=practice"></textarea></label><button class="studio-button">Create draft link</button></form></article></section><section class="studio-section"><h2>Tool registrations</h2><div class="studio-grid">{''.join(tool_cards) or '<section class="studio-empty">No LTI 1.3 tools registered yet.</section>'}</div></section><section class="studio-section"><h2>Resource links</h2><div class="studio-grid">{resource_cards}</div></section></main>'''
+        return academic_access.portal_page("LTI 1.3 / Advantage", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/lti13/tools", response_model=None)
+    async def register_tool(course_id: int, request: Request, title: str = Form(...), client_id: str = Form(...), auth_login_url: str = Form(...), jwks_url: str = Form(...), redirect_uris: str = Form(...), target_link_uri: str = Form(...), deep_link_url: str = Form(""), share_email: str = Form("0")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/lti13")
+        if isinstance(user, RedirectResponse): return user
+        clean_title, clean_client = title.strip(), client_id.strip()
+        if not clean_title or not clean_client:
+            raise HTTPException(400, "Title and Client ID are required.")
+        auth = _safe_https_url(auth_login_url, "OIDC login initiation URL")
+        jwks = _safe_https_url(jwks_url, "JWKS URL")
+        redirects = _redirect_uris(redirect_uris)
+        target = _safe_https_url(target_link_uri, "Target link URI")
+        deep = _safe_https_url(deep_link_url, "Deep Linking target URI") if deep_link_url.strip() else ""
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            duplicate = rows(execute(conn, "SELECT id FROM nuvedra_lti13_tools WHERE course_id=? AND client_id=?", (course_id, clean_client)))
+            if duplicate:
+                raise HTTPException(409, "This Client ID is already registered in the course.")
+            now = utcnow(); deployment = "nuvedra-" + secrets.token_urlsafe(18)
+            tool_id = _insert_id(conn, """INSERT INTO nuvedra_lti13_tools
+                (course_id,title,client_id,auth_login_url,jwks_url,redirect_uris,target_link_uri,deep_link_url,deployment_id,share_email,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,?,?)""", (course_id, clean_title, clean_client, auth, jwks, "\n".join(redirects), target, deep, deployment, 1 if share_email == "1" else 0, user["email"], now, now))
+            audit(conn, user["email"], "lti13_tool_registered", "lti13_tool", str(tool_id), clean_client, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/lti13", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/lti13/{{tool_id}}/toggle", response_model=None)
+    async def toggle_tool(tool_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            tool = _tool(conn, tool_id)
+            academic_access.require_course_role(conn, int(tool["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            status = "disabled" if tool.get("status") == "active" else "active"
+            execute(conn, "UPDATE nuvedra_lti13_tools SET status=?,updated_at=? WHERE id=?", (status, utcnow(), tool_id))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(tool['course_id'])}/lti13", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/lti13/resources", response_model=None)
+    async def create_resource(course_id: int, request: Request, tool_id: int = Form(...), module_id: int = Form(...), title: str = Form(...), target_link_uri: str = Form(""), points: str = Form(""), custom_parameters: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/lti13")
+        if isinstance(user, RedirectResponse): return user
+        clean_title = title.strip()
+        if not clean_title: raise HTTPException(400, "Resource title is required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            tool = _tool(conn, tool_id)
+            if int(tool["course_id"]) != course_id or tool.get("status") != "active": raise HTTPException(400, "Selected LTI tool is not active in this course.")
+            module = rows(execute(conn, "SELECT id FROM nexus_modules WHERE id=? AND course_id=?", (module_id, course_id)))
+            if not module: raise HTTPException(400, "Selected module does not belong to this course.")
+            target = _safe_https_url(target_link_uri, "Target link URI") if target_link_uri.strip() else str(tool["target_link_uri"])
+            try: point_value = float(points) if points.strip() else None
+            except ValueError as exc: raise HTTPException(400, "Points must be numeric.") from exc
+            if point_value is not None and point_value < 0: raise HTTPException(400, "Points cannot be negative.")
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nexus_content_items WHERE module_id=?", (module_id,)))[0]["p"])
+            now = utcnow()
+            item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                VALUES (?,?,?,'','','','{}',?,NULL,?,'draft',?,?)""", (module_id, "lti13", clean_title, point_value, pos, now, now))
+            resource_id = _insert_id(conn, """INSERT INTO nuvedra_lti13_resources
+                (tool_id,course_id,module_id,item_id,title,target_link_uri,custom_parameters,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,'draft',?,?)""", (tool_id, course_id, module_id, item_id, clean_title, target, custom_parameters.strip(), now, now))
+            execute(conn, "UPDATE nexus_content_items SET external_url=?,updated_at=? WHERE id=?", (f"/learn/lti13/{resource_id}/login", now, item_id))
+            if point_value is not None and point_value > 0:
+                _insert_id(conn, """INSERT INTO nuvedra_lti13_lineitems (tool_id,course_id,item_id,label,score_maximum,resource_id,tag,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,NULL,?,?)""", (tool_id, course_id, item_id, clean_title, point_value, f"nuvedra-item-{item_id}", now, now))
+            audit(conn, user["email"], "lti13_resource_created", "item", str(item_id), clean_title, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/lti13", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/lti13/resources/{{resource_id}}/toggle", response_model=None)
+    async def toggle_resource(resource_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            resource = _resource(conn, resource_id)
+            academic_access.require_course_role(conn, int(resource["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            status = "draft" if resource.get("status") == "published" else "published"
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_lti13_resources SET status=?,updated_at=? WHERE id=?", (status, now, resource_id))
+            execute(conn, "UPDATE nexus_content_items SET status=?,updated_at=? WHERE id=?", (status, now, int(resource["item_id"])))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(resource['course_id'])}/lti13", status_code=303)
+
+    @app.get("/learn/lti13/{resource_id}/login", response_model=None)
+    async def lti13_resource_login(resource_id: int, request: Request):
+        user = _user(request, f"/learn/lti13/{resource_id}/login")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            resource = _resource(conn, resource_id)
+            access = academic_access.require_course_role(conn, int(resource["course_id"]), user["email"], academic_access.AUTHOR_ROLES | academic_access.STUDENT_ROLES)
+            is_author = str(access.get("course_role")) in academic_access.AUTHOR_ROLES
+            if resource.get("tool_status") != "active": raise HTTPException(403, "This LTI 1.3 tool is disabled.")
+            if not is_author and (resource.get("course_status") != "active" or resource.get("module_status") != "published" or resource.get("item_status") != "published" or resource.get("status") != "published"):
+                raise HTTPException(403, "This LTI 1.3 resource is not available.")
+            tool = _tool(conn, int(resource["tool_id"]))
+            return _launch_redirect(conn, request, tool, user, message_type="LtiResourceLinkRequest", target_link_uri=str(resource["target_link_uri"]), module_id=int(resource["module_id"]), item_id=int(resource["item_id"]))
+
+    @app.post(f"{STUDIO_PREFIX}/lti13/{{tool_id}}/deep-link", response_model=None)
+    async def start_deep_link(tool_id: int, request: Request, module_id: int = Form(...)):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            tool = _tool(conn, tool_id)
+            academic_access.require_course_role(conn, int(tool["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            if tool.get("status") != "active" or not tool.get("deep_link_url"): raise HTTPException(409, "Deep Linking is not configured for this tool.")
+            module = rows(execute(conn, "SELECT id FROM nexus_modules WHERE id=? AND course_id=?", (module_id, int(tool["course_id"]))))
+            if not module: raise HTTPException(400, "Selected module does not belong to the course.")
+            return _launch_redirect(conn, request, tool, user, message_type="LtiDeepLinkingRequest", target_link_uri=str(tool["deep_link_url"]), module_id=module_id)
+
+    @app.api_route("/lti13/authorize", methods=["GET", "POST"], response_class=HTMLResponse, response_model=None)
+    async def lti13_authorize(request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        params = dict(request.query_params)
+        if request.method == "POST": params.update({str(k): str(v) for k, v in (await request.form()).items()})
+        login_hint = str(params.get("login_hint") or "")
+        message_hint = str(params.get("lti_message_hint") or "")
+        client_id = str(params.get("client_id") or "")
+        redirect_uri = str(params.get("redirect_uri") or "")
+        state = str(params.get("state") or "")
+        nonce = str(params.get("nonce") or "")
+        if not login_hint or login_hint != message_hint or not client_id or not redirect_uri or not state or not nonce:
+            raise HTTPException(400, "OIDC authorization request is incomplete.")
+        if "id_token" not in str(params.get("response_type") or "") or "openid" not in str(params.get("scope") or ""):
+            raise HTTPException(400, "OIDC authorization request must request an OpenID id_token.")
+        with db() as conn:
+            launches = rows(execute(conn, "SELECT * FROM nuvedra_lti13_launches WHERE launch_token=?", (login_hint,)))
+            if not launches: raise HTTPException(400, "OIDC login hint is invalid.")
+            launch = launches[0]
+            expiry = _parse_iso(launch.get("expires_at"))
+            if expiry is None or expiry <= datetime.now(timezone.utc): raise HTTPException(400, "OIDC login hint expired.")
+            if launch.get("authorized_at"): raise HTTPException(409, "OIDC login hint has already been used.")
+            tool = _tool(conn, int(launch["tool_id"]))
+            if client_id != str(tool["client_id"]): raise HTTPException(400, "OIDC Client ID does not match the launch.")
+            if redirect_uri not in _registered_redirects(tool): raise HTTPException(400, "OIDC redirect URI is not registered.")
+            if user["email"].lower() != str(launch["user_email"]).lower(): raise HTTPException(403, "OIDC launch belongs to a different signed-in user.")
+            access = academic_access.require_course_role(conn, int(tool["course_id"]), user["email"], academic_access.AUTHOR_ROLES | academic_access.STUDENT_ROLES)
+            now = int(time.time())
+            payload: dict[str, Any] = {
+                "iss": _platform_issuer(request), "aud": str(tool["client_id"]), "sub": _subject(str(tool["client_id"]), user["email"]),
+                "iat": now, "exp": now + 300, "nonce": nonce,
+                LTI_CLAIM + "deployment_id": str(tool["deployment_id"]),
+                LTI_CLAIM + "message_type": str(launch["message_type"]),
+                LTI_CLAIM + "version": LTI_VERSION,
+                LTI_CLAIM + "target_link_uri": str(launch["target_link_uri"]),
+                LTI_CLAIM + "roles": _role_claim(str(access.get("course_role") or "")),
+                LTI_CLAIM + "context": {"id": f"nuvedra-course-{int(tool['course_id'])}", "label": str(tool.get("course_code") or "course"), "title": str(tool.get("course_title") or "Course")},
+                LTI_CLAIM + "launch_presentation": {"return_url": _absolute(request, f"/learn/courses/{int(tool['course_id'])}")},
+            }
+            if int(tool.get("share_email") or 0): payload["email"] = user["email"].lower()
+            if str(launch["message_type"]) == "LtiResourceLinkRequest":
+                resource_rows = rows(execute(conn, "SELECT * FROM nuvedra_lti13_resources WHERE tool_id=? AND item_id=?", (int(tool["id"]), int(launch["item_id"]))))
+                if not resource_rows: raise HTTPException(404, "LTI resource link no longer exists.")
+                resource = resource_rows[0]
+                payload[LTI_CLAIM + "resource_link"] = {"id": f"nuvedra-item-{int(resource['item_id'])}", "title": str(resource["title"])}
+                custom = _custom_parameters(str(resource.get("custom_parameters") or ""))
+                if custom: payload[LTI_CLAIM + "custom"] = custom
+                lineitems = rows(execute(conn, "SELECT * FROM nuvedra_lti13_lineitems WHERE tool_id=? AND item_id=? ORDER BY id LIMIT 1", (int(tool["id"]), int(resource["item_id"]))))
+                endpoint: dict[str, Any] = {"scope": [AGS_SCOPE_LINEITEM, AGS_SCOPE_LINEITEM_READ, AGS_SCOPE_RESULT, AGS_SCOPE_SCORE], "lineitems": _absolute(request, f"/lti13/ags/tools/{int(tool['id'])}/lineitems")}
+                if lineitems: endpoint["lineitem"] = _absolute(request, f"/lti13/ags/lineitems/{int(lineitems[0]['id'])}")
+                payload[AGS_CLAIM + "endpoint"] = endpoint
+            elif str(launch["message_type"]) == "LtiDeepLinkingRequest":
+                if str(access.get("course_role")) not in academic_access.AUTHOR_ROLES: raise HTTPException(403, "Deep Linking requires instructor access.")
+                payload[DL_CLAIM + "deep_linking_settings"] = {
+                    "deep_link_return_url": _absolute(request, f"/lti13/deep-link/return/{int(tool['id'])}"),
+                    "accept_types": ["ltiResourceLink", "link"],
+                    "accept_presentation_document_targets": ["iframe", "window"],
+                    "accept_multiple": True, "auto_create": True, "title": "NUVEDRA course content", "data": login_hint,
+                }
+            else:
+                raise HTTPException(400, "Unsupported LTI message type.")
+            token = _sign_jwt(conn, payload)
+            execute(conn, "UPDATE nuvedra_lti13_launches SET authorized_at=? WHERE id=?", (utcnow(), int(launch["id"])))
+        form = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>LTI 1.3 launch</title></head><body><main><h1>Launching learning tool</h1><form id="lti13" method="post" action="{academic_access.esc(redirect_uri, attr=True)}"><input type="hidden" name="id_token" value="{academic_access.esc(token, attr=True)}"><input type="hidden" name="state" value="{academic_access.esc(state, attr=True)}"><noscript><button type="submit">Continue</button></noscript></form></main><script>document.getElementById('lti13').submit();</script></body></html>'''
+        return HTMLResponse(form, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    @app.post("/lti13/deep-link/return/{tool_id}", response_model=None)
+    async def deep_link_return(tool_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        form = await request.form(); token = str(form.get("JWT") or form.get("id_token") or "")
+        if not token: raise HTTPException(400, "Deep Linking response JWT is required.")
+        with db() as conn:
+            tool = _tool(conn, tool_id)
+            academic_access.require_course_role(conn, int(tool["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            payload = _verify_tool_jwt(token, tool, audience=_platform_issuer(request), issuer=str(tool["client_id"]))
+            if payload.get(LTI_CLAIM + "message_type") != "LtiDeepLinkingResponse" or payload.get(LTI_CLAIM + "version") != LTI_VERSION:
+                raise HTTPException(400, "Invalid Deep Linking response claims.")
+            if payload.get(LTI_CLAIM + "deployment_id") != tool.get("deployment_id"):
+                raise HTTPException(400, "Deep Linking deployment ID does not match.")
+            data = str(payload.get(DL_CLAIM + "data") or "")
+            launches = rows(execute(conn, "SELECT * FROM nuvedra_lti13_launches WHERE launch_token=? AND tool_id=? AND message_type='LtiDeepLinkingRequest'", (data, tool_id)))
+            if not launches: raise HTTPException(400, "Deep Linking data token is invalid.")
+            launch = launches[0]
+            if launch.get("deep_link_returned_at"): raise HTTPException(409, "Deep Linking response has already been consumed.")
+            if user["email"].lower() != str(launch["user_email"]).lower(): raise HTTPException(403, "Deep Linking response belongs to a different instructor.")
+            items = payload.get(DL_CLAIM + "content_items")
+            if not isinstance(items, list) or not items: raise HTTPException(400, "Deep Linking response did not include content items.")
+            module_id = int(launch["module_id"])
+            created = 0
+            for content in items[:25]:
+                if not isinstance(content, dict): continue
+                content_type = str(content.get("type") or "")
+                title = str(content.get("title") or "External learning resource").strip()[:180]
+                url = _safe_https_url(str(content.get("url") or ""), "Deep Linking resource URL")
+                pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nexus_content_items WHERE module_id=?", (module_id,)))[0]["p"])
+                now = utcnow()
+                if content_type == "link":
+                    _insert_id(conn, """INSERT INTO nexus_content_items
+                        (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                        VALUES (?,?,?,'',?,'','{}',NULL,NULL,?,'draft',?,?)""", (module_id, "link", title, url, pos, now, now))
+                    created += 1; continue
+                if content_type != "ltiResourceLink": continue
+                line = content.get("lineItem") if isinstance(content.get("lineItem"), dict) else {}
+                score_max = line.get("scoreMaximum")
+                try: points = float(score_max) if score_max is not None else None
+                except (TypeError, ValueError): points = None
+                custom = content.get("custom") if isinstance(content.get("custom"), dict) else {}
+                custom_text = "\n".join(f"{k}={v}" for k, v in custom.items())[:10000]
+                item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                    (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                    VALUES (?,?,?,'','','','{}',?,NULL,?,'draft',?,?)""", (module_id, "lti13", title, points, pos, now, now))
+                resource_id = _insert_id(conn, """INSERT INTO nuvedra_lti13_resources
+                    (tool_id,course_id,module_id,item_id,title,target_link_uri,custom_parameters,status,created_at,updated_at)
+                    VALUES (?,?,?,?,?,?,?,'draft',?,?)""", (tool_id, int(tool["course_id"]), module_id, item_id, title, url, custom_text, now, now))
+                execute(conn, "UPDATE nexus_content_items SET external_url=?,updated_at=? WHERE id=?", (f"/learn/lti13/{resource_id}/login", now, item_id))
+                if points is not None and points > 0:
+                    _insert_id(conn, """INSERT INTO nuvedra_lti13_lineitems (tool_id,course_id,item_id,label,score_maximum,resource_id,tag,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?)""", (tool_id, int(tool["course_id"]), item_id, str(line.get("label") or title)[:180], points, str(line.get("resourceId") or f"nuvedra-item-{item_id}")[:255], str(line.get("tag") or "")[:255], now, now))
+                created += 1
+            execute(conn, "UPDATE nuvedra_lti13_launches SET deep_link_returned_at=? WHERE id=?", (utcnow(), int(launch["id"])))
+            audit(conn, user["email"], "lti13_deep_link_imported", "course", str(tool["course_id"]), f"created={created}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(tool['course_id'])}/lti13", status_code=303)
+
+    @app.post("/lti13/token", response_model=None)
+    async def lti13_token(request: Request, grant_type: str = Form(...), client_assertion_type: str = Form(...), client_assertion: str = Form(...), scope: str = Form(...)):
+        if grant_type != "client_credentials" or client_assertion_type != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer":
+            raise HTTPException(400, "Unsupported OAuth grant.")
+        _, unverified, _, _ = _jwt_parts(client_assertion)
+        client_id = str(unverified.get("iss") or "")
+        if not client_id or str(unverified.get("sub") or "") != client_id: raise HTTPException(401, "Client assertion issuer and subject must match the Client ID.")
+        with db() as conn:
+            tool = _tool_by_client(conn, client_id)
+            payload = _verify_tool_jwt(client_assertion, tool, audience=_absolute(request, "/lti13/token"), issuer=client_id)
+            jti = str(payload.get("jti") or "")
+            if not jti: raise HTTPException(401, "Client assertion must include jti.")
+            jti_hash = hashlib.sha256(jti.encode()).hexdigest()
+            if rows(execute(conn, "SELECT id FROM nuvedra_lti13_assertion_jtis WHERE jti_hash=?", (jti_hash,))): raise HTTPException(401, "Client assertion has already been used.")
+            requested = set(scope.split()) & ALLOWED_SCOPES
+            if not requested: raise HTTPException(400, "No supported LTI Advantage scope was requested.")
+            now = datetime.now(timezone.utc); expires = datetime.fromtimestamp(now.timestamp() + 3600, tz=timezone.utc)
+            execute(conn, "INSERT INTO nuvedra_lti13_assertion_jtis (jti_hash,client_id,expires_at) VALUES (?,?,?)", (jti_hash, client_id, datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc).isoformat()))
+            raw = secrets.token_urlsafe(40); digest = hashlib.sha256(raw.encode()).hexdigest()
+            _insert_id(conn, "INSERT INTO nuvedra_lti13_tokens (token_hash,client_id,scopes,created_at,expires_at) VALUES (?,?,?,?,?)", (digest, client_id, " ".join(sorted(requested)), now.isoformat(), expires.isoformat()))
+        return JSONResponse({"access_token": raw, "token_type": "Bearer", "expires_in": 3600, "scope": " ".join(sorted(requested))}, headers={"Cache-Control": "no-store"})
+
+    @app.get("/lti13/ags/tools/{tool_id}/lineitems", response_model=None)
+    async def ags_lineitems(tool_id: int, request: Request):
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_LINEITEM, AGS_SCOPE_LINEITEM_READ})
+            tool = _tool(conn, tool_id)
+            if token.get("client_id") != tool.get("client_id"): raise HTTPException(403, "Token does not belong to this LTI tool.")
+            data = rows(execute(conn, "SELECT * FROM nuvedra_lti13_lineitems WHERE tool_id=? ORDER BY id", (tool_id,)))
+        return JSONResponse([_lineitem_json(request, row) for row in data])
+
+    @app.post("/lti13/ags/tools/{tool_id}/lineitems", response_model=None)
+    async def ags_create_lineitem(tool_id: int, request: Request):
+        body = await request.json()
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_LINEITEM})
+            tool = _tool(conn, tool_id)
+            if token.get("client_id") != tool.get("client_id"): raise HTTPException(403, "Token does not belong to this LTI tool.")
+            label = str(body.get("label") or "Line item")[:180]
+            try: maximum = float(body.get("scoreMaximum"))
+            except (TypeError, ValueError) as exc: raise HTTPException(400, "scoreMaximum must be numeric.") from exc
+            if maximum <= 0: raise HTTPException(400, "scoreMaximum must be greater than zero.")
+            resource_id = str(body.get("resourceId") or "")[:255]
+            tag = str(body.get("tag") or "")[:255]
+            item_id = None
+            if resource_id.startswith("nuvedra-item-"):
+                try: candidate = int(resource_id.rsplit("-", 1)[-1])
+                except ValueError: candidate = 0
+                found = rows(execute(conn, "SELECT item_id FROM nuvedra_lti13_resources WHERE tool_id=? AND course_id=? AND item_id=?", (tool_id, int(tool["course_id"]), candidate)))
+                if found: item_id = candidate
+            now = utcnow()
+            lineitem_id = _insert_id(conn, "INSERT INTO nuvedra_lti13_lineitems (tool_id,course_id,item_id,label,score_maximum,resource_id,tag,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (tool_id, int(tool["course_id"]), item_id, label, maximum, resource_id, tag, now, now))
+            if item_id is not None:
+                execute(conn, "UPDATE nexus_content_items SET points=?,updated_at=? WHERE id=?", (maximum, now, item_id))
+            row = rows(execute(conn, "SELECT * FROM nuvedra_lti13_lineitems WHERE id=?", (lineitem_id,)))[0]
+        return JSONResponse(_lineitem_json(request, row), status_code=201)
+
+    @app.get("/lti13/ags/lineitems/{lineitem_id}", response_model=None)
+    async def ags_lineitem(lineitem_id: int, request: Request):
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_LINEITEM, AGS_SCOPE_LINEITEM_READ})
+            row = _lineitem(conn, lineitem_id)
+            if token.get("client_id") != row.get("client_id"): raise HTTPException(403, "Token does not belong to this line item.")
+        return JSONResponse(_lineitem_json(request, row))
+
+    @app.put("/lti13/ags/lineitems/{lineitem_id}", response_model=None)
+    async def ags_update_lineitem(lineitem_id: int, request: Request):
+        body = await request.json()
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_LINEITEM})
+            row = _lineitem(conn, lineitem_id)
+            if token.get("client_id") != row.get("client_id"): raise HTTPException(403, "Token does not belong to this line item.")
+            label = str(body.get("label") or row.get("label") or "Line item")[:180]
+            try: maximum = float(body.get("scoreMaximum", row.get("score_maximum")))
+            except (TypeError, ValueError) as exc: raise HTTPException(400, "scoreMaximum must be numeric.") from exc
+            if maximum <= 0: raise HTTPException(400, "scoreMaximum must be greater than zero.")
+            resource_id = str(body.get("resourceId", row.get("resource_id") or ""))[:255]
+            tag = str(body.get("tag", row.get("tag") or ""))[:255]
+            execute(conn, "UPDATE nuvedra_lti13_lineitems SET label=?,score_maximum=?,resource_id=?,tag=?,updated_at=? WHERE id=?", (label, maximum, resource_id, tag, utcnow(), lineitem_id))
+            if row.get("item_id") not in (None, ""): execute(conn, "UPDATE nexus_content_items SET points=?,updated_at=? WHERE id=?", (maximum, utcnow(), int(row["item_id"])))
+            updated = rows(execute(conn, "SELECT * FROM nuvedra_lti13_lineitems WHERE id=?", (lineitem_id,)))[0]
+        return JSONResponse(_lineitem_json(request, updated))
+
+    @app.post("/lti13/ags/lineitems/{lineitem_id}/scores", response_model=None)
+    async def ags_score(lineitem_id: int, request: Request):
+        body = await request.json()
+        user_id = str(body.get("userId") or "")
+        if not user_id: raise HTTPException(400, "userId is required.")
+        score_given = body.get("scoreGiven"); score_max = body.get("scoreMaximum")
+        try:
+            given = float(score_given) if score_given is not None else None
+            maximum = float(score_max) if score_max is not None else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "scoreGiven and scoreMaximum must be numeric when supplied.") from exc
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_SCORE})
+            lineitem = _lineitem(conn, lineitem_id)
+            if token.get("client_id") != lineitem.get("client_id"): raise HTTPException(403, "Token does not belong to this line item.")
+            now = utcnow(); activity = str(body.get("activityProgress") or ""); grading = str(body.get("gradingProgress") or ""); comment = str(body.get("comment") or "")[:4000]; timestamp = str(body.get("timestamp") or now)[:120]
+            found = rows(execute(conn, "SELECT id FROM nuvedra_lti13_scores WHERE lineitem_id=? AND user_id=?", (lineitem_id, user_id)))
+            if found:
+                execute(conn, "UPDATE nuvedra_lti13_scores SET score_given=?,score_maximum=?,activity_progress=?,grading_progress=?,comment=?,timestamp=?,updated_at=? WHERE id=?", (given, maximum, activity, grading, comment, timestamp, now, int(found[0]["id"])))
+            else:
+                _insert_id(conn, "INSERT INTO nuvedra_lti13_scores (lineitem_id,user_id,score_given,score_maximum,activity_progress,grading_progress,comment,timestamp,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (lineitem_id, user_id, given, maximum, activity, grading, comment, timestamp, now))
+            if given is not None and maximum is not None and maximum > 0 and grading == "FullyGraded":
+                _sync_ags_grade(conn, lineitem, user_id, given, maximum, f"lti13:{lineitem['client_id']}")
+            elif lineitem.get("item_id") not in (None, "") and (activity == "Completed" or grading == "FullyGraded"):
+                email = _student_email_for_subject(conn, int(lineitem["course_id"]), str(lineitem["client_id"]), user_id)
+                if email: _upsert_progress(conn, int(lineitem["item_id"]), email, True)
+            audit(conn, f"lti13:{lineitem['client_id']}", "lti13_ags_score_received", "lineitem", str(lineitem_id), grading, request.client.host if request.client else "")
+        return JSONResponse({}, status_code=200)
+
+    @app.get("/lti13/ags/lineitems/{lineitem_id}/results", response_model=None)
+    async def ags_results(lineitem_id: int, request: Request):
+        with db() as conn:
+            token = _token_record(conn, request, {AGS_SCOPE_RESULT})
+            lineitem = _lineitem(conn, lineitem_id)
+            if token.get("client_id") != lineitem.get("client_id"): raise HTTPException(403, "Token does not belong to this line item.")
+            data = rows(execute(conn, "SELECT * FROM nuvedra_lti13_scores WHERE lineitem_id=? ORDER BY id", (lineitem_id,)))
+        result = []
+        for row in data:
+            entry: dict[str, Any] = {"userId": row["user_id"]}
+            if row.get("score_given") is not None: entry["resultScore"] = float(row["score_given"])
+            if row.get("score_maximum") is not None: entry["resultMaximum"] = float(row["score_maximum"])
+            if row.get("comment"): entry["comment"] = row["comment"]
+            result.append(entry)
+        return JSONResponse(result)
+
+    print("NUVEDRA LTI 1.3 / Advantage v1 registered: OIDC/JWT launches, platform JWKS, Deep Linking, OAuth client-credentials tokens, AGS line items/scores/results, privacy controls, and Gradebook synchronization.", flush=True)
