@@ -96,6 +96,9 @@ def main() -> None:
     from patch_attendance_participation_v1 import main as patch_attendance_participation_v1
     patch_attendance_participation_v1()
 
+    from patch_attendance_form_markup import main as patch_attendance_form_markup
+    patch_attendance_form_markup()
+
     from patch_attendance_participation_smoke import main as patch_attendance_participation_smoke
     patch_attendance_participation_smoke()
 
