@@ -151,7 +151,7 @@ def main() -> None:
         expect(client.get("/__smoke/paths-user/instructor"), 200, "instructor return session")
         copied = client.post(f"/faculty/studio/courses/{course_id}/copy/new", data={
             "course_code": "PATH-7500-COPY", "title": "Adaptive Learning Paths Copy", "term": "Spring 2027",
-            "module_ids": [str(module1), str(module2)], "copy_questions": "1", "copy_rubrics": "1", "copy_outcomes": "1",
+            "copy_questions": "1", "copy_rubrics": "1", "copy_outcomes": "1",
         })
         expect(copied, 303, "course copy with learning paths")
         target_course_id = int(copied.headers["location"].rsplit("/", 1)[-1])
