@@ -84,7 +84,9 @@ def patch_studio_js() -> None:
 def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Course Copy & Import v1 source template is missing.")
-    MODULE.write_text(SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    source_text = SOURCE.read_text(encoding="utf-8")
+    compile(source_text, str(MODULE), "exec")
+    MODULE.write_text(source_text, encoding="utf-8")
     patch_academic_portal()
     patch_studio_js()
     print("NUVEDRA Course Copy & Import v1 installed: new-course copy, selective import, draft safety, question/rubric/outcome preservation, and learner-data exclusion.", flush=True)
