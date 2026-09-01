@@ -8,6 +8,7 @@ ACADEMIC_PORTAL = Path("app/academic_portal.py")
 STUDIO_JS = Path("app/static/course-studio.js")
 STUDENT_EXPERIENCE = Path("app/student_experience.py")
 COURSE_EDITOR = Path("app/course_editor_access.py")
+COURSE_COPY_IMPORT = Path("app/course_copy_import.py")
 TAG = "NUVEDRA_XAPI_CMI5_V1"
 
 
@@ -111,6 +112,40 @@ def patch_course_editor() -> None:
     COURSE_EDITOR.write_text(text, encoding="utf-8")
 
 
+def patch_course_copy_import() -> None:
+    if not COURSE_COPY_IMPORT.is_file():
+        raise RuntimeError("xAPI & cmi5 v1 requires the generated Course Copy & Import v1 module.")
+    text = COURSE_COPY_IMPORT.read_text(encoding="utf-8")
+    helper_anchor = "def _copy_content(\n"
+    helper = '''def _copy_cmi5_au(conn: Any, source_item_id: int, target_course_id: int, target_module_id: int, target_item_id: int, actor: str) -> None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_cmi5_aus WHERE item_id=?", (source_item_id,)))
+    if not found:
+        return
+    source = found[0]
+    now = utcnow()
+    new_au_id = _insert_id(conn, """INSERT INTO nuvedra_cmi5_aus
+        (course_id,module_id,item_id,title,launch_url,activity_id,move_on,mastery_score,status,created_by,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?, 'draft',?,?,?)""", (
+            target_course_id, target_module_id, target_item_id, source.get("title"), source.get("launch_url"),
+            source.get("activity_id"), source.get("move_on") or "CompletedOrPassed", source.get("mastery_score"),
+            actor, now, now,
+        ))
+    execute(conn, "UPDATE nexus_content_items SET external_url=?,status='draft',updated_at=? WHERE id=?", (
+        f"/learn/cmi5/{new_au_id}/launch", now, target_item_id,
+    ))
+
+
+'''
+    if "def _copy_cmi5_au(" not in text:
+        if helper_anchor not in text:
+            raise RuntimeError("xAPI & cmi5 v1 could not locate the course-copy helper anchor.")
+        text = text.replace(helper_anchor, helper + helper_anchor, 1)
+    call_anchor = "            _copy_library_use(conn, source_item_id, target_course_id, target_module_id, target_item_id, actor)\n"
+    call_new = call_anchor + "            if str(source_item.get(\"item_type\") or \"\") == \"cmi5\":\n                _copy_cmi5_au(conn, source_item_id, target_course_id, target_module_id, target_item_id, actor)\n"
+    text = replace_once(text, call_anchor, call_new, "cmi5 course-copy association")
+    COURSE_COPY_IMPORT.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("xAPI & cmi5 v1 source template is missing.")
@@ -121,10 +156,12 @@ def main() -> None:
     patch_studio_js()
     patch_student_experience()
     patch_course_editor()
+    patch_course_copy_import()
     compile(MODULE.read_text(encoding="utf-8"), str(MODULE), "exec")
     compile(STUDENT_EXPERIENCE.read_text(encoding="utf-8"), str(STUDENT_EXPERIENCE), "exec")
     compile(COURSE_EDITOR.read_text(encoding="utf-8"), str(COURSE_EDITOR), "exec")
-    print("NUVEDRA xAPI & cmi5 v1 installed: course-scoped LRS endpoints, cmi5 launch/fetch flow, progress and Gradebook synchronization, Studio navigation, and student routing.", flush=True)
+    compile(COURSE_COPY_IMPORT.read_text(encoding="utf-8"), str(COURSE_COPY_IMPORT), "exec")
+    print("NUVEDRA xAPI & cmi5 v1 installed: course-scoped LRS endpoints, cmi5 launch/fetch flow, progress and Gradebook synchronization, safe course-copy preservation, Studio navigation, and student routing.", flush=True)
 
 
 if __name__ == "__main__":
