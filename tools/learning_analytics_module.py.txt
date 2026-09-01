@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import csv
+import io
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_console import db, execute, rows
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _author(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _published_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.id,i.item_type,i.title,i.points,i.due_at,i.position,
+        m.id AS module_id,m.title AS module_title,m.position AS module_position
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND m.status='published' AND i.status='published'
+        ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+
+def _completion_map(conn: Any, item_ids: list[int], email: str) -> dict[int, bool]:
+    result = {item_id: False for item_id in item_ids}
+    if not item_ids:
+        return result
+    placeholders = ",".join("?" for _ in item_ids)
+    params = tuple(item_ids) + (email.lower(),)
+    for row in rows(execute(conn, f"SELECT item_id,status FROM nuvedra_content_progress WHERE item_id IN ({placeholders}) AND lower(student_email)=?", params)):
+        result[int(row["item_id"])] = str(row.get("status")) == "completed"
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_submissions WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status='submitted'", params)):
+        result[int(row["item_id"])] = True
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_assessment_attempts WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status<>'in_progress'", params)):
+        result[int(row["item_id"])] = True
+    return result
+
+
+def _grade_summary(conn: Any, course_id: int, email: str) -> tuple[float | None, int]:
+    data = rows(execute(conn, """SELECT g.points_awarded,i.points
+        FROM nuvedra_grades g
+        JOIN nuvedra_submissions s ON s.id=g.submission_id
+        JOIN nexus_content_items i ON i.id=s.item_id
+        JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND lower(s.student_email)=? AND g.points_awarded IS NOT NULL
+        ORDER BY g.id""", (course_id, email.lower())))
+    earned = 0.0
+    possible = 0.0
+    graded = 0
+    for row in data:
+        points = row.get("points")
+        if points in (None, "") or float(points or 0) <= 0:
+            continue
+        earned += float(row.get("points_awarded") or 0)
+        possible += float(points)
+        graded += 1
+    return ((earned / possible) * 100 if possible > 0 else None), graded
+
+
+def _submission_count(conn: Any, course_id: int, email: str) -> int:
+    legacy = rows(execute(conn, """SELECT COUNT(*) AS total FROM nuvedra_submissions s
+        JOIN nexus_content_items i ON i.id=s.item_id JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND lower(s.student_email)=? AND s.status='submitted'""", (course_id, email.lower())))
+    structured = rows(execute(conn, """SELECT COUNT(*) AS total FROM nuvedra_assessment_attempts a
+        JOIN nexus_content_items i ON i.id=a.item_id JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND lower(a.student_email)=? AND a.status<>'in_progress'""", (course_id, email.lower())))
+    return int(legacy[0].get("total") or 0 if legacy else 0) + int(structured[0].get("total") or 0 if structured else 0)
+
+
+def _student_metrics(conn: Any, course_id: int) -> tuple[list[dict[str, Any]], int]:
+    students = rows(execute(conn, """SELECT lower(user_email) AS student_email FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role='student' ORDER BY lower(user_email)""", (course_id,)))
+    items = _published_items(conn, course_id)
+    item_ids = [int(item["id"]) for item in items]
+    now = datetime.now(timezone.utc)
+    metrics: list[dict[str, Any]] = []
+    total_overdue = 0
+    for student in students:
+        email = str(student.get("student_email") or "").lower()
+        completion = _completion_map(conn, item_ids, email)
+        completed = sum(1 for item_id in item_ids if completion.get(item_id, False))
+        total = len(item_ids)
+        progress = round((completed / total) * 100) if total else 0
+        overdue = 0
+        for item in items:
+            due = _parse_iso(item.get("due_at"))
+            if due is not None and due < now and not completion.get(int(item["id"]), False):
+                overdue += 1
+        total_overdue += overdue
+        grade_percent, graded = _grade_summary(conn, course_id, email)
+        submissions = _submission_count(conn, course_id, email)
+        if overdue > 0 or progress < 50:
+            attention = "needs-attention"
+            label_en, label_es = "Needs attention", "Requiere atención"
+        elif progress < 75:
+            attention = "watch"
+            label_en, label_es = "Watch", "Observar"
+        else:
+            attention = "on-track"
+            label_en, label_es = "On track", "En progreso adecuado"
+        metrics.append({
+            "email": email,
+            "completed": completed,
+            "total": total,
+            "progress": progress,
+            "overdue": overdue,
+            "submissions": submissions,
+            "grade_percent": grade_percent,
+            "graded": graded,
+            "attention": attention,
+            "label_en": label_en,
+            "label_es": label_es,
+        })
+    return metrics, total_overdue
+
+
+def register_learning_analytics(app: FastAPI) -> None:
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/analytics", response_class=HTMLResponse, response_model=None)
+    async def course_learning_analytics(course_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/courses/{course_id}/analytics")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            metrics, total_overdue = _student_metrics(conn, course_id)
+            published_items = _published_items(conn, course_id)
+        student_count = len(metrics)
+        avg_progress = round(sum(int(row["progress"]) for row in metrics) / student_count) if student_count else 0
+        needs_attention = sum(1 for row in metrics if row["attention"] == "needs-attention")
+        grade_values = [float(row["grade_percent"]) for row in metrics if row["grade_percent"] is not None]
+        avg_grade = round(sum(grade_values) / len(grade_values), 1) if grade_values else None
+        table_rows = []
+        for row in metrics:
+            grade_text = "—" if row["grade_percent"] is None else f"{float(row['grade_percent']):.1f}%"
+            table_rows.append(f'''<tr data-analytics-status="{academic_access.esc(row['attention'], attr=True)}"><td><strong>{academic_access.esc(row['email'])}</strong></td><td><strong>{int(row['progress'])}%</strong><br><small>{int(row['completed'])}/{int(row['total'])} completed</small></td><td>{int(row['overdue'])}</td><td>{int(row['submissions'])}</td><td>{academic_access.esc(grade_text)}</td><td><strong data-i18n-en="{academic_access.esc(row['label_en'], attr=True)}" data-i18n-es="{academic_access.esc(row['label_es'], attr=True)}">{academic_access.esc(row['label_en'])}</strong></td></tr>''')
+        rows_html = "".join(table_rows) or '<tr><td colspan="6" data-i18n-en="No active students are enrolled yet." data-i18n-es="Todavía no hay estudiantes activos matriculados.">No active students are enrolled yet.</td></tr>'
+        grade_summary = "—" if avg_grade is None else f"{avg_grade:.1f}%"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="learning-analytics-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Learning Analytics v1" data-i18n-es="Analítica de aprendizaje v1">Learning Analytics v1</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Monitor progress, overdue work, submissions, and graded performance. Attention indicators are simple rules for instructor review, not predictive decisions." data-i18n-es="Monitoree progreso, trabajos atrasados, entregas y desempeño calificado. Los indicadores de atención son reglas sencillas para revisión docente, no decisiones predictivas.">Monitor progress, overdue work, submissions, and graded performance. Attention indicators are simple rules for instructor review, not predictive decisions.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/analytics.csv" data-i18n-en="Export CSV" data-i18n-es="Exportar CSV">Export CSV</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{student_count}</strong><span data-i18n-en="Active students" data-i18n-es="Estudiantes activos">Active students</span></article><article class="studio-panel"><strong>{avg_progress}%</strong><span data-i18n-en="Average progress" data-i18n-es="Progreso promedio">Average progress</span></article><article class="studio-panel"><strong>{needs_attention}</strong><span data-i18n-en="Needs attention" data-i18n-es="Requieren atención">Needs attention</span></article><article class="studio-panel"><strong>{total_overdue}</strong><span data-i18n-en="Overdue items" data-i18n-es="Trabajos atrasados">Overdue items</span></article><article class="studio-panel"><strong>{len(published_items)}</strong><span data-i18n-en="Published items" data-i18n-es="Elementos publicados">Published items</span></article><article class="studio-panel"><strong>{academic_access.esc(grade_summary)}</strong><span data-i18n-en="Average graded score" data-i18n-es="Promedio calificado">Average graded score</span></article></section><section class="studio-panel"><div style="overflow:auto"><table><thead><tr><th data-i18n-en="Student" data-i18n-es="Estudiante">Student</th><th data-i18n-en="Progress" data-i18n-es="Progreso">Progress</th><th data-i18n-en="Overdue" data-i18n-es="Atrasados">Overdue</th><th data-i18n-en="Submissions" data-i18n-es="Entregas">Submissions</th><th data-i18n-en="Graded score" data-i18n-es="Puntuación calificada">Graded score</th><th data-i18n-en="Instructor review" data-i18n-es="Revisión docente">Instructor review</th></tr></thead><tbody>{rows_html}</tbody></table></div></section><section class="studio-panel"><p data-i18n-en="Use analytics as a starting point for outreach. Review context before contacting a learner or making academic decisions." data-i18n-es="Utilice la analítica como punto de partida para el acompañamiento. Revise el contexto antes de contactar al estudiante o tomar decisiones académicas.">Use analytics as a starting point for outreach. Review context before contacting a learner or making academic decisions.</p></section></main>'''
+        return academic_access.portal_page("Learning Analytics", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/analytics.csv", response_model=None)
+    async def export_learning_analytics(course_id: int, request: Request):
+        user = _author(request, f"{STUDIO_PREFIX}/courses/{course_id}/analytics")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            metrics, _ = _student_metrics(conn, course_id)
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["Student", "Progress percent", "Completed", "Published items", "Overdue", "Submissions", "Graded score percent", "Instructor review"])
+        for row in metrics:
+            writer.writerow([row["email"], row["progress"], row["completed"], row["total"], row["overdue"], row["submissions"], "" if row["grade_percent"] is None else round(float(row["grade_percent"]), 2), row["label_en"]])
+        filename = f"{str(course.get('course_code') or 'course').replace(' ', '_')}-learning-analytics.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    print("NUVEDRA Learning Analytics v1 registered: instructor progress dashboard, attention indicators, overdue work, graded performance, and CSV export.", flush=True)
