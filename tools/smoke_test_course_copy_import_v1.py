@@ -110,15 +110,15 @@ def main() -> None:
         require(home, "Create a new course copy", "course copy home")
         require(home, "Due dates are cleared", "course copy safety notice")
 
-        copied = client.post(f"/faculty/studio/courses/{source_course_id}/copy/new", data=[
-            ("course_code", "COPY-4200"),
-            ("title", "Course Copy Target"),
-            ("term", "Spring 2027"),
-            ("module_ids", str(module_one)),
-            ("copy_questions", "1"),
-            ("copy_rubrics", "1"),
-            ("copy_outcomes", "1"),
-        ])
+        copied = client.post(f"/faculty/studio/courses/{source_course_id}/copy/new", data={
+            "course_code": "COPY-4200",
+            "title": "Course Copy Target",
+            "term": "Spring 2027",
+            "module_ids": str(module_one),
+            "copy_questions": "1",
+            "copy_rubrics": "1",
+            "copy_outcomes": "1",
+        })
         expect(copied, 303, "new course copy")
         target_course_id = int(copied.headers["location"].split("/courses/", 1)[1].split("?", 1)[0].split("/", 1)[0])
 
@@ -166,11 +166,34 @@ def main() -> None:
             if leaked_submissions or leaked_grades:
                 raise RuntimeError("Student submissions or grades leaked into the copied course.")
 
+        imported = client.post(f"/faculty/studio/courses/{source_course_id}/copy/import", data={
+            "target_course_id": str(target_course_id),
+            "module_ids": str(module_two),
+        })
+        expect(imported, 303, "existing-course import")
+        with db() as conn:
+            target_modules = rows(execute(conn, "SELECT * FROM nexus_modules WHERE course_id=? ORDER BY position,id", (target_course_id,)))
+            if [module.get("title") for module in target_modules] != ["Module One", "Module Two"]:
+                raise RuntimeError("Existing-course import did not append the selected module.")
+            imported_module = target_modules[1]
+            if imported_module.get("status") != "draft":
+                raise RuntimeError("Imported module did not remain in draft state.")
+            imported_items = rows(execute(conn, "SELECT * FROM nexus_content_items WHERE module_id=?", (int(imported_module["id"]),)))
+            if len(imported_items) != 1 or imported_items[0].get("title") != "Module Two Discussion" or imported_items[0].get("due_at") not in (None, ""):
+                raise RuntimeError("Imported discussion content or due-date safety is incorrect.")
+            imported_forum_posts = rows(execute(conn, "SELECT id FROM nexus_forum_posts WHERE item_id=?", (int(imported_items[0]["id"]),)))
+            if imported_forum_posts:
+                raise RuntimeError("Discussion participation history leaked during course import.")
+            if len(rows(execute(conn, "SELECT id FROM nuvedra_rubrics WHERE course_id=?", (target_course_id,)))) != 1:
+                raise RuntimeError("Rubrics changed during an import where rubric copying was not selected.")
+            if len(rows(execute(conn, "SELECT id FROM nuvedra_outcomes WHERE course_id=?", (target_course_id,)))) != 1:
+                raise RuntimeError("Outcomes changed during an import where outcome copying was not selected.")
+
         expect(client.get("/__smoke/course-copy-user/student"), 200, "student session")
         denied = client.get(f"/faculty/studio/courses/{source_course_id}/copy")
         expect(denied, 403, "student course-copy protection")
 
-    print("Course Copy & Import v1 validated: selective draft copy, cleared due dates, assessment questions, module drafts, Content Library uses, rubrics/outcomes remapping, and strict learner-data exclusion.", flush=True)
+    print("Course Copy & Import v1 validated: new-course copy, selective existing-course import, draft safety, cleared due dates, assessment questions, module drafts, Content Library uses, rubrics/outcomes remapping, and strict learner-data exclusion.", flush=True)
 
 
 if __name__ == "__main__":
