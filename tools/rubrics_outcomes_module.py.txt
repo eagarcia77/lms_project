@@ -1,0 +1,420 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_rubrics_outcomes_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubrics (
+            id {pk}, course_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubric_criteria (
+            id {pk}, rubric_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT,
+            position INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubric_levels (
+            id {pk}, criterion_id INTEGER NOT NULL, label TEXT NOT NULL, description TEXT,
+            points REAL NOT NULL DEFAULT 0, position INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubric_links (
+            id {pk}, rubric_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(item_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_outcomes (
+            id {pk}, course_id INTEGER NOT NULL, code TEXT NOT NULL, title TEXT NOT NULL,
+            description TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_outcome_links (
+            id {pk}, outcome_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(outcome_id,item_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubric_evaluations (
+            id {pk}, submission_id INTEGER NOT NULL, rubric_id INTEGER NOT NULL,
+            raw_score REAL NOT NULL DEFAULT 0, possible_raw_score REAL NOT NULL DEFAULT 0,
+            grade_points REAL NOT NULL DEFAULT 0, feedback TEXT,
+            status TEXT NOT NULL DEFAULT 'graded', graded_by TEXT NOT NULL,
+            graded_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(submission_id,rubric_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_rubric_scores (
+            id {pk}, evaluation_id INTEGER NOT NULL, criterion_id INTEGER NOT NULL,
+            level_id INTEGER NOT NULL, points_awarded REAL NOT NULL DEFAULT 0,
+            feedback TEXT, UNIQUE(evaluation_id,criterion_id)
+        )""")
+
+
+def _course_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.id,i.title,i.item_type,i.points,i.status,m.title AS module_title,m.position AS module_position
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+
+def _rubric(conn: Any, rubric_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_rubrics WHERE id=?", (rubric_id,)))
+    if not found:
+        raise HTTPException(404, "Rubric not found.")
+    return found[0]
+
+
+def _criteria(conn: Any, rubric_id: int) -> list[dict[str, Any]]:
+    criteria = rows(execute(conn, "SELECT * FROM nuvedra_rubric_criteria WHERE rubric_id=? ORDER BY position,id", (rubric_id,)))
+    for criterion in criteria:
+        criterion["levels"] = rows(execute(conn, "SELECT * FROM nuvedra_rubric_levels WHERE criterion_id=? ORDER BY points DESC,position,id", (int(criterion["id"]),)))
+    return criteria
+
+
+def _rubric_max(criteria: list[dict[str, Any]]) -> float:
+    return sum(max((float(level.get("points") or 0) for level in criterion.get("levels", [])), default=0.0) for criterion in criteria)
+
+
+def _linked_rubric(conn: Any, item_id: int) -> dict[str, Any] | None:
+    found = rows(execute(conn, """SELECT r.* FROM nuvedra_rubric_links l
+        JOIN nuvedra_rubrics r ON r.id=l.rubric_id
+        WHERE l.item_id=? AND r.status='active'""", (item_id,)))
+    return found[0] if found else None
+
+
+def _submission_bundle(conn: Any, submission_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT s.*,i.title AS item_title,i.points AS item_points,i.id AS item_id,
+        m.course_id,m.title AS module_title,c.course_code,c.title AS course_title
+        FROM nuvedra_submissions s
+        JOIN nexus_content_items i ON i.id=s.item_id
+        JOIN nexus_modules m ON m.id=i.module_id
+        JOIN nexus_admin_courses c ON c.id=m.course_id
+        WHERE s.id=?""", (submission_id,)))
+    if not found:
+        raise HTTPException(404, "Submission not found.")
+    return found[0]
+
+
+def _outcome_attainment(conn: Any, outcome_id: int) -> tuple[float | None, int]:
+    data = rows(execute(conn, """SELECT i.points,g.points_awarded FROM nuvedra_outcome_links ol
+        JOIN nexus_content_items i ON i.id=ol.item_id
+        JOIN nuvedra_submissions s ON s.item_id=i.id AND s.status='submitted'
+        JOIN nuvedra_grades g ON g.submission_id=s.id AND g.status='graded'
+        WHERE ol.outcome_id=? AND i.points IS NOT NULL AND i.points>0 AND g.points_awarded IS NOT NULL""", (outcome_id,)))
+    percentages = [max(0.0, min(100.0, (float(row.get("points_awarded") or 0) / float(row.get("points") or 1)) * 100.0)) for row in data]
+    if not percentages:
+        return None, 0
+    return sum(percentages) / len(percentages), len(percentages)
+
+
+def _rubric_student_html(criteria: list[dict[str, Any]], selected: dict[int, dict[str, Any]] | None = None) -> str:
+    cards = []
+    selected = selected or {}
+    for criterion in criteria:
+        score = selected.get(int(criterion["id"]))
+        levels = "".join(
+            f'''<tr><td>{academic_access.esc(level.get('label'))}</td><td>{academic_access.esc(level.get('description'))}</td><td>{float(level.get('points') or 0):g}</td></tr>'''
+            for level in criterion.get("levels", [])
+        ) or '<tr><td colspan="3">No performance levels yet.</td></tr>'
+        evaluated = ""
+        if score:
+            evaluated = f'''<p class="studio-notice"><strong data-i18n-en="Selected level" data-i18n-es="Nivel seleccionado">Selected level</strong>: {academic_access.esc(score.get('level_label'))} · {float(score.get('points_awarded') or 0):g} pts<br>{academic_access.esc(score.get('feedback') or '')}</p>'''
+        cards.append(f'''<article class="studio-panel"><h3>{academic_access.esc(criterion.get('title'))}</h3><p>{academic_access.esc(criterion.get('description'))}</p>{evaluated}<div style="overflow:auto"><table><thead><tr><th data-i18n-en="Level" data-i18n-es="Nivel">Level</th><th data-i18n-en="Description" data-i18n-es="Descripción">Description</th><th data-i18n-en="Points" data-i18n-es="Puntos">Points</th></tr></thead><tbody>{levels}</tbody></table></div></article>''')
+    return "".join(cards) or '<section class="studio-empty" data-i18n-en="This rubric has no criteria yet." data-i18n-es="Esta rúbrica todavía no tiene criterios.">This rubric has no criteria yet.</section>'
+
+
+def register_rubrics_outcomes(app: FastAPI) -> None:
+    ensure_rubrics_outcomes_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/rubrics", response_class=HTMLResponse, response_model=None)
+    async def course_rubrics(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/rubrics")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            rubrics = rows(execute(conn, "SELECT * FROM nuvedra_rubrics WHERE course_id=? AND status='active' ORDER BY title,id", (course_id,)))
+            for rubric in rubrics:
+                rubric["criteria_count"] = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_rubric_criteria WHERE rubric_id=?", (int(rubric["id"]),)))[0]["total"]
+                rubric["link_count"] = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_rubric_links WHERE rubric_id=?", (int(rubric["id"]),)))[0]["total"]
+        cards = "".join(f'''<article class="studio-panel"><h3>{academic_access.esc(r.get('title'))}</h3><p>{academic_access.esc(r.get('description'))}</p><p><strong>{int(r.get('criteria_count') or 0)}</strong> criteria · <strong>{int(r.get('link_count') or 0)}</strong> linked activities</p><a class="studio-button" href="{STUDIO_PREFIX}/rubrics/{int(r['id'])}" data-i18n-en="Open rubric" data-i18n-es="Abrir rúbrica">Open rubric</a></article>''' for r in rubrics) or '<section class="studio-empty" data-i18n-en="No rubrics yet." data-i18n-es="Todavía no hay rúbricas.">No rubrics yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="rubrics-outcomes-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}">Course Studio</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}/outcomes" data-i18n-en="Outcomes" data-i18n-es="Resultados">Outcomes</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Rubrics & Outcomes" data-i18n-es="Rúbricas y resultados">Rubrics & Outcomes</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Build reusable rubrics, align assessments to outcomes, and grade consistently." data-i18n-es="Cree rúbricas reutilizables, alinee evaluaciones con resultados y califique consistentemente.">Build reusable rubrics, align assessments to outcomes, and grade consistently.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Create rubric" data-i18n-es="Crear rúbrica">Create rubric</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/rubrics" class="studio-form"><label><span data-i18n-en="Title" data-i18n-es="Título">Title</span><input name="title" required maxlength="180"></label><label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description" rows="3"></textarea></label><button class="studio-button" data-i18n-en="Create rubric" data-i18n-es="Crear rúbrica">Create rubric</button></form></section><section class="studio-grid">{cards}</section></main>'''
+        return academic_access.portal_page("Rubrics & Outcomes", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/rubrics", response_model=None)
+    async def create_rubric(course_id: int, request: Request, title: str = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/rubrics")
+        if isinstance(user, RedirectResponse): return user
+        clean = title.strip()
+        if not clean: raise HTTPException(400, "Rubric title is required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            execute(conn, "INSERT INTO nuvedra_rubrics (course_id,title,description,status,created_by,created_at,updated_at) VALUES (?,?,?,'active',?,?,?)", (course_id, clean, description.strip(), user["email"], now, now))
+            rubric_id = int(rows(execute(conn, "SELECT id FROM nuvedra_rubrics WHERE course_id=? ORDER BY id DESC", (course_id,)))[0]["id"])
+            audit(conn, user["email"], "rubric_created", "rubric", str(rubric_id), clean, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/rubrics/{rubric_id}", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/rubrics/{{rubric_id}}", response_class=HTMLResponse, response_model=None)
+    async def rubric_builder(rubric_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/rubrics/{rubric_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            rubric = _rubric(conn, rubric_id)
+            course_id = int(rubric["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            criteria = _criteria(conn, rubric_id)
+            items = _course_items(conn, course_id)
+            links = rows(execute(conn, "SELECT item_id FROM nuvedra_rubric_links WHERE rubric_id=?", (rubric_id,)))
+            linked_ids = {int(row["item_id"]) for row in links}
+            authored_courses = rows(execute(conn, """SELECT c.id,c.course_code,c.title FROM nexus_admin_enrollments e JOIN nexus_admin_courses c ON c.id=e.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ('instructor','teaching_assistant','course_builder','facilitator') ORDER BY c.title""", (user["email"].lower(),)))
+        criterion_cards = []
+        for criterion in criteria:
+            levels = "".join(f'<li><strong>{academic_access.esc(level.get("label"))}</strong> — {float(level.get("points") or 0):g} pts · {academic_access.esc(level.get("description"))}</li>' for level in criterion.get("levels", [])) or '<li>No performance levels yet.</li>'
+            criterion_cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">Criterion {int(criterion.get('position') or 1)}</p><h3>{academic_access.esc(criterion.get('title'))}</h3><p>{academic_access.esc(criterion.get('description'))}</p><ul>{levels}</ul><form method="post" action="{STUDIO_PREFIX}/rubrics/{rubric_id}/criteria/{int(criterion['id'])}/levels" class="studio-form"><div class="studio-form-grid"><label><span data-i18n-en="Level" data-i18n-es="Nivel">Level</span><input name="label" required></label><label><span data-i18n-en="Points" data-i18n-es="Puntos">Points</span><input type="number" name="points" min="0" step="0.01" required></label></div><label><span data-i18n-en="Level description" data-i18n-es="Descripción del nivel">Level description</span><input name="description"></label><button class="studio-button studio-button--quiet" data-i18n-en="Add performance level" data-i18n-es="Añadir nivel de desempeño">Add performance level</button></form></article>''')
+        item_options = "".join(f'<option value="{int(item["id"])}">{academic_access.esc(item.get("module_title"))} · {academic_access.esc(item.get("title"))}{" · linked" if int(item["id"]) in linked_ids else ""}</option>' for item in items)
+        course_options = "".join(f'<option value="{int(course["id"])}">{academic_access.esc(course.get("course_code"))} · {academic_access.esc(course.get("title"))}</option>' for course in authored_courses)
+        maximum = _rubric_max(criteria)
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="rubric-builder-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/rubrics" data-i18n-en="Rubrics" data-i18n-es="Rúbricas">Rubrics</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Rubric Builder" data-i18n-es="Constructor de rúbricas">Rubric Builder</p><h2>{academic_access.esc(rubric.get('title'))}</h2><p>{academic_access.esc(rubric.get('description'))}</p></div><div class="studio-actions"><span class="studio-button studio-button--quiet">{maximum:g} max rubric points</span></div></header><section class="studio-panel"><h3 data-i18n-en="Add criterion" data-i18n-es="Añadir criterio">Add criterion</h3><form method="post" action="{STUDIO_PREFIX}/rubrics/{rubric_id}/criteria" class="studio-form"><label><span data-i18n-en="Criterion title" data-i18n-es="Título del criterio">Criterion title</span><input name="title" required></label><label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description" rows="2"></textarea></label><button class="studio-button" data-i18n-en="Add criterion" data-i18n-es="Añadir criterio">Add criterion</button></form></section><section class="studio-grid">{''.join(criterion_cards) or '<section class="studio-empty">Add the first criterion to begin building this rubric.</section>'}</section><section class="studio-panel"><h3 data-i18n-en="Attach to activity" data-i18n-es="Vincular a actividad">Attach to activity</h3><form method="post" action="{STUDIO_PREFIX}/rubrics/{rubric_id}/attach" class="studio-form"><select name="item_id" required>{item_options}</select><button class="studio-button" data-i18n-en="Attach rubric" data-i18n-es="Vincular rúbrica">Attach rubric</button></form></section><section class="studio-panel"><h3 data-i18n-en="Reuse rubric" data-i18n-es="Reutilizar rúbrica">Reuse rubric</h3><p data-i18n-en="Create an independent copy in another course you author." data-i18n-es="Cree una copia independiente en otro curso donde sea autor.">Create an independent copy in another course you author.</p><form method="post" action="{STUDIO_PREFIX}/rubrics/{rubric_id}/duplicate" class="studio-form"><select name="target_course_id" required>{course_options}</select><button class="studio-button studio-button--quiet" data-i18n-en="Duplicate rubric" data-i18n-es="Duplicar rúbrica">Duplicate rubric</button></form></section></main>'''
+        return academic_access.portal_page("Rubric Builder", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/rubrics/{{rubric_id}}/criteria", response_model=None)
+    async def add_criterion(rubric_id: int, request: Request, title: str = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/rubrics/{rubric_id}")
+        if isinstance(user, RedirectResponse): return user
+        clean = title.strip()
+        if not clean: raise HTTPException(400, "Criterion title is required.")
+        with db() as conn:
+            rubric = _rubric(conn, rubric_id)
+            academic_access.require_course_role(conn, int(rubric["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            current = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_rubric_criteria WHERE rubric_id=?", (rubric_id,)))
+            execute(conn, "INSERT INTO nuvedra_rubric_criteria (rubric_id,title,description,position,created_at) VALUES (?,?,?,?,?)", (rubric_id, clean, description.strip(), int(current[0].get("total") or 0)+1, utcnow()))
+        return RedirectResponse(f"{STUDIO_PREFIX}/rubrics/{rubric_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/rubrics/{{rubric_id}}/criteria/{{criterion_id}}/levels", response_model=None)
+    async def add_level(rubric_id: int, criterion_id: int, request: Request, label: str = Form(...), points: float = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/rubrics/{rubric_id}")
+        if isinstance(user, RedirectResponse): return user
+        if points < 0: raise HTTPException(400, "Rubric points cannot be negative.")
+        with db() as conn:
+            rubric = _rubric(conn, rubric_id)
+            academic_access.require_course_role(conn, int(rubric["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            found = rows(execute(conn, "SELECT id FROM nuvedra_rubric_criteria WHERE id=? AND rubric_id=?", (criterion_id, rubric_id)))
+            if not found: raise HTTPException(404, "Rubric criterion not found.")
+            count = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_rubric_levels WHERE criterion_id=?", (criterion_id,)))
+            execute(conn, "INSERT INTO nuvedra_rubric_levels (criterion_id,label,description,points,position,created_at) VALUES (?,?,?,?,?,?)", (criterion_id, label.strip(), description.strip(), points, int(count[0].get("total") or 0)+1, utcnow()))
+        return RedirectResponse(f"{STUDIO_PREFIX}/rubrics/{rubric_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/rubrics/{{rubric_id}}/attach", response_model=None)
+    async def attach_rubric(rubric_id: int, request: Request, item_id: int = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/rubrics/{rubric_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            rubric = _rubric(conn, rubric_id)
+            course_id = int(rubric["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            item_course, _item, _module = academic_access.item_bundle(conn, item_id)
+            if item_course != course_id: raise HTTPException(400, "Rubrics can only be attached to activities in the same course.")
+            found = rows(execute(conn, "SELECT id FROM nuvedra_rubric_links WHERE item_id=?", (item_id,)))
+            now = utcnow()
+            if found:
+                execute(conn, "UPDATE nuvedra_rubric_links SET rubric_id=?,created_by=?,created_at=? WHERE id=?", (rubric_id, user["email"], now, int(found[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_rubric_links (rubric_id,item_id,created_by,created_at) VALUES (?,?,?,?)", (rubric_id, item_id, user["email"], now))
+            audit(conn, user["email"], "rubric_attached", "item", str(item_id), f"rubric={rubric_id}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/rubrics/{rubric_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/rubrics/{{rubric_id}}/duplicate", response_model=None)
+    async def duplicate_rubric(rubric_id: int, request: Request, target_course_id: int = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/rubrics/{rubric_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            source = _rubric(conn, rubric_id)
+            academic_access.require_course_role(conn, int(source["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            academic_access.require_course_role(conn, target_course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            execute(conn, "INSERT INTO nuvedra_rubrics (course_id,title,description,status,created_by,created_at,updated_at) VALUES (?,?,?,'active',?,?,?)", (target_course_id, str(source.get("title") or "Rubric") + " (Copy)", source.get("description") or "", user["email"], now, now))
+            new_id = int(rows(execute(conn, "SELECT id FROM nuvedra_rubrics WHERE course_id=? ORDER BY id DESC", (target_course_id,)))[0]["id"])
+            for criterion in _criteria(conn, rubric_id):
+                execute(conn, "INSERT INTO nuvedra_rubric_criteria (rubric_id,title,description,position,created_at) VALUES (?,?,?,?,?)", (new_id, criterion.get("title"), criterion.get("description"), int(criterion.get("position") or 1), now))
+                new_criterion = int(rows(execute(conn, "SELECT id FROM nuvedra_rubric_criteria WHERE rubric_id=? ORDER BY id DESC", (new_id,)))[0]["id"])
+                for level in criterion.get("levels", []):
+                    execute(conn, "INSERT INTO nuvedra_rubric_levels (criterion_id,label,description,points,position,created_at) VALUES (?,?,?,?,?,?)", (new_criterion, level.get("label"), level.get("description"), float(level.get("points") or 0), int(level.get("position") or 1), now))
+        return RedirectResponse(f"{STUDIO_PREFIX}/rubrics/{new_id}", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/outcomes", response_class=HTMLResponse, response_model=None)
+    async def course_outcomes(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/outcomes")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            outcomes = rows(execute(conn, "SELECT * FROM nuvedra_outcomes WHERE course_id=? AND status='active' ORDER BY code,id", (course_id,)))
+            items = _course_items(conn, course_id)
+            for outcome in outcomes:
+                outcome["links"] = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_outcome_links WHERE outcome_id=?", (int(outcome["id"]),)))[0]["total"]
+                outcome["attainment"], outcome["evidence_count"] = _outcome_attainment(conn, int(outcome["id"]))
+        options = "".join(f'<option value="{int(item["id"])}">{academic_access.esc(item.get("module_title"))} · {academic_access.esc(item.get("title"))}</option>' for item in items)
+        cards = []
+        for outcome in outcomes:
+            attainment = "No graded evidence" if outcome.get("attainment") is None else f"{float(outcome.get('attainment') or 0):.1f}% average attainment"
+            cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(outcome.get('code'))}</p><h3>{academic_access.esc(outcome.get('title'))}</h3><p>{academic_access.esc(outcome.get('description'))}</p><p><strong>{int(outcome.get('links') or 0)}</strong> aligned activities · <strong>{academic_access.esc(attainment)}</strong> · {int(outcome.get('evidence_count') or 0)} graded evidence records</p><form method="post" action="{STUDIO_PREFIX}/outcomes/{int(outcome['id'])}/attach" class="studio-form"><select name="item_id" required>{options}</select><button class="studio-button studio-button--quiet" data-i18n-en="Align activity" data-i18n-es="Alinear actividad">Align activity</button></form></article>''')
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="course-outcomes-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/rubrics" data-i18n-en="Rubrics" data-i18n-es="Rúbricas">Rubrics</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}">Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Learning Outcomes" data-i18n-es="Resultados de aprendizaje">Learning Outcomes</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Align course activities to measurable outcomes and review graded evidence of attainment." data-i18n-es="Alinee actividades con resultados medibles y revise evidencia calificada de logro.">Align course activities to measurable outcomes and review graded evidence of attainment.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Create outcome" data-i18n-es="Crear resultado">Create outcome</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/outcomes" class="studio-form"><div class="studio-form-grid"><label><span data-i18n-en="Code" data-i18n-es="Código">Code</span><input name="code" required maxlength="40" placeholder="CLO-1"></label><label><span data-i18n-en="Outcome title" data-i18n-es="Título del resultado">Outcome title</span><input name="title" required></label></div><label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description" rows="3"></textarea></label><button class="studio-button" data-i18n-en="Create outcome" data-i18n-es="Crear resultado">Create outcome</button></form></section><section class="studio-grid">{''.join(cards) or '<section class="studio-empty">No learning outcomes yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Learning Outcomes", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/outcomes", response_model=None)
+    async def create_outcome(course_id: int, request: Request, code: str = Form(...), title: str = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/outcomes")
+        if isinstance(user, RedirectResponse): return user
+        if not code.strip() or not title.strip(): raise HTTPException(400, "Outcome code and title are required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            execute(conn, "INSERT INTO nuvedra_outcomes (course_id,code,title,description,status,created_by,created_at,updated_at) VALUES (?,?,?,?,'active',?,?,?)", (course_id, code.strip(), title.strip(), description.strip(), user["email"], now, now))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/outcomes", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/outcomes/{{outcome_id}}/attach", response_model=None)
+    async def attach_outcome(outcome_id: int, request: Request, item_id: int = Form(...)):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            found = rows(execute(conn, "SELECT * FROM nuvedra_outcomes WHERE id=?", (outcome_id,)))
+            if not found: raise HTTPException(404, "Outcome not found.")
+            outcome = found[0]; course_id = int(outcome["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            item_course, _item, _module = academic_access.item_bundle(conn, item_id)
+            if item_course != course_id: raise HTTPException(400, "Outcome alignment must stay within the same course.")
+            duplicate = rows(execute(conn, "SELECT id FROM nuvedra_outcome_links WHERE outcome_id=? AND item_id=?", (outcome_id, item_id)))
+            if not duplicate:
+                execute(conn, "INSERT INTO nuvedra_outcome_links (outcome_id,item_id,created_by,created_at) VALUES (?,?,?,?)", (outcome_id, item_id, user["email"], utcnow()))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/outcomes", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/submissions/{{submission_id}}/rubric", response_class=HTMLResponse, response_model=None)
+    async def grade_with_rubric(submission_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/submissions/{submission_id}/rubric")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            submission = _submission_bundle(conn, submission_id)
+            academic_access.require_course_role(conn, int(submission["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            rubric = _linked_rubric(conn, int(submission["item_id"]))
+            if not rubric: raise HTTPException(404, "No rubric is attached to this activity.")
+            criteria = _criteria(conn, int(rubric["id"]))
+            evaluations = rows(execute(conn, "SELECT * FROM nuvedra_rubric_evaluations WHERE submission_id=? AND rubric_id=?", (submission_id, int(rubric["id"]))))
+            existing: dict[int, dict[str, Any]] = {}
+            if evaluations:
+                for score in rows(execute(conn, "SELECT * FROM nuvedra_rubric_scores WHERE evaluation_id=?", (int(evaluations[0]["id"]),))): existing[int(score["criterion_id"])] = score
+        fields = []
+        for criterion in criteria:
+            chosen = existing.get(int(criterion["id"]), {})
+            radios = "".join(f'''<label style="display:block"><input type="radio" name="level_{int(criterion['id'])}" value="{int(level['id'])}" {'checked' if int(chosen.get('level_id') or 0)==int(level['id']) else ''} required> <strong>{academic_access.esc(level.get('label'))}</strong> — {float(level.get('points') or 0):g} pts · {academic_access.esc(level.get('description'))}</label>''' for level in criterion.get("levels", [])) or '<p class="studio-notice">Add performance levels before grading this criterion.</p>'
+            fields.append(f'''<article class="studio-panel"><h3>{academic_access.esc(criterion.get('title'))}</h3><p>{academic_access.esc(criterion.get('description'))}</p>{radios}<label><span data-i18n-en="Criterion feedback" data-i18n-es="Retroalimentación del criterio">Criterion feedback</span><textarea name="feedback_{int(criterion['id'])}" rows="2">{academic_access.esc(chosen.get('feedback') or '')}</textarea></label></article>''')
+        evaluation = evaluations[0] if evaluations else {}
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="rubric-grading-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{int(submission['course_id'])}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Calificaciones">Gradebook</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Grade with Rubric" data-i18n-es="Calificar con rúbrica">Grade with Rubric</p><h2>{academic_access.esc(submission.get('item_title'))}</h2><p>{academic_access.esc(submission.get('student_email'))} · {academic_access.esc(rubric.get('title'))}</p></div></header><section class="studio-panel"><details open><summary data-i18n-en="Student submission" data-i18n-es="Entrega del estudiante">Student submission</summary><p>{academic_access.esc(submission.get('response_text'))}</p></details></section><form method="post" action="{STUDIO_PREFIX}/submissions/{submission_id}/rubric" class="studio-form">{''.join(fields)}<section class="studio-panel"><label><span data-i18n-en="Overall feedback" data-i18n-es="Retroalimentación general">Overall feedback</span><textarea name="overall_feedback" rows="4">{academic_access.esc(evaluation.get('feedback') or '')}</textarea></label><button class="studio-button" data-i18n-en="Save rubric grade" data-i18n-es="Guardar calificación de rúbrica">Save rubric grade</button></section></form></main>'''
+        return academic_access.portal_page("Grade with Rubric", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/submissions/{{submission_id}}/rubric", response_model=None)
+    async def save_rubric_grade(submission_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/submissions/{submission_id}/rubric")
+        if isinstance(user, RedirectResponse): return user
+        form = await request.form()
+        with db() as conn:
+            submission = _submission_bundle(conn, submission_id)
+            course_id = int(submission["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            rubric = _linked_rubric(conn, int(submission["item_id"]))
+            if not rubric: raise HTTPException(404, "No rubric is attached to this activity.")
+            criteria = _criteria(conn, int(rubric["id"]))
+            if not criteria: raise HTTPException(400, "The rubric has no criteria.")
+            raw = 0.0; selections: list[tuple[int,int,float,str]] = []
+            for criterion in criteria:
+                criterion_id = int(criterion["id"])
+                selected = str(form.get(f"level_{criterion_id}") or "").strip()
+                if not selected.isdigit(): raise HTTPException(400, f"Select a performance level for {criterion.get('title') or 'each criterion'}.")
+                level_id = int(selected)
+                level = next((level for level in criterion.get("levels", []) if int(level["id"]) == level_id), None)
+                if not level: raise HTTPException(400, "Selected rubric level is invalid.")
+                points = float(level.get("points") or 0); raw += points
+                selections.append((criterion_id, level_id, points, str(form.get(f"feedback_{criterion_id}") or "").strip()))
+            possible = _rubric_max(criteria)
+            if possible <= 0: raise HTTPException(400, "The rubric must contain positive possible points before grading.")
+            item_points = float(submission.get("item_points") or 0)
+            grade_points = (raw / possible) * item_points if item_points > 0 else raw
+            grade_points = round(grade_points, 2)
+            now = utcnow(); feedback = str(form.get("overall_feedback") or "").strip()
+            evaluation_rows = rows(execute(conn, "SELECT id FROM nuvedra_rubric_evaluations WHERE submission_id=? AND rubric_id=?", (submission_id, int(rubric["id"]))))
+            if evaluation_rows:
+                evaluation_id = int(evaluation_rows[0]["id"])
+                execute(conn, "UPDATE nuvedra_rubric_evaluations SET raw_score=?,possible_raw_score=?,grade_points=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE id=?", (raw, possible, grade_points, feedback, user["email"], now, now, evaluation_id))
+                execute(conn, "DELETE FROM nuvedra_rubric_scores WHERE evaluation_id=?", (evaluation_id,))
+            else:
+                execute(conn, "INSERT INTO nuvedra_rubric_evaluations (submission_id,rubric_id,raw_score,possible_raw_score,grade_points,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,?,?,?,'graded',?,?,?)", (submission_id, int(rubric["id"]), raw, possible, grade_points, feedback, user["email"], now, now))
+                evaluation_id = int(rows(execute(conn, "SELECT id FROM nuvedra_rubric_evaluations WHERE submission_id=? AND rubric_id=?", (submission_id, int(rubric["id"]))))[0]["id"])
+            for criterion_id, level_id, points, criterion_feedback in selections:
+                execute(conn, "INSERT INTO nuvedra_rubric_scores (evaluation_id,criterion_id,level_id,points_awarded,feedback) VALUES (?,?,?,?,?)", (evaluation_id, criterion_id, level_id, points, criterion_feedback))
+            grade = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+            if grade:
+                execute(conn, "UPDATE nuvedra_grades SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE submission_id=?", (grade_points, feedback, user["email"], now, now, submission_id))
+            else:
+                execute(conn, "INSERT INTO nuvedra_grades (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,'graded',?,?,?)", (submission_id, grade_points, feedback, user["email"], now, now))
+            audit(conn, user["email"], "submission_rubric_graded", "submission", str(submission_id), f"rubric={int(rubric['id'])}; grade={grade_points:g}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/submissions/{submission_id}/rubric", status_code=303)
+
+    @app.get("/learn/items/{item_id}/rubric", response_class=HTMLResponse, response_model=None)
+    async def student_item_rubric(item_id: int, request: Request):
+        user = _user(request, f"/learn/items/{item_id}/rubric")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course_id, item, module = academic_access.item_bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active" or str(item.get("status")) != "published" or str(module.get("status")) != "published": raise HTTPException(403, "This rubric is not available.")
+            rubric = _linked_rubric(conn, item_id)
+            criteria = _criteria(conn, int(rubric["id"])) if rubric else []
+            outcomes = rows(execute(conn, """SELECT o.code,o.title,o.description FROM nuvedra_outcome_links ol JOIN nuvedra_outcomes o ON o.id=ol.outcome_id
+                WHERE ol.item_id=? AND o.status='active' ORDER BY o.code,o.id""", (item_id,)))
+        if rubric:
+            rubric_html = f'<h2>{academic_access.esc(rubric.get("title"))}</h2><p>{academic_access.esc(rubric.get("description"))}</p>{_rubric_student_html(criteria)}'
+        else:
+            rubric_html = '<section class="studio-empty" data-i18n-en="No rubric has been attached to this activity." data-i18n-es="No se ha vinculado una rúbrica a esta actividad.">No rubric has been attached to this activity.</section>'
+        outcome_html = "".join(f'<li><strong>{academic_access.esc(o.get("code"))}</strong> — {academic_access.esc(o.get("title"))}: {academic_access.esc(o.get("description"))}</li>' for o in outcomes) or '<li data-i18n-en="No learning outcomes are aligned yet." data-i18n-es="Todavía no hay resultados alineados.">No learning outcomes are aligned yet.</li>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-rubric-v1"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Evaluation Criteria" data-i18n-es="Criterios de evaluación">Evaluation Criteria</p><h2>{academic_access.esc(item.get('title'))}</h2></div></header>{rubric_html}<section class="studio-panel"><h3 data-i18n-en="Aligned learning outcomes" data-i18n-es="Resultados de aprendizaje alineados">Aligned learning outcomes</h3><ul>{outcome_html}</ul></section></main>'''
+        return academic_access.portal_page("Evaluation Criteria", body, user)
+
+    @app.get("/learn/submissions/{submission_id}/rubric", response_class=HTMLResponse, response_model=None)
+    async def student_rubric_feedback(submission_id: int, request: Request):
+        user = _user(request, f"/learn/submissions/{submission_id}/rubric")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            submission = _submission_bundle(conn, submission_id)
+            academic_access.require_course_role(conn, int(submission["course_id"]), user["email"], {"student"})
+            if str(submission.get("student_email") or "").lower() != user["email"].lower(): raise HTTPException(403, "You can only view your own rubric feedback.")
+            rubric = _linked_rubric(conn, int(submission["item_id"]))
+            if not rubric: raise HTTPException(404, "No rubric is attached to this activity.")
+            criteria = _criteria(conn, int(rubric["id"]))
+            evaluations = rows(execute(conn, "SELECT * FROM nuvedra_rubric_evaluations WHERE submission_id=? AND rubric_id=? AND status='graded'", (submission_id, int(rubric["id"]))))
+            if not evaluations: raise HTTPException(404, "Rubric feedback is not available yet.")
+            evaluation = evaluations[0]
+            selected: dict[int, dict[str, Any]] = {}
+            for score in rows(execute(conn, """SELECT rs.*,rl.label AS level_label FROM nuvedra_rubric_scores rs JOIN nuvedra_rubric_levels rl ON rl.id=rs.level_id WHERE rs.evaluation_id=?""", (int(evaluation["id"]),))): selected[int(score["criterion_id"])] = score
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-rubric-feedback-v1"><nav class="studio-breadcrumbs"><a href="/learn/courses/{int(submission['course_id'])}/grades" data-i18n-en="My grades" data-i18n-es="Mis calificaciones">My grades</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Rubric Feedback" data-i18n-es="Retroalimentación de rúbrica">Rubric Feedback</p><h2>{academic_access.esc(submission.get('item_title'))}</h2><p>{academic_access.esc(rubric.get('title'))}</p></div><div class="studio-actions"><span class="studio-button studio-button--quiet">{float(evaluation.get('raw_score') or 0):g} / {float(evaluation.get('possible_raw_score') or 0):g} rubric pts</span><span class="studio-button studio-button--quiet">{float(evaluation.get('grade_points') or 0):g} course pts</span></div></header>{_rubric_student_html(criteria, selected)}<section class="studio-panel"><h3 data-i18n-en="Overall feedback" data-i18n-es="Retroalimentación general">Overall feedback</h3><p>{academic_access.esc(evaluation.get('feedback') or 'No overall feedback.')}</p></section></main>'''
+        return academic_access.portal_page("Rubric Feedback", body, user)
+
+    print("NUVEDRA Rubrics & Outcomes v1 registered: reusable rubric builder, outcome alignment, rubric grading, Gradebook synchronization, and student transparency.", flush=True)
