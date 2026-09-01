@@ -1,0 +1,365 @@
+from __future__ import annotations
+
+import secrets
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_certificates_completion_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, """CREATE TABLE IF NOT EXISTS nuvedra_course_completion_rules (
+            course_id INTEGER PRIMARY KEY, min_progress_percent REAL NOT NULL DEFAULT 100,
+            min_grade_percent REAL, certificate_enabled INTEGER NOT NULL DEFAULT 1,
+            certificate_title TEXT NOT NULL DEFAULT 'Certificate of Completion',
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_completion_required_items (
+            id {pk}, course_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(course_id,item_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_course_completions (
+            id {pk}, course_id INTEGER NOT NULL, student_email TEXT NOT NULL,
+            verification_code TEXT NOT NULL UNIQUE, certificate_title TEXT NOT NULL,
+            progress_percent REAL NOT NULL, grade_percent REAL,
+            status TEXT NOT NULL DEFAULT 'active', awarded_by TEXT NOT NULL,
+            awarded_at TEXT NOT NULL, revoked_at TEXT,
+            UNIQUE(course_id,student_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_notifications (
+            id {pk}, recipient_email TEXT NOT NULL, course_id INTEGER, title TEXT NOT NULL,
+            message TEXT, href TEXT, kind TEXT NOT NULL DEFAULT 'course_event',
+            read_at TEXT, created_at TEXT NOT NULL
+        )""")
+
+
+def _rule(conn: Any, course_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_course_completion_rules WHERE course_id=?", (course_id,)))
+    if found:
+        return found[0]
+    return {
+        "course_id": course_id,
+        "min_progress_percent": 100.0,
+        "min_grade_percent": None,
+        "certificate_enabled": 1,
+        "certificate_title": "Certificate of Completion",
+    }
+
+
+def _published_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.id,i.title,i.item_type,i.points,m.title AS module_title
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND m.status='published' AND i.status='published'
+        ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+
+def _completion_map(conn: Any, course_id: int, email: str) -> dict[int, bool]:
+    items = _published_items(conn, course_id)
+    item_ids = [int(item["id"]) for item in items]
+    result = {item_id: False for item_id in item_ids}
+    if not item_ids:
+        return result
+    placeholders = ",".join("?" for _ in item_ids)
+    params = tuple(item_ids) + (email.lower(),)
+    for row in rows(execute(conn, f"SELECT item_id,status FROM nuvedra_content_progress WHERE item_id IN ({placeholders}) AND lower(student_email)=?", params)):
+        result[int(row["item_id"])] = str(row.get("status") or "") == "completed"
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_submissions WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status='submitted'", params)):
+        result[int(row["item_id"])] = True
+    for row in rows(execute(conn, f"SELECT item_id FROM nuvedra_assessment_attempts WHERE item_id IN ({placeholders}) AND lower(student_email)=? AND status<>'in_progress'", params)):
+        result[int(row["item_id"])] = True
+    return result
+
+
+def _grade_percent(conn: Any, course_id: int, email: str) -> float | None:
+    data = rows(execute(conn, """SELECT g.points_awarded,i.points
+        FROM nuvedra_grades g
+        JOIN nuvedra_submissions s ON s.id=g.submission_id
+        JOIN nexus_content_items i ON i.id=s.item_id
+        JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND lower(s.student_email)=? AND g.points_awarded IS NOT NULL
+        ORDER BY g.id""", (course_id, email.lower())))
+    earned = 0.0
+    possible = 0.0
+    for row in data:
+        possible_points = float(row.get("points") or 0)
+        if possible_points <= 0:
+            continue
+        earned += float(row.get("points_awarded") or 0)
+        possible += possible_points
+    return (earned / possible) * 100 if possible > 0 else None
+
+
+def _required_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT r.id AS requirement_id,i.id AS item_id,i.title,i.item_type,m.title AS module_title
+        FROM nuvedra_completion_required_items r
+        JOIN nexus_content_items i ON i.id=r.item_id
+        JOIN nexus_modules m ON m.id=i.module_id
+        WHERE r.course_id=? AND m.course_id=? AND m.status='published' AND i.status='published'
+        ORDER BY m.position,m.id,i.position,i.id""", (course_id, course_id)))
+
+
+def completion_status_for_student(conn: Any, course_id: int, email: str) -> dict[str, Any]:
+    rule = _rule(conn, course_id)
+    items = _published_items(conn, course_id)
+    completion = _completion_map(conn, course_id, email)
+    completed = sum(1 for item in items if completion.get(int(item["id"]), False))
+    total = len(items)
+    progress = round((completed / total) * 100, 2) if total else 0.0
+    grade = _grade_percent(conn, course_id, email)
+    required = _required_items(conn, course_id)
+    required_complete = sum(1 for item in required if completion.get(int(item["item_id"]), False))
+    min_progress = float(rule.get("min_progress_percent") or 0)
+    min_grade_raw = rule.get("min_grade_percent")
+    min_grade = None if min_grade_raw in (None, "") else float(min_grade_raw)
+    grade_ok = min_grade is None or (grade is not None and grade >= min_grade)
+    eligible = progress >= min_progress and required_complete == len(required) and grade_ok
+    return {
+        "eligible": eligible,
+        "progress": progress,
+        "completed": completed,
+        "total": total,
+        "grade": grade,
+        "required_complete": required_complete,
+        "required_total": len(required),
+        "rule": rule,
+    }
+
+
+def _completion(conn: Any, course_id: int, email: str) -> dict[str, Any] | None:
+    found = rows(execute(conn, """SELECT * FROM nuvedra_course_completions
+        WHERE course_id=? AND lower(student_email)=?""", (course_id, email.lower())))
+    return found[0] if found else None
+
+
+def _new_code(conn: Any) -> str:
+    for _ in range(8):
+        code = "NUV-" + secrets.token_hex(8).upper()
+        if not rows(execute(conn, "SELECT id FROM nuvedra_course_completions WHERE verification_code=?", (code,))):
+            return code
+    raise HTTPException(500, "Could not generate a unique certificate verification code.")
+
+
+def _mask_email(value: str) -> str:
+    email = str(value or "").lower()
+    if "@" not in email:
+        return "Learner"
+    local, domain = email.split("@", 1)
+    prefix = local[:1] if local else "*"
+    return f"{prefix}***@{domain}"
+
+
+def register_certificates_completion(app: FastAPI) -> None:
+    ensure_certificates_completion_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/completion", response_class=HTMLResponse, response_model=None)
+    async def instructor_completion(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/completion")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            rule = _rule(conn, course_id)
+            items = _published_items(conn, course_id)
+            required_ids = {int(row["item_id"]) for row in _required_items(conn, course_id)}
+            students = rows(execute(conn, """SELECT lower(user_email) AS email FROM nexus_admin_enrollments
+                WHERE course_id=? AND status='active' AND course_role='student' ORDER BY lower(user_email)""", (course_id,)))
+            student_rows = []
+            for student in students:
+                email = str(student["email"])
+                status = completion_status_for_student(conn, course_id, email)
+                award = _completion(conn, course_id, email)
+                student_rows.append((email, status, award))
+        grade_value = "" if rule.get("min_grade_percent") in (None, "") else str(float(rule.get("min_grade_percent")))
+        item_rows = "".join(
+            f'''<tr><td>{academic_access.esc(item.get('module_title'))}</td><td>{academic_access.esc(item.get('title'))}</td><td>{academic_access.esc(item.get('item_type'))}</td><td><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/completion/required/{int(item['id'])}/toggle"><button class="studio-button studio-button--quiet">{'Remove requirement' if int(item['id']) in required_ids else 'Require'}</button></form></td></tr>'''
+            for item in items
+        ) or '<tr><td colspan="4">No published items are available.</td></tr>'
+        learner_rows = []
+        for email, status, award in student_rows:
+            grade_text = "—" if status["grade"] is None else f"{float(status['grade']):.1f}%"
+            current = str((award or {}).get("status") or "not-awarded")
+            if award and current == "active":
+                action = f'''<a class="studio-button studio-button--quiet" href="/verify/certificate/{academic_access.esc(award['verification_code'], attr=True)}">Verify</a><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/completion/{academic_access.esc(email, attr=True)}/revoke" style="display:inline"><button class="studio-button studio-button--quiet">Revoke</button></form>'''
+            elif status["eligible"] and int(rule.get("certificate_enabled") or 0):
+                action = f'''<form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/completion/{academic_access.esc(email, attr=True)}/award"><button class="studio-button">Award certificate</button></form>'''
+            else:
+                action = '<span class="studio-eyebrow">Not eligible</span>'
+            learner_rows.append(f'''<tr><td><strong>{academic_access.esc(email)}</strong></td><td>{status['progress']:.1f}%</td><td>{grade_text}</td><td>{status['required_complete']}/{status['required_total']}</td><td>{'Eligible' if status['eligible'] else 'Pending'}</td><td>{academic_access.esc(current)}</td><td>{action}</td></tr>''')
+        learners_html = "".join(learner_rows) or '<tr><td colspan="7">No active students yet.</td></tr>'
+        checked = " checked" if int(rule.get("certificate_enabled") or 0) else ""
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="certificates-completion-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Certificates & Course Completion" data-i18n-es="Certificados y finalización">Certificates & Course Completion</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Define transparent completion criteria and issue verifiable certificates only after instructor review." data-i18n-es="Defina criterios transparentes de finalización y emita certificados verificables después de revisión docente.">Define transparent completion criteria and issue verifiable certificates only after instructor review.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Completion rules" data-i18n-es="Reglas de finalización">Completion rules</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/completion/rules" class="studio-form"><label>Minimum progress %<input type="number" name="min_progress_percent" min="0" max="100" step="1" value="{float(rule.get('min_progress_percent') or 0):.0f}" required></label><label>Minimum graded score % (optional)<input type="number" name="min_grade_percent" min="0" max="100" step="0.1" value="{academic_access.esc(grade_value, attr=True)}"></label><label>Certificate title<input name="certificate_title" maxlength="180" value="{academic_access.esc(rule.get('certificate_title'), attr=True)}" required></label><label><input type="checkbox" name="certificate_enabled" value="1"{checked}> Enable certificate awards</label><button class="studio-button">Save completion rules</button></form></section><section class="studio-panel"><h3 data-i18n-en="Required published activities" data-i18n-es="Actividades publicadas requeridas">Required published activities</h3><p class="studio-notice">Required activities must be completed in addition to the minimum overall progress and optional grade threshold.</p><div style="overflow:auto"><table><thead><tr><th>Module</th><th>Activity</th><th>Type</th><th>Requirement</th></tr></thead><tbody>{item_rows}</tbody></table></div></section><section class="studio-panel"><h3 data-i18n-en="Learner completion review" data-i18n-es="Revisión de finalización">Learner completion review</h3><div style="overflow:auto"><table><thead><tr><th>Student</th><th>Progress</th><th>Grade</th><th>Required</th><th>Eligibility</th><th>Certificate</th><th>Action</th></tr></thead><tbody>{learners_html}</tbody></table></div></section><section class="studio-panel"><p data-i18n-en="NUVEDRA does not award certificates automatically in v1. Eligibility is calculated from configured criteria, but an authorized instructor performs the final award action." data-i18n-es="NUVEDRA no emite certificados automáticamente en v1. La elegibilidad se calcula según los criterios configurados, pero un instructor autorizado realiza la emisión final.">NUVEDRA does not award certificates automatically in v1. Eligibility is calculated from configured criteria, but an authorized instructor performs the final award action.</p></section></main>'''
+        return academic_access.portal_page("Certificates & Completion", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/completion/rules", response_model=None)
+    async def save_rules(course_id: int, request: Request, min_progress_percent: float = Form(100), min_grade_percent: str = Form(""), certificate_title: str = Form("Certificate of Completion"), certificate_enabled: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/completion")
+        if isinstance(user, RedirectResponse):
+            return user
+        if min_progress_percent < 0 or min_progress_percent > 100:
+            raise HTTPException(400, "Minimum progress must be between 0 and 100.")
+        grade = None
+        if min_grade_percent.strip():
+            try:
+                grade = float(min_grade_percent)
+            except ValueError as exc:
+                raise HTTPException(400, "Minimum grade must be numeric.") from exc
+            if grade < 0 or grade > 100:
+                raise HTTPException(400, "Minimum grade must be between 0 and 100.")
+        title = certificate_title.strip() or "Certificate of Completion"
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            existing = rows(execute(conn, "SELECT course_id FROM nuvedra_course_completion_rules WHERE course_id=?", (course_id,)))
+            if existing:
+                execute(conn, """UPDATE nuvedra_course_completion_rules SET min_progress_percent=?,min_grade_percent=?,certificate_enabled=?,certificate_title=?,updated_by=?,updated_at=? WHERE course_id=?""", (min_progress_percent, grade, 1 if certificate_enabled else 0, title, user["email"], now, course_id))
+            else:
+                execute(conn, """INSERT INTO nuvedra_course_completion_rules (course_id,min_progress_percent,min_grade_percent,certificate_enabled,certificate_title,updated_by,updated_at) VALUES (?,?,?,?,?,?,?)""", (course_id, min_progress_percent, grade, 1 if certificate_enabled else 0, title, user["email"], now))
+            audit(conn, user["email"], "completion_rules_updated", "course", str(course_id), title, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/completion", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/completion/required/{{item_id}}/toggle", response_model=None)
+    async def toggle_required(course_id: int, item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/completion")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            item_course_id, _item, _module = academic_access.item_bundle(conn, item_id)
+            if item_course_id != course_id:
+                raise HTTPException(400, "The required activity must belong to this course.")
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_completion_required_items WHERE course_id=? AND item_id=?", (course_id, item_id)))
+            if existing:
+                execute(conn, "DELETE FROM nuvedra_completion_required_items WHERE id=?", (int(existing[0]["id"]),))
+                action = "completion_requirement_removed"
+            else:
+                execute(conn, "INSERT INTO nuvedra_completion_required_items (course_id,item_id,created_by,created_at) VALUES (?,?,?,?)", (course_id, item_id, user["email"], utcnow()))
+                action = "completion_requirement_added"
+            audit(conn, user["email"], action, "item", str(item_id), f"course={course_id}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/completion", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/completion/{{student_email}}/award", response_model=None)
+    async def award_certificate(course_id: int, student_email: str, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/completion")
+        if isinstance(user, RedirectResponse):
+            return user
+        email = student_email.strip().lower()
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            academic_access.require_course_role(conn, course_id, email, {"student"})
+            status = completion_status_for_student(conn, course_id, email)
+            rule = status["rule"]
+            if not int(rule.get("certificate_enabled") or 0):
+                raise HTTPException(409, "Certificate awards are disabled for this course.")
+            if not status["eligible"]:
+                raise HTTPException(409, "This learner does not currently satisfy the course completion criteria.")
+            existing = _completion(conn, course_id, email)
+            if existing and str(existing.get("status")) == "active":
+                raise HTTPException(409, "An active certificate has already been awarded to this learner.")
+            code = _new_code(conn)
+            title = str(rule.get("certificate_title") or "Certificate of Completion")
+            now = utcnow()
+            if existing:
+                execute(conn, """UPDATE nuvedra_course_completions SET verification_code=?,certificate_title=?,progress_percent=?,grade_percent=?,status='active',awarded_by=?,awarded_at=?,revoked_at=NULL WHERE id=?""", (code, title, status["progress"], status["grade"], user["email"], now, int(existing["id"])))
+            else:
+                execute(conn, """INSERT INTO nuvedra_course_completions (course_id,student_email,verification_code,certificate_title,progress_percent,grade_percent,status,awarded_by,awarded_at,revoked_at) VALUES (?,?,?,?,?,?,'active',?,?,NULL)""", (course_id, email, code, title, status["progress"], status["grade"], user["email"], now))
+            execute(conn, """INSERT INTO nuvedra_notifications (recipient_email,course_id,title,message,href,kind,read_at,created_at) VALUES (?,?,?,?,?,'completion',NULL,?)""", (email, course_id, "Course completion certificate awarded", f"Your certificate for this course is ready. Verification code: {code}", f"/learn/certificates/{code}", now))
+            audit(conn, user["email"], "course_certificate_awarded", "course", str(course_id), email, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/completion", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/completion/{{student_email}}/revoke", response_model=None)
+    async def revoke_certificate(course_id: int, student_email: str, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/completion")
+        if isinstance(user, RedirectResponse):
+            return user
+        email = student_email.strip().lower()
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            existing = _completion(conn, course_id, email)
+            if not existing or str(existing.get("status")) != "active":
+                raise HTTPException(404, "Active certificate not found.")
+            execute(conn, "UPDATE nuvedra_course_completions SET status='revoked',revoked_at=? WHERE id=?", (utcnow(), int(existing["id"])))
+            audit(conn, user["email"], "course_certificate_revoked", "course", str(course_id), email, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/completion", status_code=303)
+
+    @app.get("/learn/completions", response_class=HTMLResponse, response_model=None)
+    async def student_completions(request: Request):
+        user = _user(request, "/learn/completions")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            courses = rows(execute(conn, """SELECT c.id,c.course_code,c.title FROM nexus_admin_enrollments e
+                JOIN nexus_admin_courses c ON c.id=e.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role='student' AND c.status='active'
+                ORDER BY c.title""", (user["email"].lower(),)))
+            cards = []
+            for course in courses:
+                cid = int(course["id"])
+                status = completion_status_for_student(conn, cid, user["email"])
+                award = _completion(conn, cid, user["email"])
+                active_award = award if award and str(award.get("status")) == "active" else None
+                grade_text = "—" if status["grade"] is None else f"{float(status['grade']):.1f}%"
+                certificate_link = f'<a class="studio-button" href="/learn/certificates/{academic_access.esc(active_award["verification_code"], attr=True)}">View certificate</a>' if active_award else ''
+                cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(course.get('course_code'))}</p><h3>{academic_access.esc(course.get('title'))}</h3><p><strong>{status['progress']:.1f}%</strong> progress · Grade {grade_text} · Required {status['required_complete']}/{status['required_total']}</p><p><strong>{'Completion criteria satisfied' if status['eligible'] else 'Completion criteria pending'}</strong></p>{certificate_link}</article>''')
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-completions-v1"><nav class="studio-breadcrumbs"><a href="/learn/dashboard">Dashboard</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="My Completion & Certificates" data-i18n-es="Mi finalización y certificados">My Completion & Certificates</p><h2 data-i18n-en="Track course completion" data-i18n-es="Revise la finalización de sus cursos">Track course completion</h2><p data-i18n-en="Review your current completion criteria and certificates awarded by your instructor." data-i18n-es="Revise sus criterios de finalización y certificados emitidos por su instructor.">Review your current completion criteria and certificates awarded by your instructor.</p></div></header><section class="studio-grid">{''.join(cards) or '<section class="studio-empty">No active student courses.</section>'}</section></main>'''
+        return academic_access.portal_page("My Completion", body, user)
+
+    @app.get("/learn/certificates/{verification_code}", response_class=HTMLResponse, response_model=None)
+    async def student_certificate(verification_code: str, request: Request):
+        user = _user(request, f"/learn/certificates/{verification_code}")
+        if isinstance(user, RedirectResponse):
+            return user
+        code = verification_code.strip().upper()
+        with db() as conn:
+            found = rows(execute(conn, """SELECT cc.*,c.course_code,c.title AS course_title,c.term
+                FROM nuvedra_course_completions cc JOIN nexus_admin_courses c ON c.id=cc.course_id
+                WHERE cc.verification_code=?""", (code,)))
+            if not found:
+                raise HTTPException(404, "Certificate not found.")
+            cert = found[0]
+            academic_access.require_course_role(conn, int(cert["course_id"]), user["email"], {"student"})
+            if str(cert.get("student_email") or "").lower() != user["email"].lower():
+                raise HTTPException(403, "You can only view your own certificate.")
+            if str(cert.get("status")) != "active":
+                raise HTTPException(410, "This certificate has been revoked.")
+        grade_line = "" if cert.get("grade_percent") in (None, "") else f'<p>Recorded graded score: {float(cert["grade_percent"]):.1f}%</p>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-certificate-v1"><nav class="studio-breadcrumbs"><a href="/learn/completions">My Completion</a></nav><section class="studio-panel" style="text-align:center;padding:56px 32px"><p class="studio-eyebrow">NUVEDRA · Verifiable Academic Record</p><h1>{academic_access.esc(cert.get('certificate_title'))}</h1><p>This certifies that</p><h2>{academic_access.esc(cert.get('student_email'))}</h2><p>completed the configured requirements for</p><h2>{academic_access.esc(cert.get('course_code'))}: {academic_access.esc(cert.get('course_title'))}</h2><p>{academic_access.esc(cert.get('term'))}</p><p>Completion progress: {float(cert.get('progress_percent') or 0):.1f}%</p>{grade_line}<p><strong>Awarded:</strong> {academic_access.esc(cert.get('awarded_at'))}</p><p><strong>Verification code:</strong> {academic_access.esc(code)}</p><p><a href="/verify/certificate/{academic_access.esc(code, attr=True)}">Verify this certificate</a></p><button class="studio-button" onclick="window.print()">Print certificate</button></section></main>'''
+        return academic_access.portal_page("Certificate", body, user)
+
+    @app.get("/verify/certificate/{verification_code}", response_class=HTMLResponse, response_model=None)
+    async def verify_certificate(verification_code: str):
+        code = verification_code.strip().upper()
+        with db() as conn:
+            found = rows(execute(conn, """SELECT cc.*,c.course_code,c.title AS course_title,c.term
+                FROM nuvedra_course_completions cc JOIN nexus_admin_courses c ON c.id=cc.course_id
+                WHERE cc.verification_code=?""", (code,)))
+        if not found:
+            raise HTTPException(404, "Certificate verification code not found.")
+        cert = found[0]
+        active = str(cert.get("status")) == "active"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="certificate-verification-v1"><header class="studio-hero"><div><p class="studio-eyebrow">NUVEDRA Certificate Verification</p><h2>{'Valid certificate' if active else 'Revoked certificate'}</h2><p>Verification code: {academic_access.esc(code)}</p></div></header><section class="studio-panel"><p><strong>Status:</strong> {'Valid' if active else 'Revoked'}</p><p><strong>Learner:</strong> {academic_access.esc(_mask_email(str(cert.get('student_email') or '')))}</p><p><strong>Course:</strong> {academic_access.esc(cert.get('course_code'))}: {academic_access.esc(cert.get('course_title'))}</p><p><strong>Term:</strong> {academic_access.esc(cert.get('term'))}</p><p><strong>Awarded:</strong> {academic_access.esc(cert.get('awarded_at'))}</p></section><section class="studio-panel"><p>This public verification page intentionally masks the learner email while confirming the certificate code, course, issue date, and current validity.</p></section></main>'''
+        return academic_access.portal_page("Certificate Verification", body)
+
+    print("NUVEDRA Certificates & Course Completion v1 registered: configurable criteria, required activities, instructor-reviewed awards, student certificates, revocation, notifications, and public verification.", flush=True)
