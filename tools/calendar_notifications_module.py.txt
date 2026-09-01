@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+EVENT_TYPES = {"class", "deadline", "meeting", "announcement"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _parse_local(value: str, label: str) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        raise HTTPException(400, f"{label} is required.")
+    try:
+        parsed = datetime.fromisoformat(clean)
+    except ValueError as exc:
+        raise HTTPException(400, f"{label} is not a valid date and time.") from exc
+    return parsed.isoformat(timespec="minutes")
+
+
+def _format_when(value: Any) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError:
+        return clean
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed.strftime("%b %d, %Y · %I:%M %p")
+
+
+def ensure_calendar_notifications_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_course_events (
+            id {pk}, course_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT,
+            event_type TEXT NOT NULL DEFAULT 'class', starts_at TEXT NOT NULL, ends_at TEXT,
+            location TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_notifications (
+            id {pk}, recipient_email TEXT NOT NULL, course_id INTEGER, title TEXT NOT NULL,
+            message TEXT, href TEXT, kind TEXT NOT NULL DEFAULT 'course_event',
+            read_at TEXT, created_at TEXT NOT NULL
+        )""")
+
+
+def _notify_course_students(conn: Any, course_id: int, *, title: str, message: str, href: str) -> int:
+    students = rows(execute(conn, """SELECT lower(user_email) AS email FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role='student' ORDER BY lower(user_email)""", (course_id,)))
+    now = utcnow()
+    for student in students:
+        execute(conn, "INSERT INTO nuvedra_notifications (recipient_email,course_id,title,message,href,kind,read_at,created_at) VALUES (?,?,?,?,?,'course_event',NULL,?)",
+                (student["email"], course_id, title, message, href, now))
+    return len(students)
+
+
+def _course_events(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, "SELECT * FROM nuvedra_course_events WHERE course_id=? AND status='active' ORDER BY starts_at,id", (course_id,)))
+
+
+def _due_items(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.id,i.title,i.due_at,i.item_type,m.title AS module_title
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND m.status='published' AND i.status='published'
+          AND i.due_at IS NOT NULL AND TRIM(i.due_at)<>''
+        ORDER BY i.due_at,i.id""", (course_id,)))
+
+
+def register_calendar_notifications(app: FastAPI) -> None:
+    ensure_calendar_notifications_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/calendar", response_class=HTMLResponse, response_model=None)
+    async def instructor_calendar(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/calendar")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            events = _course_events(conn, course_id)
+            due_items = _due_items(conn, course_id)
+        event_cards = "".join(
+            f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(event.get('event_type'))}</p><h3>{academic_access.esc(event.get('title'))}</h3><p>{academic_access.esc(event.get('description'))}</p><p><strong>{academic_access.esc(_format_when(event.get('starts_at')))}</strong>{(' · '+academic_access.esc(event.get('location'))) if event.get('location') else ''}</p><form method="post" action="{STUDIO_PREFIX}/events/{int(event['id'])}/archive" data-confirm data-confirm-en="Archive this calendar event?" data-confirm-es="¿Archivar este evento del calendario?"><button class="studio-button studio-button--quiet" data-i18n-en="Archive" data-i18n-es="Archivar">Archive</button></form></article>'''
+            for event in events
+        ) or '<section class="studio-empty" data-i18n-en="No instructor-created events yet." data-i18n-es="Todavía no hay eventos creados por el instructor.">No instructor-created events yet.</section>'
+        due_cards = "".join(
+            f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(item.get('module_title'))} · {academic_access.esc(item.get('item_type'))}</p><h3>{academic_access.esc(item.get('title'))}</h3><p><strong>{academic_access.esc(_format_when(item.get('due_at')))}</strong></p><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/items/{int(item['id'])}/edit" data-i18n-en="Edit content" data-i18n-es="Editar contenido">Edit content</a></article>'''
+            for item in due_items
+        ) or '<section class="studio-empty" data-i18n-en="No published due dates yet." data-i18n-es="Todavía no hay fechas límite publicadas.">No published due dates yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="course-calendar-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Course Calendar" data-i18n-es="Calendario del curso">Course Calendar</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Coordinate class meetings, milestones, announcements, and published due dates." data-i18n-es="Coordine reuniones, hitos, anuncios y fechas límite publicadas.">Coordinate class meetings, milestones, announcements, and published due dates.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Create calendar event" data-i18n-es="Crear evento del calendario">Create calendar event</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/calendar/events" class="studio-form"><label><span data-i18n-en="Title" data-i18n-es="Título">Title</span><input name="title" required maxlength="180"></label><label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description" rows="3"></textarea></label><div class="studio-form-grid"><label><span data-i18n-en="Type" data-i18n-es="Tipo">Type</span><select name="event_type"><option value="class">Class</option><option value="deadline">Milestone</option><option value="meeting">Meeting</option><option value="announcement">Announcement</option></select></label><label><span data-i18n-en="Starts" data-i18n-es="Comienza">Starts</span><input type="datetime-local" name="starts_at" required></label><label><span data-i18n-en="Ends (optional)" data-i18n-es="Termina (opcional)">Ends (optional)</span><input type="datetime-local" name="ends_at"></label><label><span data-i18n-en="Location or meeting link" data-i18n-es="Lugar o enlace de reunión">Location or meeting link</span><input name="location"></label></div><button class="studio-button" data-i18n-en="Create event and notify students" data-i18n-es="Crear evento y notificar estudiantes">Create event and notify students</button></form></section><section class="studio-section"><h2 data-i18n-en="Course events" data-i18n-es="Eventos del curso">Course events</h2><div class="studio-grid">{event_cards}</div></section><section class="studio-section"><h2 data-i18n-en="Published due dates" data-i18n-es="Fechas límite publicadas">Published due dates</h2><div class="studio-grid">{due_cards}</div></section></main>'''
+        return academic_access.portal_page("Course Calendar", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/calendar/events", response_model=None)
+    async def create_calendar_event(course_id: int, request: Request, title: str = Form(...), description: str = Form(""), event_type: str = Form("class"), starts_at: str = Form(...), ends_at: str = Form(""), location: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/calendar")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_title = title.strip()
+        if not clean_title:
+            raise HTTPException(400, "Event title is required.")
+        clean_type = event_type if event_type in EVENT_TYPES else "class"
+        start_value = _parse_local(starts_at, "Start date")
+        end_value = _parse_local(ends_at, "End date") if ends_at.strip() else ""
+        if end_value and datetime.fromisoformat(end_value) < datetime.fromisoformat(start_value):
+            raise HTTPException(400, "End date cannot be before the start date.")
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            execute(conn, "INSERT INTO nuvedra_course_events (course_id,title,description,event_type,starts_at,ends_at,location,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,'active',?,?,?)",
+                    (course_id, clean_title, description.strip(), clean_type, start_value, end_value, location.strip(), user["email"], now, now))
+            count = _notify_course_students(conn, course_id, title=clean_title, message=f"{course.get('course_code')}: {_format_when(start_value)}", href="/learn/calendar")
+            audit(conn, user["email"], "course_calendar_event_created", "course", str(course_id), f"{clean_title}; notified={count}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/calendar", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/events/{{event_id}}/archive", response_model=None)
+    async def archive_calendar_event(event_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            found = rows(execute(conn, "SELECT * FROM nuvedra_course_events WHERE id=?", (event_id,)))
+            if not found:
+                raise HTTPException(404, "Calendar event not found.")
+            event = found[0]
+            course_id = int(event["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            execute(conn, "UPDATE nuvedra_course_events SET status='archived',updated_at=? WHERE id=?", (utcnow(), event_id))
+            audit(conn, user["email"], "course_calendar_event_archived", "event", str(event_id), str(event.get("title") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/calendar", status_code=303)
+
+    @app.get("/learn/calendar", response_class=HTMLResponse, response_model=None)
+    async def student_calendar(request: Request):
+        user = _user(request, "/learn/calendar")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            enrollments = rows(execute(conn, """SELECT e.course_id,e.course_role,c.course_code,c.title FROM nexus_admin_enrollments e
+                JOIN nexus_admin_courses c ON c.id=e.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ('student','observer') AND c.status='active'
+                ORDER BY c.title""", (user["email"].lower(),)))
+            entries: list[tuple[str, str, str, str, str]] = []
+            for enrollment in enrollments:
+                course_id = int(enrollment["course_id"])
+                for event in _course_events(conn, course_id):
+                    entries.append((str(event.get("starts_at") or ""), str(enrollment.get("course_code") or ""), str(event.get("title") or ""), str(event.get("event_type") or "event"), str(event.get("description") or "")))
+                for item in _due_items(conn, course_id):
+                    entries.append((str(item.get("due_at") or ""), str(enrollment.get("course_code") or ""), str(item.get("title") or ""), "due", f"{item.get('module_title') or ''} · {item.get('item_type') or ''}"))
+        entries.sort(key=lambda entry: entry[0])
+        cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(code)} · {academic_access.esc(kind)}</p><h3>{academic_access.esc(title)}</h3><p>{academic_access.esc(description)}</p><p><strong>{academic_access.esc(_format_when(when))}</strong></p></article>''' for when, code, title, kind, description in entries) or '<section class="studio-empty" data-i18n-en="No upcoming course dates are available." data-i18n-es="No hay fechas próximas de cursos disponibles.">No upcoming course dates are available.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-calendar-v1"><nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a><span>/</span><a href="/portal/notifications" data-i18n-en="Notifications" data-i18n-es="Notificaciones">Notifications</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="My Calendar" data-i18n-es="Mi calendario">My Calendar</p><h2 data-i18n-en="Course dates in one place" data-i18n-es="Fechas de cursos en un solo lugar">Course dates in one place</h2><p data-i18n-en="See instructor-created events and published due dates across your active courses." data-i18n-es="Consulte eventos creados por instructores y fechas límite publicadas de sus cursos activos.">See instructor-created events and published due dates across your active courses.</p></div></header><section class="studio-grid">{cards}</section></main>'''
+        return academic_access.portal_page("My Calendar", body, user)
+
+    @app.get("/portal/notifications", response_class=HTMLResponse, response_model=None)
+    async def notifications_center(request: Request):
+        user = _user(request, "/portal/notifications")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            notifications = rows(execute(conn, "SELECT * FROM nuvedra_notifications WHERE lower(recipient_email)=? ORDER BY created_at DESC,id DESC LIMIT 100", (user["email"].lower(),)))
+        unread = sum(1 for item in notifications if not item.get("read_at"))
+        cards = "".join(f'''<article class="studio-panel" data-notification-read="{'1' if item.get('read_at') else '0'}"><p class="studio-eyebrow">{academic_access.esc(item.get('kind'))}</p><h3>{academic_access.esc(item.get('title'))}</h3><p>{academic_access.esc(item.get('message'))}</p><div class="studio-actions">{f'<a class="studio-button studio-button--quiet" href="{academic_access.esc(item.get("href"), attr=True)}" data-i18n-en="Open" data-i18n-es="Abrir">Open</a>' if item.get('href') else ''}{f'<form method="post" action="/portal/notifications/{int(item["id"])}/read"><button class="studio-button studio-button--quiet" data-i18n-en="Mark read" data-i18n-es="Marcar como leída">Mark read</button></form>' if not item.get('read_at') else '<span data-i18n-en="Read" data-i18n-es="Leída">Read</span>'}</div></article>''' for item in notifications) or '<section class="studio-empty" data-i18n-en="No notifications yet." data-i18n-es="Todavía no hay notificaciones.">No notifications yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="notifications-center-v1"><nav class="studio-breadcrumbs"><a href="/portal" data-i18n-en="My courses" data-i18n-es="Mis cursos">My courses</a><span>/</span><a href="/learn/calendar" data-i18n-en="Calendar" data-i18n-es="Calendario">Calendar</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Notifications" data-i18n-es="Notificaciones">Notifications</p><h2><span data-i18n-en="Unread" data-i18n-es="No leídas">Unread</span>: {unread}</h2></div></header><section class="studio-grid">{cards}</section></main>'''
+        return academic_access.portal_page("Notifications", body, user)
+
+    @app.post("/portal/notifications/{notification_id}/read", response_model=None)
+    async def mark_notification_read(notification_id: int, request: Request):
+        user = _user(request, "/portal/notifications")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            found = rows(execute(conn, "SELECT id FROM nuvedra_notifications WHERE id=? AND lower(recipient_email)=?", (notification_id, user["email"].lower())))
+            if not found:
+                raise HTTPException(404, "Notification not found.")
+            execute(conn, "UPDATE nuvedra_notifications SET read_at=? WHERE id=?", (utcnow(), notification_id))
+        return RedirectResponse("/portal/notifications", status_code=303)
+
+    print("NUVEDRA Calendar and Notifications v1 registered: instructor course events, student calendar, due dates, and in-app notifications.", flush=True)
