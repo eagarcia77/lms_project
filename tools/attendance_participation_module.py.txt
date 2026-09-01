@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+import csv
+import io
+from datetime import date
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+ATTENDANCE_STATUSES = {"unmarked", "present", "absent", "late", "excused"}
+PARTICIPATION_CATEGORIES = {"contribution", "discussion", "teamwork", "presentation", "other"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def ensure_attendance_participation_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_attendance_sessions (
+            id {pk}, course_id INTEGER NOT NULL, title TEXT NOT NULL,
+            session_date TEXT NOT NULL, notes TEXT, status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_attendance_records (
+            id {pk}, session_id INTEGER NOT NULL, student_email TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unmarked', minutes_late INTEGER NOT NULL DEFAULT 0,
+            note TEXT, marked_by TEXT, updated_at TEXT NOT NULL,
+            UNIQUE(session_id,student_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_participation_entries (
+            id {pk}, course_id INTEGER NOT NULL, student_email TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'contribution', points REAL NOT NULL DEFAULT 0,
+            note TEXT, recorded_on TEXT NOT NULL, created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+
+
+def _course_students(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT lower(user_email) AS student_email
+        FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role='student'
+        ORDER BY lower(user_email)""", (course_id,)))
+
+
+def _session(conn: Any, session_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT s.*,c.course_code,c.title AS course_title,c.status AS course_status
+        FROM nuvedra_attendance_sessions s JOIN nexus_admin_courses c ON c.id=s.course_id
+        WHERE s.id=?""", (session_id,)))
+    if not found:
+        raise HTTPException(404, "Attendance session not found.")
+    return found[0]
+
+
+def _author_session(conn: Any, session_id: int, email: str) -> dict[str, Any]:
+    session = _session(conn, session_id)
+    academic_access.require_course_role(conn, int(session["course_id"]), email, academic_access.AUTHOR_ROLES)
+    return session
+
+
+def _seed_session_records(conn: Any, session_id: int, course_id: int) -> None:
+    now = utcnow()
+    for student in _course_students(conn, course_id):
+        email = str(student.get("student_email") or "").lower()
+        if not email:
+            continue
+        existing = rows(execute(conn, "SELECT id FROM nuvedra_attendance_records WHERE session_id=? AND lower(student_email)=?", (session_id, email)))
+        if not existing:
+            execute(conn, """INSERT INTO nuvedra_attendance_records
+                (session_id,student_email,status,minutes_late,note,marked_by,updated_at)
+                VALUES (?,?,'unmarked',0,'',NULL,?)""", (session_id, email, now))
+
+
+def attendance_summary_for_student(conn: Any, course_id: int, email: str) -> dict[str, Any]:
+    counts = {status: 0 for status in ATTENDANCE_STATUSES}
+    records = rows(execute(conn, """SELECT r.status
+        FROM nuvedra_attendance_records r
+        JOIN nuvedra_attendance_sessions s ON s.id=r.session_id
+        WHERE s.course_id=? AND s.status='active' AND lower(r.student_email)=?""",
+        (course_id, email.lower())))
+    for record in records:
+        status = str(record.get("status") or "unmarked")
+        if status in counts:
+            counts[status] += 1
+    denominator = counts["present"] + counts["late"] + counts["absent"]
+    attended = counts["present"] + counts["late"]
+    rate = round((attended / denominator) * 100, 1) if denominator else None
+    participation = rows(execute(conn, """SELECT COALESCE(SUM(points),0) AS points,COUNT(*) AS total
+        FROM nuvedra_participation_entries WHERE course_id=? AND lower(student_email)=?""",
+        (course_id, email.lower())))
+    part_points = float(participation[0].get("points") or 0) if participation else 0.0
+    part_entries = int(participation[0].get("total") or 0) if participation else 0
+    return {
+        **counts,
+        "recorded_sessions": denominator + counts["excused"],
+        "attendance_rate": rate,
+        "participation_points": part_points,
+        "participation_entries": part_entries,
+    }
+
+
+def _course_summaries(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    result = []
+    for student in _course_students(conn, course_id):
+        email = str(student.get("student_email") or "").lower()
+        result.append({"email": email, **attendance_summary_for_student(conn, course_id, email)})
+    return result
+
+
+def _status_options(current: str) -> str:
+    labels = [
+        ("unmarked", "Unmarked"), ("present", "Present"), ("absent", "Absent"),
+        ("late", "Late"), ("excused", "Excused"),
+    ]
+    return "".join(f'<option value="{value}"{" selected" if current == value else ""}>{label}</option>' for value, label in labels)
+
+
+def register_attendance_participation(app: FastAPI) -> None:
+    ensure_attendance_participation_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/attendance", response_class=HTMLResponse, response_model=None)
+    async def attendance_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            sessions = rows(execute(conn, """SELECT s.*,
+                (SELECT COUNT(*) FROM nuvedra_attendance_records r WHERE r.session_id=s.id AND r.status<>'unmarked') AS marked_count
+                FROM nuvedra_attendance_sessions s WHERE s.course_id=? AND s.status='active'
+                ORDER BY s.session_date DESC,s.id DESC""", (course_id,)))
+            summaries = _course_summaries(conn, course_id)
+            participation = rows(execute(conn, """SELECT * FROM nuvedra_participation_entries
+                WHERE course_id=? ORDER BY recorded_on DESC,id DESC LIMIT 20""", (course_id,)))
+        session_cards = "".join(
+            f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(session.get('session_date'))}</p><h3>{academic_access.esc(session.get('title'))}</h3><p>{academic_access.esc(session.get('notes'))}</p><p><strong>{int(session.get('marked_count') or 0)}</strong> <span data-i18n-en="students marked" data-i18n-es="estudiantes registrados">students marked</span></p><a class="studio-button" href="{STUDIO_PREFIX}/attendance/sessions/{int(session['id'])}" data-i18n-en="Take attendance" data-i18n-es="Tomar asistencia">Take attendance</a></article>'''
+            for session in sessions
+        ) or '<section class="studio-empty" data-i18n-en="No attendance sessions yet." data-i18n-es="Todavía no hay sesiones de asistencia.">No attendance sessions yet.</section>'
+        summary_rows = "".join(
+            f'''<tr><td><strong>{academic_access.esc(row['email'])}</strong></td><td>{'—' if row['attendance_rate'] is None else f"{row['attendance_rate']:.1f}%"}</td><td>{row['present']}</td><td>{row['late']}</td><td>{row['absent']}</td><td>{row['excused']}</td><td>{row['participation_points']:.1f}</td><td>{row['participation_entries']}</td></tr>'''
+            for row in summaries
+        ) or '<tr><td colspan="8">No active students yet.</td></tr>'
+        participation_rows = "".join(
+            f'''<tr><td>{academic_access.esc(row.get('recorded_on'))}</td><td>{academic_access.esc(row.get('student_email'))}</td><td>{academic_access.esc(row.get('category'))}</td><td>{float(row.get('points') or 0):.1f}</td><td>{academic_access.esc(row.get('note'))}</td></tr>'''
+            for row in participation
+        ) or '<tr><td colspan="5">No participation entries yet.</td></tr>'
+        student_options = "".join(f'<option value="{academic_access.esc(row["email"], attr=True)}">{academic_access.esc(row["email"])}</option>' for row in summaries)
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="attendance-participation-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}/analytics" data-i18n-en="Learning Analytics" data-i18n-es="Analítica de aprendizaje">Learning Analytics</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Attendance & Participation" data-i18n-es="Asistencia y participación">Attendance & Participation</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Track class attendance and participation evidence. Excused sessions are excluded from the attendance-rate denominator, and participation points do not change Gradebook scores automatically." data-i18n-es="Registre asistencia y evidencia de participación. Las ausencias excusadas se excluyen del denominador de asistencia y los puntos de participación no cambian automáticamente el Gradebook.">Track class attendance and participation evidence. Excused sessions are excluded from the attendance-rate denominator, and participation points do not change Gradebook scores automatically.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/attendance.csv" data-i18n-en="Export CSV" data-i18n-es="Exportar CSV">Export CSV</a></div></header><section class="studio-grid"><article class="studio-panel"><h3 data-i18n-en="Create attendance session" data-i18n-es="Crear sesión de asistencia">Create attendance session</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/attendance/sessions" class="studio-form"><label><span data-i18n-en="Title" data-i18n-es="Título">Title</span><input name="title" required maxlength="180" placeholder="Class meeting"></label><label><span data-i18n-en="Date" data-i18n-es="Fecha">Date</span><input type="date" name="session_date" value="{date.today().isoformat()}" required></label><label><span data-i18n-en="Notes" data-i18n-es="Notas">Notes</span><textarea name="notes" rows="3"></textarea></label><button class="studio-button" data-i18n-en="Create session" data-i18n-es="Crear sesión">Create session</button></form></article><article class="studio-panel"><h3 data-i18n-en="Record participation" data-i18n-es="Registrar participación">Record participation</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/participation" class="studio-form"><label><span data-i18n-en="Student" data-i18n-es="Estudiante">Student</span><select name="student_email" required>{student_options}</select></label><label><span data-i18n-en="Category" data-i18n-es="Categoría">Category</span><select name="category"><option value="contribution">Contribution</option><option value="discussion">Discussion</option><option value="teamwork">Teamwork</option><option value="presentation">Presentation</option><option value="other">Other</option></select></label><label><span data-i18n-en="Participation points" data-i18n-es="Puntos de participación">Participation points</span><input type="number" name="points" min="0" max="10" step="0.5" value="1"></label><label><span data-i18n-en="Evidence / note" data-i18n-es="Evidencia / nota">Evidence / note</span><textarea name="note" rows="3"></textarea></label><button class="studio-button" data-i18n-en="Record participation" data-i18n-es="Registrar participación">Record participation</button></form></article></section><section class="studio-section"><h2 data-i18n-en="Attendance sessions" data-i18n-es="Sesiones de asistencia">Attendance sessions</h2><div class="studio-grid">{session_cards}</div></section><section class="studio-panel"><h2 data-i18n-en="Student summary" data-i18n-es="Resumen por estudiante">Student summary</h2><div style="overflow:auto"><table><thead><tr><th>Student</th><th>Attendance rate</th><th>Present</th><th>Late</th><th>Absent</th><th>Excused</th><th>Participation points</th><th>Entries</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section><section class="studio-panel"><h2 data-i18n-en="Recent participation evidence" data-i18n-es="Evidencia reciente de participación">Recent participation evidence</h2><div style="overflow:auto"><table><thead><tr><th>Date</th><th>Student</th><th>Category</th><th>Points</th><th>Note</th></tr></thead><tbody>{participation_rows}</tbody></table></div></section></main>'''
+        return academic_access.portal_page("Attendance & Participation", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/attendance/sessions", response_model=None)
+    async def create_attendance_session(course_id: int, request: Request, title: str = Form(...), session_date: str = Form(...), notes: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_title = title.strip()
+        clean_date = session_date.strip()
+        if not clean_title or not clean_date:
+            raise HTTPException(400, "Session title and date are required.")
+        try:
+            date.fromisoformat(clean_date)
+        except ValueError as exc:
+            raise HTTPException(400, "Attendance date must be a valid ISO date.") from exc
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            session_id = _insert_id(conn, """INSERT INTO nuvedra_attendance_sessions
+                (course_id,title,session_date,notes,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,'active',?,?,?)""", (course_id, clean_title, clean_date, notes.strip(), user["email"], now, now))
+            _seed_session_records(conn, session_id, course_id)
+            audit(conn, user["email"], "attendance_session_created", "attendance_session", str(session_id), clean_date, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/attendance/sessions/{session_id}", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/attendance/sessions/{{session_id}}", response_class=HTMLResponse, response_model=None)
+    async def attendance_session(session_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/attendance/sessions/{session_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            session = _author_session(conn, session_id, user["email"])
+            _seed_session_records(conn, session_id, int(session["course_id"]))
+            records = rows(execute(conn, "SELECT * FROM nuvedra_attendance_records WHERE session_id=? ORDER BY lower(student_email)", (session_id,)))
+        record_rows = "".join(
+            f'''<tr><td><strong>{academic_access.esc(record.get('student_email'))}</strong></td><td><form method="post" action="{STUDIO_PREFIX}/attendance/sessions/{session_id}/records/{int(record['id'])}" class="studio-form"><select name="status">{_status_options(str(record.get('status') or 'unmarked'))}</select></td><td><input type="number" name="minutes_late" min="0" max="240" value="{int(record.get('minutes_late') or 0)}"></td><td><input name="note" maxlength="500" value="{academic_access.esc(record.get('note'), attr=True)}"></td><td><button class="studio-button studio-button--quiet" data-i18n-en="Save" data-i18n-es="Guardar">Save</button></form></td></tr>'''
+            for record in records
+        )
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="attendance-session-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{int(session['course_id'])}/attendance" data-i18n-en="Attendance & Participation" data-i18n-es="Asistencia y participación">Attendance & Participation</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(session.get('session_date'))}</p><h2>{academic_access.esc(session.get('title'))}</h2><p>{academic_access.esc(session.get('notes'))}</p></div></header><section class="studio-panel"><p class="studio-notice" data-i18n-en="Late counts as attended. Excused records are excluded from the attendance-rate denominator. Unmarked records are ignored until saved." data-i18n-es="Tarde cuenta como asistencia. Los registros excusados se excluyen del denominador y los no marcados se ignoran hasta guardarse.">Late counts as attended. Excused records are excluded from the attendance-rate denominator. Unmarked records are ignored until saved.</p><div style="overflow:auto"><table><thead><tr><th>Student</th><th>Status</th><th>Minutes late</th><th>Note</th><th>Action</th></tr></thead><tbody>{record_rows}</tbody></table></div></section><section class="studio-panel"><form method="post" action="{STUDIO_PREFIX}/attendance/sessions/{session_id}/archive" data-confirm data-confirm-en="Archive this attendance session?" data-confirm-es="¿Archivar esta sesión de asistencia?"><button class="studio-button studio-button--quiet" data-i18n-en="Archive session" data-i18n-es="Archivar sesión">Archive session</button></form></section></main>'''
+        return academic_access.portal_page("Attendance Session", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/attendance/sessions/{{session_id}}/records/{{record_id}}", response_model=None)
+    async def save_attendance_record(session_id: int, record_id: int, request: Request, status: str = Form(...), minutes_late: int = Form(0), note: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/attendance/sessions/{session_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_status = status.strip().lower()
+        if clean_status not in ATTENDANCE_STATUSES:
+            raise HTTPException(400, "Invalid attendance status.")
+        if minutes_late < 0 or minutes_late > 240:
+            raise HTTPException(400, "Minutes late must be between 0 and 240.")
+        with db() as conn:
+            _author_session(conn, session_id, user["email"])
+            record = rows(execute(conn, "SELECT * FROM nuvedra_attendance_records WHERE id=? AND session_id=?", (record_id, session_id)))
+            if not record:
+                raise HTTPException(404, "Attendance record not found.")
+            execute(conn, """UPDATE nuvedra_attendance_records
+                SET status=?,minutes_late=?,note=?,marked_by=?,updated_at=? WHERE id=?""",
+                (clean_status, minutes_late if clean_status == "late" else 0, note.strip(), user["email"], utcnow(), record_id))
+            audit(conn, user["email"], "attendance_record_updated", "attendance_record", str(record_id), f"status={clean_status}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/attendance/sessions/{session_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/attendance/sessions/{{session_id}}/archive", response_model=None)
+    async def archive_attendance_session(session_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/attendance/sessions/{session_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            session = _author_session(conn, session_id, user["email"])
+            execute(conn, "UPDATE nuvedra_attendance_sessions SET status='archived',updated_at=? WHERE id=?", (utcnow(), session_id))
+            audit(conn, user["email"], "attendance_session_archived", "attendance_session", str(session_id), "", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(session['course_id'])}/attendance", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/participation", response_model=None)
+    async def record_participation(course_id: int, request: Request, student_email: str = Form(...), category: str = Form("contribution"), points: float = Form(1), note: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        email = student_email.strip().lower()
+        clean_category = category.strip().lower()
+        if clean_category not in PARTICIPATION_CATEGORIES:
+            raise HTTPException(400, "Invalid participation category.")
+        if points < 0 or points > 10:
+            raise HTTPException(400, "Participation points must be between 0 and 10.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            academic_access.require_course_role(conn, course_id, email, {"student"})
+            execute(conn, """INSERT INTO nuvedra_participation_entries
+                (course_id,student_email,category,points,note,recorded_on,created_by,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""", (course_id, email, clean_category, points, note.strip(), date.today().isoformat(), user["email"], utcnow()))
+            audit(conn, user["email"], "participation_recorded", "course", str(course_id), f"student={email}; points={points}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/attendance", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/attendance.csv", response_model=None)
+    async def export_attendance(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            summaries = _course_summaries(conn, course_id)
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["Student", "Attendance rate percent", "Present", "Late", "Absent", "Excused", "Unmarked", "Participation points", "Participation entries"])
+        for row in summaries:
+            writer.writerow([row["email"], "" if row["attendance_rate"] is None else row["attendance_rate"], row["present"], row["late"], row["absent"], row["excused"], row["unmarked"], row["participation_points"], row["participation_entries"]])
+        filename = f"{str(course.get('course_code') or 'course').replace(' ', '_')}-attendance-participation.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/learn/attendance", response_class=HTMLResponse, response_model=None)
+    async def student_attendance_home(request: Request):
+        user = _user(request, "/learn/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            courses = rows(execute(conn, """SELECT c.id,c.course_code,c.title
+                FROM nexus_admin_enrollments e JOIN nexus_admin_courses c ON c.id=e.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role='student' AND c.status='active'
+                ORDER BY c.title""", (user["email"].lower(),)))
+            data = [(course, attendance_summary_for_student(conn, int(course["id"]), user["email"])) for course in courses]
+        cards = "".join(
+            f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(course.get('course_code'))}</p><h3>{academic_access.esc(course.get('title'))}</h3><p><strong>{'—' if summary['attendance_rate'] is None else f"{summary['attendance_rate']:.1f}%"}</strong> <span data-i18n-en="attendance rate" data-i18n-es="tasa de asistencia">attendance rate</span></p><p>{summary['present']} present · {summary['late']} late · {summary['absent']} absent · {summary['excused']} excused</p><p><strong>{summary['participation_points']:.1f}</strong> <span data-i18n-en="participation points recorded" data-i18n-es="puntos de participación registrados">participation points recorded</span></p><a class="studio-button" href="/learn/courses/{int(course['id'])}/attendance" data-i18n-en="View details" data-i18n-es="Ver detalles">View details</a></article>'''
+            for course, summary in data
+        ) or '<section class="studio-empty" data-i18n-en="No active student courses." data-i18n-es="No hay cursos activos del estudiante.">No active student courses.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-attendance-v1"><nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="My Attendance & Participation" data-i18n-es="Mi asistencia y participación">My Attendance & Participation</p><h2 data-i18n-en="Review your course records" data-i18n-es="Revise sus registros del curso">Review your course records</h2><p data-i18n-en="Excused sessions do not reduce the attendance rate. Participation points are evidence recorded by the instructor and are not automatically Gradebook points." data-i18n-es="Las sesiones excusadas no reducen la tasa de asistencia. Los puntos de participación son evidencia registrada por el instructor y no pasan automáticamente al Gradebook.">Excused sessions do not reduce the attendance rate. Participation points are evidence recorded by the instructor and are not automatically Gradebook points.</p></div></header><section class="studio-grid">{cards}</section></main>'''
+        return academic_access.portal_page("My Attendance & Participation", body, user)
+
+    @app.get("/learn/courses/{course_id}/attendance", response_class=HTMLResponse, response_model=None)
+    async def student_course_attendance(course_id: int, request: Request):
+        user = _user(request, f"/learn/courses/{course_id}/attendance")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            summary = attendance_summary_for_student(conn, course_id, user["email"])
+            records = rows(execute(conn, """SELECT s.session_date,s.title,r.status,r.minutes_late,r.note
+                FROM nuvedra_attendance_records r JOIN nuvedra_attendance_sessions s ON s.id=r.session_id
+                WHERE s.course_id=? AND s.status='active' AND lower(r.student_email)=?
+                ORDER BY s.session_date DESC,s.id DESC""", (course_id, user["email"].lower())))
+            participation = rows(execute(conn, """SELECT recorded_on,category,points,note
+                FROM nuvedra_participation_entries WHERE course_id=? AND lower(student_email)=?
+                ORDER BY recorded_on DESC,id DESC""", (course_id, user["email"].lower())))
+        attendance_rows = "".join(f'''<tr><td>{academic_access.esc(row.get('session_date'))}</td><td>{academic_access.esc(row.get('title'))}</td><td>{academic_access.esc(row.get('status'))}</td><td>{int(row.get('minutes_late') or 0)}</td><td>{academic_access.esc(row.get('note'))}</td></tr>''' for row in records) or '<tr><td colspan="5">No attendance records yet.</td></tr>'
+        participation_rows = "".join(f'''<tr><td>{academic_access.esc(row.get('recorded_on'))}</td><td>{academic_access.esc(row.get('category'))}</td><td>{float(row.get('points') or 0):.1f}</td><td>{academic_access.esc(row.get('note'))}</td></tr>''' for row in participation) or '<tr><td colspan="4">No participation entries yet.</td></tr>'
+        rate = "—" if summary["attendance_rate"] is None else f"{summary['attendance_rate']:.1f}%"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-course-attendance-v1"><nav class="studio-breadcrumbs"><a href="/learn/attendance" data-i18n-en="My Attendance" data-i18n-es="Mi asistencia">My Attendance</a><span>/</span><a href="/learn/courses/{course_id}" data-i18n-en="Course" data-i18n-es="Curso">Course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(course.get('course_code'))}</p><h2>{academic_access.esc(course.get('title'))}</h2><p><strong>{rate}</strong> attendance rate · <strong>{summary['participation_points']:.1f}</strong> participation points</p></div></header><section class="studio-panel"><h3 data-i18n-en="Attendance history" data-i18n-es="Historial de asistencia">Attendance history</h3><div style="overflow:auto"><table><thead><tr><th>Date</th><th>Session</th><th>Status</th><th>Minutes late</th><th>Note</th></tr></thead><tbody>{attendance_rows}</tbody></table></div></section><section class="studio-panel"><h3 data-i18n-en="Participation evidence" data-i18n-es="Evidencia de participación">Participation evidence</h3><div style="overflow:auto"><table><thead><tr><th>Date</th><th>Category</th><th>Points</th><th>Note</th></tr></thead><tbody>{participation_rows}</tbody></table></div></section></main>'''
+        return academic_access.portal_page("Course Attendance", body, user)
+
+    print("NUVEDRA Attendance & Participation v1 registered: attendance sessions, Present/Absent/Late/Excused records, participation evidence, student transparency, summaries, and CSV export.", flush=True)
