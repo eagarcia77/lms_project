@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import io
+import mimetypes
+import secrets
+import time
+import urllib.parse
+import zipfile
+from pathlib import PurePosixPath
+from typing import Any
+from xml.etree import ElementTree as ET
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+MAX_SCORM_BYTES = 25 * 1024 * 1024
+MAX_SCORM_FILES = 2500
+MAX_SCORM_UNCOMPRESSED = 250 * 1024 * 1024
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _blob_type() -> str:
+    return "BYTEA" if database_url().startswith("postgres") else "BLOB"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def ensure_interoperability_schema() -> None:
+    pk = _pk()
+    blob = _blob_type()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_scorm_packages (
+            id {pk}, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL, item_id INTEGER NOT NULL UNIQUE,
+            title TEXT NOT NULL, version TEXT NOT NULL, launch_path TEXT NOT NULL, filename TEXT NOT NULL,
+            package_bytes {blob} NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_scorm_states (
+            id {pk}, package_id INTEGER NOT NULL, student_email TEXT NOT NULL,
+            completion_status TEXT NOT NULL DEFAULT 'not attempted', success_status TEXT NOT NULL DEFAULT 'unknown',
+            score_raw REAL, score_min REAL, score_max REAL, location TEXT, suspend_data TEXT, total_time TEXT,
+            updated_at TEXT NOT NULL, UNIQUE(package_id,student_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_lti_tools (
+            id {pk}, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL, item_id INTEGER NOT NULL UNIQUE,
+            title TEXT NOT NULL, launch_url TEXT NOT NULL, consumer_key TEXT NOT NULL, shared_secret TEXT NOT NULL,
+            custom_parameters TEXT, share_email INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'draft', created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+
+def _safe_zip_name(value: str) -> str:
+    clean = value.replace("\\", "/").lstrip("/")
+    path = PurePosixPath(clean)
+    if not clean or any(part in {"", ".", ".."} for part in path.parts):
+        raise HTTPException(400, "The SCORM package contains an unsafe file path.")
+    return str(path)
+
+
+def _manifest_details(package_bytes: bytes) -> tuple[str, str]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+            if len(infos) > MAX_SCORM_FILES:
+                raise HTTPException(400, f"SCORM packages may contain at most {MAX_SCORM_FILES} files.")
+            total = 0
+            manifest_name = ""
+            for info in infos:
+                safe = _safe_zip_name(info.filename)
+                total += int(info.file_size or 0)
+                if total > MAX_SCORM_UNCOMPRESSED:
+                    raise HTTPException(400, "The uncompressed SCORM package is too large.")
+                if safe.lower() == "imsmanifest.xml":
+                    manifest_name = info.filename
+            if not manifest_name:
+                raise HTTPException(400, "The ZIP file does not contain imsmanifest.xml at the package root.")
+            root = ET.fromstring(archive.read(manifest_name))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(400, "The uploaded file is not a valid ZIP package.") from exc
+    except ET.ParseError as exc:
+        raise HTTPException(400, "The SCORM manifest is not valid XML.") from exc
+
+    version_text = " ".join((node.text or "") for node in root.findall(".//{*}schemaversion")).lower()
+    version = "2004" if "2004" in version_text else "1.2"
+    organizations = root.find(".//{*}organizations")
+    identifierref = ""
+    if organizations is not None:
+        default_org = organizations.attrib.get("default", "")
+        org = None
+        if default_org:
+            for candidate in organizations.findall("{*}organization"):
+                if candidate.attrib.get("identifier") == default_org:
+                    org = candidate
+                    break
+        if org is None:
+            org = organizations.find("{*}organization")
+        if org is not None:
+            item = org.find(".//{*}item")
+            if item is not None:
+                identifierref = item.attrib.get("identifierref", "")
+    launch = ""
+    resources = root.findall(".//{*}resources/{*}resource")
+    if identifierref:
+        for resource in resources:
+            if resource.attrib.get("identifier") == identifierref and resource.attrib.get("href"):
+                launch = resource.attrib["href"]
+                break
+    if not launch:
+        for resource in resources:
+            if resource.attrib.get("href"):
+                launch = resource.attrib["href"]
+                break
+    if not launch:
+        raise HTTPException(400, "The SCORM manifest does not identify a launch resource.")
+    launch = _safe_zip_name(urllib.parse.unquote(launch.split("?", 1)[0].split("#", 1)[0]))
+    return version, launch
+
+
+def _course_modules(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, "SELECT id,title,status,position FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+
+
+def _package(conn: Any, package_id: int) -> dict[str, Any]:
+    data = rows(execute(conn, """SELECT p.*,c.course_code,c.title AS course_title,c.status AS course_status,
+        m.status AS module_status,i.status AS item_status FROM nuvedra_scorm_packages p
+        JOIN nexus_admin_courses c ON c.id=p.course_id JOIN nexus_modules m ON m.id=p.module_id
+        JOIN nexus_content_items i ON i.id=p.item_id WHERE p.id=?""", (package_id,)))
+    if not data:
+        raise HTTPException(404, "SCORM package not found.")
+    return data[0]
+
+
+def _lti_tool(conn: Any, tool_id: int) -> dict[str, Any]:
+    data = rows(execute(conn, """SELECT t.*,c.course_code,c.title AS course_title,c.status AS course_status,
+        m.status AS module_status,i.status AS item_status FROM nuvedra_lti_tools t
+        JOIN nexus_admin_courses c ON c.id=t.course_id JOIN nexus_modules m ON m.id=t.module_id
+        JOIN nexus_content_items i ON i.id=t.item_id WHERE t.id=?""", (tool_id,)))
+    if not data:
+        raise HTTPException(404, "LTI tool not found.")
+    return data[0]
+
+
+def _learning_access(conn: Any, course_id: int, email: str) -> dict[str, Any]:
+    allowed = set(academic_access.STUDENT_ROLES) | set(academic_access.AUTHOR_ROLES)
+    return academic_access.require_course_role(conn, course_id, email, allowed)
+
+
+def _published_interop(row: dict[str, Any]) -> bool:
+    return str(row.get("status")) == "published" and str(row.get("item_status")) == "published" and str(row.get("module_status")) == "published" and str(row.get("course_status")) == "active"
+
+
+def _upsert_progress(conn: Any, item_id: int, email: str, completed: bool) -> None:
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_content_progress WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    status = "completed" if completed else "not_started"
+    if found:
+        execute(conn, "UPDATE nuvedra_content_progress SET status=?,completed_at=?,updated_at=? WHERE id=?", (status, now if completed else None, now, int(found[0]["id"])))
+    else:
+        execute(conn, "INSERT INTO nuvedra_content_progress (item_id,student_email,status,completed_at,updated_at) VALUES (?,?,?,?,?)", (item_id, email.lower(), status, now if completed else None, now))
+
+
+def _oauth_quote(value: Any) -> str:
+    return urllib.parse.quote(str(value), safe="~-._")
+
+
+def _lti_signature(url: str, params: dict[str, str], secret: str) -> str:
+    normalized = "&".join(f"{_oauth_quote(k)}={_oauth_quote(v)}" for k, v in sorted(params.items()))
+    base = "&".join(("POST", _oauth_quote(url), _oauth_quote(normalized)))
+    digest = hmac.new((secret + "&").encode(), base.encode(), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _custom_lti_parameters(raw: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        if not line.strip() or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in key.strip())[:80]
+        if key:
+            result[f"custom_{key}"] = value.strip()[:1000]
+    return result
+
+
+def _role_for_lti(course_role: str) -> str:
+    role = str(course_role or "").lower()
+    if role == "student":
+        return "Learner"
+    if role == "observer":
+        return "Observer"
+    return "Instructor"
+
+
+def register_interoperability(app: FastAPI) -> None:
+    ensure_interoperability_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/interoperability", response_class=HTMLResponse, response_model=None)
+    async def interoperability_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/interoperability")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            modules = _course_modules(conn, course_id)
+            scorm = rows(execute(conn, "SELECT id,title,version,filename,status,module_id,item_id FROM nuvedra_scorm_packages WHERE course_id=? ORDER BY id DESC", (course_id,)))
+            tools = rows(execute(conn, "SELECT id,title,launch_url,consumer_key,share_email,status,module_id,item_id FROM nuvedra_lti_tools WHERE course_id=? ORDER BY id DESC", (course_id,)))
+        module_options = "".join(f'<option value="{int(m["id"])}">{academic_access.esc(m.get("title"))} · {academic_access.esc(m.get("status"))}</option>' for m in modules)
+        scorm_cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">SCORM {academic_access.esc(p.get('version'))} · {academic_access.esc(p.get('status'))}</p><h3>{academic_access.esc(p.get('title'))}</h3><p>{academic_access.esc(p.get('filename'))}</p><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/learn/scorm/{int(p['id'])}" target="_blank">Preview</a><form method="post" action="{STUDIO_PREFIX}/interop/scorm/{int(p['id'])}/toggle"><button class="studio-button">{'Unpublish' if p.get('status')=='published' else 'Publish'}</button></form></div></article>''' for p in scorm) or '<section class="studio-empty">No SCORM packages yet.</section>'
+        lti_cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">LTI 1.1 · {academic_access.esc(t.get('status'))}</p><h3>{academic_access.esc(t.get('title'))}</h3><p>{academic_access.esc(t.get('launch_url'))}</p><p><small>Consumer key: {academic_access.esc(t.get('consumer_key'))} · Email sharing: {'On' if int(t.get('share_email') or 0) else 'Off'}</small></p><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/learn/lti/{int(t['id'])}/launch" target="_blank">Preview launch</a><form method="post" action="{STUDIO_PREFIX}/interop/lti/{int(t['id'])}/toggle"><button class="studio-button">{'Unpublish' if t.get('status')=='published' else 'Publish'}</button></form></div></article>''' for t in tools) or '<section class="studio-empty">No LTI tools yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="interoperability-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="SCORM & LTI Interoperability" data-i18n-es="Interoperabilidad SCORM y LTI">SCORM & LTI Interoperability</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Launch database-backed SCORM packages and legacy LTI 1.1 Basic Launch tools without relying on Render's ephemeral filesystem." data-i18n-es="Ejecute paquetes SCORM almacenados en la base de datos y herramientas LTI 1.1 Basic Launch sin depender del sistema de archivos efímero de Render.">Launch database-backed SCORM packages and legacy LTI 1.1 Basic Launch tools without relying on Render's ephemeral filesystem.</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>Upload SCORM package</h3><form method="post" enctype="multipart/form-data" action="{STUDIO_PREFIX}/courses/{course_id}/interop/scorm" class="studio-form"><label>Module<select name="module_id" required>{module_options}</select></label><label>Title<input name="title" required maxlength="180"></label><label>SCORM ZIP<input type="file" name="package" accept=".zip,application/zip" required></label><button class="studio-button">Upload as draft</button></form><p><small>Supports SCORM 1.2 and SCORM 2004 runtime discovery. Maximum compressed size: 25 MB.</small></p></article><article class="studio-panel"><h3>Add LTI 1.1 tool</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/interop/lti" class="studio-form"><label>Module<select name="module_id" required>{module_options}</select></label><label>Title<input name="title" required maxlength="180"></label><label>Launch URL<input type="url" name="launch_url" required></label><label>Consumer key<input name="consumer_key" required></label><label>Shared secret<input type="password" name="shared_secret" required autocomplete="new-password"></label><label>Custom parameters (one key=value per line)<textarea name="custom_parameters" rows="4"></textarea></label><label><input type="checkbox" name="share_email" value="1"> Share learner email with tool</label><button class="studio-button">Save as draft</button></form><p><small>LTI 1.1 Basic Launch is provided for legacy compatibility. LTI 1.3 / Advantage is not claimed in v1. Grade return is not enabled in this phase.</small></p></article></section><section class="studio-section"><h2>SCORM packages</h2><div class="studio-grid">{scorm_cards}</div></section><section class="studio-section"><h2>LTI tools</h2><div class="studio-grid">{lti_cards}</div></section></main>'''
+        return academic_access.portal_page("SCORM & LTI", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/interop/scorm", response_model=None)
+    async def upload_scorm(course_id: int, request: Request, module_id: int = Form(...), title: str = Form(...), package: UploadFile = File(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/interoperability")
+        if isinstance(user, RedirectResponse): return user
+        data = await package.read(MAX_SCORM_BYTES + 1)
+        if not data or len(data) > MAX_SCORM_BYTES:
+            raise HTTPException(400, "SCORM package must be a non-empty ZIP file no larger than 25 MB.")
+        version, launch_path = _manifest_details(data)
+        clean_title = title.strip()
+        if not clean_title:
+            raise HTTPException(400, "Title is required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            module = rows(execute(conn, "SELECT id FROM nexus_modules WHERE id=? AND course_id=?", (module_id, course_id)))
+            if not module: raise HTTPException(400, "Selected module does not belong to this course.")
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nexus_content_items WHERE module_id=?", (module_id,)))[0]["p"])
+            now = utcnow()
+            item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                VALUES (?,?,?,'','','','{}',NULL,NULL,?,'draft',?,?)""", (module_id, "scorm", clean_title, pos, now, now))
+            package_id = _insert_id(conn, """INSERT INTO nuvedra_scorm_packages
+                (course_id,module_id,item_id,title,version,launch_path,filename,package_bytes,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?, 'draft',?,?,?)""", (course_id, module_id, item_id, clean_title, version, launch_path, package.filename or "package.zip", data, user["email"], now, now))
+            audit(conn, user["email"], "scorm_package_uploaded", "scorm_package", str(package_id), f"SCORM {version}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/interoperability", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/interop/scorm/{{package_id}}/toggle", response_model=None)
+    async def toggle_scorm(package_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            package = _package(conn, package_id)
+            academic_access.require_course_role(conn, int(package["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            new_status = "draft" if str(package.get("status")) == "published" else "published"
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_scorm_packages SET status=?,updated_at=? WHERE id=?", (new_status, now, package_id))
+            execute(conn, "UPDATE nexus_content_items SET status=?,updated_at=? WHERE id=?", (new_status, now, int(package["item_id"])))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(package['course_id'])}/interoperability", status_code=303)
+
+    @app.get("/learn/scorm/{package_id}", response_class=HTMLResponse, response_model=None)
+    async def launch_scorm(package_id: int, request: Request):
+        user = _user(request, f"/learn/scorm/{package_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            package = _package(conn, package_id)
+            access = _learning_access(conn, int(package["course_id"]), user["email"])
+            is_author = str(access.get("course_role")) in academic_access.AUTHOR_ROLES
+            if not is_author and not _published_interop(package): raise HTTPException(403, "This SCORM package is not available.")
+            state = rows(execute(conn, "SELECT * FROM nuvedra_scorm_states WHERE package_id=? AND lower(student_email)=?", (package_id, user["email"].lower())))
+            initial = state[0] if state else {}
+        values = {
+            "completion": str(initial.get("completion_status") or "not attempted"),
+            "success": str(initial.get("success_status") or "unknown"),
+            "score_raw": "" if initial.get("score_raw") is None else str(initial.get("score_raw")),
+            "score_min": "" if initial.get("score_min") is None else str(initial.get("score_min")),
+            "score_max": "" if initial.get("score_max") is None else str(initial.get("score_max")),
+            "location": str(initial.get("location") or ""),
+            "suspend_data": str(initial.get("suspend_data") or ""),
+            "total_time": str(initial.get("total_time") or ""),
+        }
+        import json
+        state_json = json.dumps(values).replace("</", "<\\/")
+        launch_url = f"/learn/scorm/{package_id}/asset/{urllib.parse.quote(str(package['launch_path']), safe='/')}"
+        js = f'''const S={state_json}; const endpoint="/learn/scorm/{package_id}/state"; let lastError="0";
+function getv(k){{const m={{"cmi.core.lesson_status":"completion","cmi.completion_status":"completion","cmi.success_status":"success","cmi.core.score.raw":"score_raw","cmi.score.raw":"score_raw","cmi.core.score.min":"score_min","cmi.score.min":"score_min","cmi.core.score.max":"score_max","cmi.score.max":"score_max","cmi.core.lesson_location":"location","cmi.location":"location","cmi.suspend_data":"suspend_data","cmi.core.total_time":"total_time","cmi.total_time":"total_time"}}; return S[m[k]]??"";}}
+function setv(k,v){{const m={{"cmi.core.lesson_status":"completion","cmi.completion_status":"completion","cmi.success_status":"success","cmi.core.score.raw":"score_raw","cmi.score.raw":"score_raw","cmi.core.score.min":"score_min","cmi.score.min":"score_min","cmi.core.score.max":"score_max","cmi.score.max":"score_max","cmi.core.lesson_location":"location","cmi.location":"location","cmi.suspend_data":"suspend_data","cmi.core.total_time":"total_time","cmi.total_time":"total_time"}}; if(m[k]) S[m[k]]=String(v); return "true";}}
+function commit(){{const body=new URLSearchParams(S); fetch(endpoint,{{method:"POST",headers:{{"Content-Type":"application/x-www-form-urlencoded"}},body}}).catch(()=>{{lastError="101";}}); return "true";}}
+window.API={{LMSInitialize:()=>"true",LMSFinish:()=>commit(),LMSGetValue:getv,LMSSetValue:setv,LMSCommit:()=>commit(),LMSGetLastError:()=>lastError,LMSGetErrorString:()=>lastError==="0"?"No error":"General exception",LMSGetDiagnostic:()=>"NUVEDRA SCORM 1.2 runtime"}};
+window.API_1484_11={{Initialize:()=>"true",Terminate:()=>commit(),GetValue:getv,SetValue:setv,Commit:()=>commit(),GetLastError:()=>lastError,GetErrorString:()=>lastError==="0"?"No error":"General exception",GetDiagnostic:()=>"NUVEDRA SCORM 2004 runtime"}};
+window.addEventListener("pagehide",commit);'''
+        body = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{academic_access.esc(package.get('title'))}</title><style>html,body{{height:100%;margin:0}}body{{font-family:system-ui;background:#f6f8f7}}header{{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;background:#fff;border-bottom:1px solid #d9dedb}}iframe{{width:100%;height:calc(100% - 55px);border:0;background:#fff}}a{{color:#075f4b}}</style></head><body><header><strong>{academic_access.esc(package.get('title'))}</strong><span>SCORM {academic_access.esc(package.get('version'))} · <a href="/learn/courses/{int(package['course_id'])}">Return to course</a></span></header><iframe title="{academic_access.esc(package.get('title'), attr=True)}" src="{academic_access.esc(launch_url, attr=True)}" allow="fullscreen"></iframe><script>{js}</script></body></html>'''
+        return HTMLResponse(body)
+
+    @app.get("/learn/scorm/{package_id}/asset/{asset_path:path}", response_model=None)
+    async def scorm_asset(package_id: int, asset_path: str, request: Request):
+        user = _user(request, f"/learn/scorm/{package_id}")
+        if isinstance(user, RedirectResponse): return user
+        safe = _safe_zip_name(urllib.parse.unquote(asset_path))
+        with db() as conn:
+            package = _package(conn, package_id)
+            access = _learning_access(conn, int(package["course_id"]), user["email"])
+            is_author = str(access.get("course_role")) in academic_access.AUTHOR_ROLES
+            if not is_author and not _published_interop(package): raise HTTPException(403, "This SCORM package is not available.")
+            payload = package["package_bytes"]
+        if isinstance(payload, memoryview): payload = payload.tobytes()
+        try:
+            with zipfile.ZipFile(io.BytesIO(bytes(payload))) as archive:
+                names = {name.replace("\\", "/"): name for name in archive.namelist()}
+                original = names.get(safe)
+                if original is None: raise HTTPException(404, "SCORM asset not found.")
+                data = archive.read(original)
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(500, "Stored SCORM package is invalid.") from exc
+        media = mimetypes.guess_type(safe)[0] or "application/octet-stream"
+        return Response(data, media_type=media, headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"})
+
+    @app.post("/learn/scorm/{package_id}/state", response_model=None)
+    async def save_scorm_state(package_id: int, request: Request, completion: str = Form("not attempted"), success: str = Form("unknown"), score_raw: str = Form(""), score_min: str = Form(""), score_max: str = Form(""), location: str = Form(""), suspend_data: str = Form(""), total_time: str = Form("")):
+        user = _user(request, f"/learn/scorm/{package_id}")
+        if isinstance(user, RedirectResponse): return user
+        def number(value: str) -> float | None:
+            try: return float(value) if value.strip() else None
+            except ValueError: return None
+        with db() as conn:
+            package = _package(conn, package_id)
+            access = _learning_access(conn, int(package["course_id"]), user["email"])
+            if str(access.get("course_role")) != "student": return Response(status_code=204)
+            if not _published_interop(package): raise HTTPException(403, "This SCORM package is not available.")
+            now = utcnow()
+            found = rows(execute(conn, "SELECT id FROM nuvedra_scorm_states WHERE package_id=? AND lower(student_email)=?", (package_id, user["email"].lower())))
+            values = (completion[:80], success[:80], number(score_raw), number(score_min), number(score_max), location[:1000], suspend_data[:64000], total_time[:120], now)
+            if found:
+                execute(conn, """UPDATE nuvedra_scorm_states SET completion_status=?,success_status=?,score_raw=?,score_min=?,score_max=?,location=?,suspend_data=?,total_time=?,updated_at=? WHERE id=?""", values + (int(found[0]["id"]),))
+            else:
+                execute(conn, """INSERT INTO nuvedra_scorm_states (package_id,student_email,completion_status,success_status,score_raw,score_min,score_max,location,suspend_data,total_time,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", (package_id, user["email"].lower()) + values)
+            completed = completion.strip().lower() in {"completed", "passed"} or success.strip().lower() == "passed"
+            _upsert_progress(conn, int(package["item_id"]), user["email"], completed)
+        return Response(status_code=204)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/interop/lti", response_model=None)
+    async def add_lti(course_id: int, request: Request, module_id: int = Form(...), title: str = Form(...), launch_url: str = Form(...), consumer_key: str = Form(...), shared_secret: str = Form(...), custom_parameters: str = Form(""), share_email: str = Form("0")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/interoperability")
+        if isinstance(user, RedirectResponse): return user
+        parsed = urllib.parse.urlparse(launch_url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc: raise HTTPException(400, "LTI launch URL must use http or https.")
+        if not title.strip() or not consumer_key.strip() or not shared_secret: raise HTTPException(400, "Title, consumer key, and shared secret are required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            module = rows(execute(conn, "SELECT id FROM nexus_modules WHERE id=? AND course_id=?", (module_id, course_id)))
+            if not module: raise HTTPException(400, "Selected module does not belong to this course.")
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nexus_content_items WHERE module_id=?", (module_id,)))[0]["p"])
+            now = utcnow()
+            item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                VALUES (?,?,?,'','','','{}',NULL,NULL,?,'draft',?,?)""", (module_id, "lti", title.strip(), pos, now, now))
+            tool_id = _insert_id(conn, """INSERT INTO nuvedra_lti_tools
+                (course_id,module_id,item_id,title,launch_url,consumer_key,shared_secret,custom_parameters,share_email,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,'draft',?,?,?)""", (course_id, module_id, item_id, title.strip(), launch_url.strip(), consumer_key.strip(), shared_secret, custom_parameters.strip(), 1 if share_email == "1" else 0, user["email"], now, now))
+            audit(conn, user["email"], "lti_tool_created", "lti_tool", str(tool_id), "LTI 1.1 Basic Launch", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/interoperability", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/interop/lti/{{tool_id}}/toggle", response_model=None)
+    async def toggle_lti(tool_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            tool = _lti_tool(conn, tool_id)
+            academic_access.require_course_role(conn, int(tool["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            new_status = "draft" if str(tool.get("status")) == "published" else "published"
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_lti_tools SET status=?,updated_at=? WHERE id=?", (new_status, now, tool_id))
+            execute(conn, "UPDATE nexus_content_items SET status=?,updated_at=? WHERE id=?", (new_status, now, int(tool["item_id"])))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(tool['course_id'])}/interoperability", status_code=303)
+
+    @app.get("/learn/lti/{tool_id}/launch", response_class=HTMLResponse, response_model=None)
+    async def launch_lti(tool_id: int, request: Request):
+        user = _user(request, f"/learn/lti/{tool_id}/launch")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            tool = _lti_tool(conn, tool_id)
+            access = _learning_access(conn, int(tool["course_id"]), user["email"])
+            is_author = str(access.get("course_role")) in academic_access.AUTHOR_ROLES
+            if not is_author and not _published_interop(tool): raise HTTPException(403, "This LTI tool is not available.")
+        params = {
+            "lti_message_type": "basic-lti-launch-request",
+            "lti_version": "LTI-1p0",
+            "resource_link_id": f"nuvedra-{int(tool['item_id'])}",
+            "resource_link_title": str(tool.get("title") or "NUVEDRA LTI Tool"),
+            "user_id": hashlib.sha256(user["email"].lower().encode()).hexdigest()[:32],
+            "roles": _role_for_lti(str(access.get("course_role") or "")),
+            "context_id": f"nuvedra-course-{int(tool['course_id'])}",
+            "context_label": str(tool.get("course_code") or "course"),
+            "context_title": str(tool.get("course_title") or "Course"),
+            "launch_presentation_return_url": str(request.base_url).rstrip("/") + f"/learn/courses/{int(tool['course_id'])}",
+            "oauth_consumer_key": str(tool.get("consumer_key") or ""),
+            "oauth_nonce": secrets.token_hex(16),
+            "oauth_signature_method": "HMAC-SHA1",
+            "oauth_timestamp": str(int(time.time())),
+            "oauth_version": "1.0",
+        }
+        if int(tool.get("share_email") or 0): params["lis_person_contact_email_primary"] = user["email"].lower()
+        params.update(_custom_lti_parameters(str(tool.get("custom_parameters") or "")))
+        params["oauth_signature"] = _lti_signature(str(tool["launch_url"]), params, str(tool["shared_secret"]))
+        inputs = "".join(f'<input type="hidden" name="{academic_access.esc(k, attr=True)}" value="{academic_access.esc(v, attr=True)}">' for k, v in params.items())
+        body = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Launching {academic_access.esc(tool.get('title'))}</title></head><body><main style="font-family:system-ui;max-width:720px;margin:8vh auto;padding:24px"><h1>Launching external learning tool</h1><p>{academic_access.esc(tool.get('title'))}</p><p>This launch uses LTI 1.1 Basic Launch for legacy compatibility.</p><form id="lti-launch" method="post" action="{academic_access.esc(tool['launch_url'], attr=True)}">{inputs}<button type="submit">Continue</button></form></main><script>document.getElementById('lti-launch').submit();</script></body></html>'''
+        return HTMLResponse(body, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    print("NUVEDRA SCORM & LTI v1 registered: database-backed SCORM 1.2/2004 launch and state tracking plus legacy LTI 1.1 Basic Launch with role/privacy controls.", flush=True)
