@@ -35,6 +35,7 @@ from app.production_entry import app  # noqa: E402
 @app.get("/__smoke/xapi-user/{kind}", include_in_schema=False)
 async def smoke_xapi_user(kind: str, request: Request):
     users = {
+        "instructor": {"id": "xapi-instructor", "name": "xAPI Instructor", "email": "xapi.admin@example.com"},
         "student": {"id": "xapi-student", "name": "xAPI Student", "email": "xapi.student@example.com"},
         "observer": {"id": "xapi-observer", "name": "xAPI Observer", "email": "xapi.observer@example.com"},
     }
@@ -86,6 +87,12 @@ def main() -> None:
         if not match:
             raise RuntimeError("xAPI source credential page did not expose the one-time Basic credential.")
         source_auth = "Basic " + match.group(1)
+        with db() as conn:
+            source_id = int(rows(execute(conn, "SELECT id FROM nuvedra_xapi_sources WHERE course_id=?", (course_id,)))[0]["id"])
+        refreshed_home = client.get(f"/faculty/studio/courses/{course_id}/xapi")
+        expect(refreshed_home, 200, "xAPI workspace after source creation")
+        require(refreshed_home, f"/faculty/studio/xapi/sources/{source_id}/toggle", "xAPI source revocation control")
+
         statement_id = str(uuid.uuid4())
         generic_statement = {
             "id": statement_id,
@@ -103,6 +110,9 @@ def main() -> None:
         expect(generic_read, 200, "course-scoped xAPI statement read")
         if generic_read.json().get("id") != statement_id:
             raise RuntimeError("xAPI statement read returned the wrong statement.")
+        expect(client.post(f"/faculty/studio/xapi/sources/{source_id}/toggle"), 303, "xAPI source disable")
+        expect(client.get("/xapi/statements", headers={"Authorization": source_auth}), 401, "disabled xAPI credential rejection")
+        expect(client.post(f"/faculty/studio/xapi/sources/{source_id}/toggle"), 303, "xAPI source re-enable")
 
         cmi5_created = client.post(f"/faculty/studio/courses/{course_id}/xapi/cmi5", data={
             "module_id": str(module_id), "title": "Evidence cmi5 Activity",
@@ -186,6 +196,31 @@ def main() -> None:
         if completion_id not in statement_ids or statement_id in statement_ids:
             raise RuntimeError("cmi5 credentials did not remain scoped to the learner registration.")
 
+        expect(client.get("/__smoke/xapi-user/instructor"), 200, "instructor return session")
+        copied = client.post(f"/faculty/studio/courses/{course_id}/copy/new", data={
+            "course_code": "XAPI-7400-COPY", "title": "Experience Data and cmi5 Copy", "term": "Spring 2027",
+            "module_ids": str(module_id), "copy_questions": "1", "copy_rubrics": "1", "copy_outcomes": "1",
+        })
+        expect(copied, 303, "course copy with cmi5 activity")
+        target_course_id = int(copied.headers["location"].rsplit("/", 1)[-1])
+        with db() as conn:
+            copied_aus = rows(execute(conn, "SELECT * FROM nuvedra_cmi5_aus WHERE course_id=?", (target_course_id,)))
+            if len(copied_aus) != 1:
+                raise RuntimeError(f"Course Copy did not preserve exactly one cmi5 AU association: {copied_aus}")
+            copied_au = copied_aus[0]
+            copied_item_id = int(copied_au["item_id"])
+            copied_item = rows(execute(conn, "SELECT item_type,external_url,status FROM nexus_content_items WHERE id=?", (copied_item_id,)))[0]
+            if copied_item.get("item_type") != "cmi5" or copied_item.get("status") != "draft" or copied_item.get("external_url") != f"/learn/cmi5/{int(copied_au['id'])}/launch":
+                raise RuntimeError(f"Copied cmi5 item did not receive an independent draft launch association: {copied_item}")
+            if rows(execute(conn, "SELECT id FROM nuvedra_cmi5_registrations WHERE au_id=?", (int(copied_au["id"]),))):
+                raise RuntimeError("Course Copy carried cmi5 learner registrations into the destination course.")
+            if rows(execute(conn, "SELECT id FROM nuvedra_xapi_statements WHERE course_id=?", (target_course_id,))):
+                raise RuntimeError("Course Copy carried xAPI learner statements into the destination course.")
+            if rows(execute(conn, "SELECT id FROM nuvedra_xapi_sources WHERE course_id=?", (target_course_id,))):
+                raise RuntimeError("Course Copy carried xAPI source credentials into the destination course.")
+            if rows(execute(conn, "SELECT id FROM nuvedra_submissions WHERE item_id=?", (copied_item_id,))):
+                raise RuntimeError("Course Copy carried cmi5 learner submissions into the destination course.")
+
         expect(client.get("/__smoke/xapi-user/observer"), 200, "observer session")
         expect(client.get(f"/learn/cmi5/{au_id}/launch"), 403, "observer cmi5 launch protection")
         expect(client.get(f"/faculty/studio/courses/{course_id}/xapi"), 403, "observer xAPI management protection")
@@ -193,7 +228,7 @@ def main() -> None:
         expect(client.get("/__smoke/xapi-user/student"), 200, "student return session")
         expect(client.get(f"/faculty/studio/courses/{course_id}/xapi"), 403, "student xAPI management protection")
 
-    print("xAPI & cmi5 v1 validated: course-scoped source credentials, statement read/write, cmi5 launch/fetch replay protection, state persistence, pseudonymous learner binding, MoveOn progress, Gradebook synchronization, and role protection.", flush=True)
+    print("xAPI & cmi5 v1 validated: course-scoped and revocable source credentials, statement read/write, cmi5 launch/fetch replay protection, state persistence, pseudonymous learner binding, MoveOn progress, Gradebook synchronization, safe course-copy preservation, and role protection.", flush=True)
 
 
 if __name__ == "__main__":
