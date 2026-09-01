@@ -10,44 +10,82 @@ STUDIO_JS = Path("app/static/course-studio.js")
 TAG = "NUVEDRA_ACCESSIBILITY_CHECKER_V1"
 
 
-def replace_once(text: str, old: str, new: str, label: str) -> str:
-    if new in text:
+def _insert_after(text: str, anchor: str, addition: str, label: str) -> str:
+    if addition.strip() in text:
         return text
-    if old not in text:
-        raise RuntimeError(f"Accessibility Checker v1 patch could not find {label}: {old[:180]!r}")
-    return text.replace(old, new, 1)
+    if anchor not in text:
+        raise RuntimeError(f"Accessibility Checker v1 could not find {label}: {anchor[:180]!r}")
+    return text.replace(anchor, anchor + addition, 1)
+
+
+def _insert_before(text: str, anchor: str, addition: str, label: str) -> str:
+    if addition.strip() in text:
+        return text
+    if anchor not in text:
+        raise RuntimeError(f"Accessibility Checker v1 could not find {label}: {anchor[:180]!r}")
+    return text.replace(anchor, addition + anchor, 1)
 
 
 def patch_academic_portal() -> None:
     text = ACADEMIC_PORTAL.read_text(encoding="utf-8")
-    text = replace_once(
-        text,
-        "from app.content_library import register_content_library\n",
-        "from app.content_library import register_content_library\nfrom app.accessibility_checker import register_accessibility_checker\n",
-        "Accessibility Checker import",
-    )
-    text = replace_once(
-        text,
-        '    register_content_library(app)\n    print("Portal académico por roles registrado: administrador, profesor, estudiante, Gradebook, Assessments v2, Gradebook v2, Student Experience v2 y Content Library v1.", flush=True)\n',
-        '    register_content_library(app)\n    register_accessibility_checker(app)\n    print("Portal académico por roles registrado: administrador, profesor, estudiante, Gradebook, Assessments v2, Gradebook v2, Student Experience v2, Content Library v1 y Accessibility Checker v1.", flush=True)\n',
-        "Accessibility Checker registration",
-    )
+    if "from app.accessibility_checker import register_accessibility_checker" not in text:
+        if "from app.content_library import register_content_library\n" in text:
+            text = _insert_after(
+                text,
+                "from app.content_library import register_content_library\n",
+                "from app.accessibility_checker import register_accessibility_checker\n",
+                "Content Library import",
+            )
+        else:
+            marker = "\n\ndef register_academic_portal(app: FastAPI) -> None:\n"
+            text = _insert_before(
+                text,
+                marker,
+                "from app.accessibility_checker import register_accessibility_checker\n",
+                "academic portal registration function",
+            )
+
+    if "register_accessibility_checker(app)" not in text:
+        if "    register_content_library(app)\n" in text:
+            text = _insert_after(
+                text,
+                "    register_content_library(app)\n",
+                "    register_accessibility_checker(app)\n",
+                "Content Library registration",
+            )
+        else:
+            marker = "    print("
+            text = _insert_before(
+                text,
+                marker,
+                "    register_accessibility_checker(app)\n",
+                "academic portal status print",
+            )
+
     ACADEMIC_PORTAL.write_text(text, encoding="utf-8")
 
 
 def patch_course_editor() -> None:
     text = COURSE_EDITOR.read_text(encoding="utf-8")
     if "import app.accessibility_checker as accessibility_checker" not in text:
-        text = replace_once(
-            text,
-            "import app.academic_access as academic_access\n",
-            "import app.academic_access as academic_access\nimport app.accessibility_checker as accessibility_checker\n",
-            "Course Studio accessibility import",
-        )
+        if "import app.academic_access as academic_access\n" in text:
+            text = _insert_after(
+                text,
+                "import app.academic_access as academic_access\n",
+                "import app.accessibility_checker as accessibility_checker\n",
+                "academic access import",
+            )
+        else:
+            text = _insert_after(
+                text,
+                "from fastapi.responses import HTMLResponse, RedirectResponse\n",
+                "\nimport app.accessibility_checker as accessibility_checker\n",
+                "FastAPI response import",
+            )
 
-    update_marker = '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}\n'
-    update_block = '''            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}
-            # NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate
+    if "NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate" not in text:
+        anchor = '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}\n'
+        block = '''            # NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate
             if status == "published":
                 accessibility_report = accessibility_checker.check_item_payload(
                     item_type=item_type,
@@ -64,12 +102,11 @@ def patch_course_editor() -> None:
                         + accessibility_checker.blocking_summary(accessibility_report),
                     )
 '''
-    if "NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate" not in text:
-        text = replace_once(text, update_marker, update_block, "item edit publication gate")
+        text = _insert_after(text, anchor, block, "item assessment metadata update")
 
-    toggle_marker = '            next_state = "draft" if str(item.get("status")) == "published" else "published"\n'
-    toggle_block = '''            next_state = "draft" if str(item.get("status")) == "published" else "published"
-            if next_state == "published":
+    if "accessibility_checker.check_item_row(item)" not in text:
+        anchor = '            next_state = "draft" if str(item.get("status")) == "published" else "published"\n'
+        block = '''            if next_state == "published":
                 accessibility_report = accessibility_checker.check_item_row(item)
                 if accessibility_report["blocking"]:
                     raise HTTPException(
@@ -78,17 +115,15 @@ def patch_course_editor() -> None:
                         + accessibility_checker.blocking_summary(accessibility_report),
                     )
 '''
-    if 'accessibility_checker.check_item_row(item)' not in text:
-        text = replace_once(text, toggle_marker, toggle_block, "quick publish accessibility gate")
+        text = _insert_after(text, anchor, block, "quick publish state change")
 
     COURSE_EDITOR.write_text(text, encoding="utf-8")
 
 
 def patch_studio_js() -> None:
     text = STUDIO_JS.read_text(encoding="utf-8")
-    if TAG in text:
-        return
-    functions = r'''
+    if TAG not in text:
+        functions = r'''
   // NUVEDRA_ACCESSIBILITY_CHECKER_V1
   function initializeAccessibilityCheckerLinks() {
     const courseStudio = document.querySelector('[data-testid="visual-course-studio"]');
@@ -137,13 +172,17 @@ def patch_studio_js() -> None:
   }
 
 '''
-    marker = "  function start() {\n"
-    if marker not in text:
-        raise RuntimeError("Accessibility Checker v1 could not insert Studio navigation links.")
-    text = text.replace(marker, functions + marker, 1)
-    init_old = "    initializeContentLibraryLink();\n    initializeDrafts();\n"
-    init_new = "    initializeContentLibraryLink();\n    initializeAccessibilityCheckerLinks();\n    initializeDrafts();\n"
-    text = replace_once(text, init_old, init_new, "Accessibility Checker Studio initialization")
+        marker = "  function start() {\n"
+        if marker not in text:
+            raise RuntimeError("Accessibility Checker v1 could not locate Course Studio start().")
+        text = text.replace(marker, functions + marker, 1)
+
+    if "    initializeAccessibilityCheckerLinks();\n" not in text:
+        marker = "    initializeDrafts();\n"
+        if marker not in text:
+            raise RuntimeError("Accessibility Checker v1 could not locate Course Studio initialization.")
+        text = text.replace(marker, "    initializeAccessibilityCheckerLinks();\n" + marker, 1)
+
     STUDIO_JS.write_text(text, encoding="utf-8")
 
 
@@ -154,7 +193,10 @@ def main() -> None:
     patch_academic_portal()
     patch_course_editor()
     patch_studio_js()
-    print("NUVEDRA Accessibility Checker v1 installed: automated WCAG-oriented checks, Studio reports, and pre-publication blocking.", flush=True)
+    print(
+        "NUVEDRA Accessibility Checker v1 installed deterministically: WCAG-oriented reports and publication gates enabled.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
