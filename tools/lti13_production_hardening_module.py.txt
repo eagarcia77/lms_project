@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import db, execute, rows
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _age_days(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() // 86400))
+
+
+def register_lti13_production_hardening(app: FastAPI) -> None:
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/lti13/security", response_class=HTMLResponse, response_model=None)
+    async def lti13_security(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/lti13/security")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            tool_rows = rows(execute(conn, "SELECT id,title,status,client_id,jwks_url,share_email FROM nuvedra_lti13_tools WHERE course_id=? ORDER BY id", (course_id,)))
+            keys = rows(execute(conn, "SELECT kid,status,created_at FROM nuvedra_lti13_platform_keys WHERE status IN ('active','retiring') ORDER BY id DESC"))
+            expired_tokens = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_lti13_tokens WHERE expires_at < ?", (datetime.now(timezone.utc).isoformat(),)))[0]
+            expired_jtis = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_lti13_assertion_jtis WHERE expires_at < ?", (datetime.now(timezone.utc).isoformat(),)))[0]
+        configured = os.getenv("NUVEDRA_LTI13_ISSUER", "").strip().rstrip("/")
+        issuer_text = configured or "Request-derived origin (set NUVEDRA_LTI13_ISSUER in production)"
+        issuer_state = "Configured" if configured.startswith("https://") else "Review"
+        key_age = _age_days(keys[0].get("created_at")) if keys else None
+        key_state = "Ready" if keys else "Missing"
+        rows_html = "".join(
+            f'''<tr><td>{academic_access.esc(tool.get('title'))}</td><td>{academic_access.esc(tool.get('status'))}</td><td>{academic_access.esc(tool.get('client_id'))}</td><td>{'Enabled' if int(tool.get('share_email') or 0) else 'Off by default'}</td><td>{academic_access.esc(tool.get('jwks_url'))}</td></tr>'''
+            for tool in tool_rows
+        ) or '<tr><td colspan="5">No LTI 1.3 tools are registered for this course.</td></tr>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="lti13-production-hardening">
+        <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/lti13" data-i18n-en="Back to LTI 1.3" data-i18n-es="Volver a LTI 1.3">Back to LTI 1.3</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Production hardening" data-i18n-es="Fortalecimiento de producción">Production hardening</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Review the security posture of the LTI 1.3 platform without exposing private keys, access tokens, or tool secrets." data-i18n-es="Revise la postura de seguridad de la plataforma LTI 1.3 sin exponer claves privadas, tokens de acceso ni secretos de herramientas.">Review the security posture of the LTI 1.3 platform without exposing private keys, access tokens, or tool secrets.</p></div></header>
+        <section class="studio-summary-grid"><article class="studio-panel"><strong>{academic_access.esc(issuer_state)}</strong><span>Platform issuer</span></article><article class="studio-panel"><strong>{academic_access.esc(key_state)}</strong><span>RS256 signing key</span></article><article class="studio-panel"><strong>{len(tool_rows)}</strong><span>Course registrations</span></article><article class="studio-panel"><strong>{int(expired_tokens.get('total') or 0) + int(expired_jtis.get('total') or 0)}</strong><span>Expired security records awaiting cleanup</span></article></section>
+        <section class="studio-grid"><article class="studio-panel"><h3>Platform origin</h3><p><strong>{academic_access.esc(issuer_text)}</strong></p><p>Production deployments should set <code>NUVEDRA_LTI13_ISSUER</code> to the canonical HTTPS origin. Generated authorization, token, JWKS, AGS, return, and launch URLs use the canonical issuer when configured.</p></article><article class="studio-panel"><h3>Signing material</h3><p>Public keys exposed through JWKS: <strong>{len(keys)}</strong></p><p>Current key age: <strong>{academic_access.esc(str(key_age) + ' days' if key_age is not None else 'unknown')}</strong></p><p>The private RSA key is stored server-side and is never rendered by this page or by the public JWKS endpoint.</p></article></section>
+        <section class="studio-panel"><h3>Hardened controls</h3><ul><li>HTTPS-only registration endpoints with local/private literal-address rejection.</li><li>DNS destination checks before remote JWKS retrieval.</li><li>JWKS response-size, key-count, RSA-size, algorithm, use, and key-operation validation.</li><li>Required JWT <code>kid</code>, <code>iat</code>, <code>exp</code>, issuer, audience, signature, and bounded lifetime validation.</li><li>Opaque hashed AGS access tokens, scoped authorization, expiring records, assertion replay protection, and periodic stale-record pruning.</li><li>OIDC login hints and Deep Linking responses remain one-time operations.</li><li>AGS score writes are restricted to pseudonymous IDs that resolve to active students in the course.</li></ul></section>
+        <section class="studio-panel"><h3>Course tool registrations</h3><div style="overflow:auto"><table><thead><tr><th>Tool</th><th>Status</th><th>Client ID</th><th>Email sharing</th><th>JWKS endpoint</th></tr></thead><tbody>{rows_html}</tbody></table></div></section>
+        <section class="studio-panel"><p><strong>Certification statement:</strong> these controls improve production readiness but do not represent or imply 1EdTech certification.</p></section>
+        </main>'''
+        return academic_access.portal_page("LTI 1.3 Production Hardening", body, user)
+
+    print("NUVEDRA LTI 1.3 production hardening dashboard registered.", flush=True)
