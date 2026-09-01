@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+from app.calendar_notifications import ensure_calendar_notifications_schema
+
+STUDIO_PREFIX = "/faculty/studio"
+PRIORITIES = {"normal", "important"}
+STATUSES = {"draft", "published"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_course_announcements_schema() -> None:
+    ensure_calendar_notifications_schema()
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_course_announcements (
+            id {pk}, course_id INTEGER NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'normal', status TEXT NOT NULL DEFAULT 'draft',
+            published_at TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+
+def _notify_course_members(conn: Any, course_id: int, *, title: str, message: str) -> int:
+    recipients = rows(execute(conn, """SELECT lower(user_email) AS email FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role IN ('student','observer')
+        ORDER BY lower(user_email)""", (course_id,)))
+    now = utcnow()
+    for recipient in recipients:
+        execute(conn, """INSERT INTO nuvedra_notifications
+            (recipient_email,course_id,title,message,href,kind,read_at,created_at)
+            VALUES (?,?,?,?,?,'announcement',NULL,?)""",
+            (recipient["email"], course_id, title, message, "/learn/announcements", now))
+    return len(recipients)
+
+
+def _announcement(conn: Any, announcement_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_course_announcements WHERE id=?", (announcement_id,)))
+    if not found:
+        raise HTTPException(404, "Announcement not found.")
+    return found[0]
+
+
+def _instructor_cards(data: list[dict[str, Any]]) -> str:
+    if not data:
+        return '<section class="studio-empty" data-i18n-en="No course announcements yet." data-i18n-es="Todavía no hay anuncios del curso.">No course announcements yet.</section>'
+    cards: list[str] = []
+    for item in data:
+        priority = str(item.get("priority") or "normal")
+        status = str(item.get("status") or "draft")
+        publish_button = ""
+        if status != "published":
+            publish_button = f'''<form method="post" action="{STUDIO_PREFIX}/announcements/{int(item['id'])}/publish"><button class="studio-button" data-i18n-en="Publish and notify" data-i18n-es="Publicar y notificar">Publish and notify</button></form>'''
+        cards.append(f'''<article class="studio-panel" data-announcement-priority="{academic_access.esc(priority, attr=True)}"><p class="studio-eyebrow">{academic_access.esc(priority)} · {academic_access.esc(status)}</p><h3>{academic_access.esc(item.get('title'))}</h3><p style="white-space:pre-wrap">{academic_access.esc(item.get('message'))}</p><small>{academic_access.esc(item.get('published_at') or item.get('updated_at'))}</small><div class="studio-actions">{publish_button}<form method="post" action="{STUDIO_PREFIX}/announcements/{int(item['id'])}/archive" data-confirm data-confirm-en="Archive this announcement?" data-confirm-es="¿Archivar este anuncio?"><button class="studio-button studio-button--quiet" data-i18n-en="Archive" data-i18n-es="Archivar">Archive</button></form></div></article>''')
+    return "".join(cards)
+
+
+def register_course_announcements(app: FastAPI) -> None:
+    ensure_course_announcements_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/announcements", response_class=HTMLResponse, response_model=None)
+    async def instructor_announcements(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/announcements")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            data = rows(execute(conn, "SELECT * FROM nuvedra_course_announcements WHERE course_id=? AND status<>'archived' ORDER BY id DESC", (course_id,)))
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="course-announcements-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Course Announcements" data-i18n-es="Anuncios del curso">Course Announcements</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Create concise course updates and notify active students and observers when an announcement is published." data-i18n-es="Cree avisos breves del curso y notifique a estudiantes y observadores activos cuando se publique un anuncio.">Create concise course updates and notify active students and observers when an announcement is published.</p></div></header><section class="studio-panel"><h3 data-i18n-en="New announcement" data-i18n-es="Nuevo anuncio">New announcement</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/announcements" class="studio-form"><label><span data-i18n-en="Title" data-i18n-es="Título">Title</span><input name="title" required maxlength="180"></label><label><span data-i18n-en="Message" data-i18n-es="Mensaje">Message</span><textarea name="message" rows="6" required maxlength="5000"></textarea></label><div class="studio-form-grid"><label><span data-i18n-en="Priority" data-i18n-es="Prioridad">Priority</span><select name="priority"><option value="normal">Normal</option><option value="important">Important</option></select></label><label><span data-i18n-en="Initial status" data-i18n-es="Estado inicial">Initial status</span><select name="status"><option value="draft">Draft</option><option value="published">Publish now</option></select></label></div><button class="studio-button" data-i18n-en="Save announcement" data-i18n-es="Guardar anuncio">Save announcement</button></form></section><section class="studio-section"><h2 data-i18n-en="Announcements" data-i18n-es="Anuncios">Announcements</h2><div class="studio-grid">{_instructor_cards(data)}</div></section></main>'''
+        return academic_access.portal_page("Course Announcements", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/announcements", response_model=None)
+    async def create_announcement(course_id: int, request: Request, title: str = Form(...), message: str = Form(...), priority: str = Form("normal"), status: str = Form("draft")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/announcements")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_title = title.strip()
+        clean_message = message.strip()
+        if not clean_title or not clean_message:
+            raise HTTPException(400, "Title and message are required.")
+        clean_priority = priority if priority in PRIORITIES else "normal"
+        clean_status = status if status in STATUSES else "draft"
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            published_at = now if clean_status == "published" else None
+            execute(conn, """INSERT INTO nuvedra_course_announcements
+                (course_id,title,message,priority,status,published_at,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (course_id, clean_title, clean_message, clean_priority, clean_status, published_at, user["email"], now, now))
+            notified = 0
+            if clean_status == "published":
+                notified = _notify_course_members(conn, course_id, title=clean_title, message=clean_message[:500])
+            audit(conn, user["email"], "course_announcement_created", "course", str(course_id), f"{clean_status}; notified={notified}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/announcements", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/announcements/{{announcement_id}}/publish", response_model=None)
+    async def publish_announcement(announcement_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            item = _announcement(conn, announcement_id)
+            course_id = int(item["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            notified = 0
+            if str(item.get("status")) != "published":
+                now = utcnow()
+                execute(conn, "UPDATE nuvedra_course_announcements SET status='published',published_at=?,updated_at=? WHERE id=?", (now, now, announcement_id))
+                notified = _notify_course_members(conn, course_id, title=str(item.get("title") or ""), message=str(item.get("message") or "")[:500])
+            audit(conn, user["email"], "course_announcement_published", "announcement", str(announcement_id), f"notified={notified}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/announcements", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/announcements/{{announcement_id}}/archive", response_model=None)
+    async def archive_announcement(announcement_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            item = _announcement(conn, announcement_id)
+            course_id = int(item["course_id"])
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            execute(conn, "UPDATE nuvedra_course_announcements SET status='archived',updated_at=? WHERE id=?", (utcnow(), announcement_id))
+            audit(conn, user["email"], "course_announcement_archived", "announcement", str(announcement_id), str(item.get("title") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/announcements", status_code=303)
+
+    @app.get("/learn/announcements", response_class=HTMLResponse, response_model=None)
+    async def student_announcements(request: Request):
+        user = _user(request, "/learn/announcements")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            data = rows(execute(conn, """SELECT a.*,c.course_code,c.title AS course_title,e.course_role
+                FROM nuvedra_course_announcements a
+                JOIN nexus_admin_courses c ON c.id=a.course_id
+                JOIN nexus_admin_enrollments e ON e.course_id=a.course_id
+                WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ('student','observer')
+                  AND c.status='active' AND a.status='published'
+                ORDER BY a.published_at DESC,a.id DESC""", (user["email"].lower(),)))
+        cards = "".join(f'''<article class="studio-panel" data-announcement-priority="{academic_access.esc(item.get('priority') or 'normal', attr=True)}"><p class="studio-eyebrow">{academic_access.esc(item.get('course_code'))} · {academic_access.esc(item.get('priority') or 'normal')}</p><h3>{academic_access.esc(item.get('title'))}</h3><p style="white-space:pre-wrap">{academic_access.esc(item.get('message'))}</p><small>{academic_access.esc(item.get('published_at'))}</small></article>''' for item in data) or '<section class="studio-empty" data-i18n-en="No published announcements are available." data-i18n-es="No hay anuncios publicados disponibles.">No published announcements are available.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-announcements-v1"><nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a><span>/</span><a href="/portal/notifications" data-i18n-en="Notifications" data-i18n-es="Notificaciones">Notifications</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Announcements" data-i18n-es="Anuncios">Announcements</p><h2 data-i18n-en="Course updates in one place" data-i18n-es="Avisos de cursos en un solo lugar">Course updates in one place</h2><p data-i18n-en="Review published announcements from your active courses." data-i18n-es="Revise los anuncios publicados de sus cursos activos.">Review published announcements from your active courses.</p></div></header><section class="studio-grid">{cards}</section></main>'''
+        return academic_access.portal_page("Announcements", body, user)
+
+    print("NUVEDRA Course Announcements v1 registered: instructor publishing, student/observer visibility, notification fan-out, and role protection.", flush=True)
