@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+GROUP_ACTIVITY_TYPES = {"assignment", "project", "presentation"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def ensure_people_groups_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_groups (
+            id {pk}, course_id INTEGER NOT NULL, name TEXT NOT NULL, description TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_group_members (
+            id {pk}, group_id INTEGER NOT NULL, user_email TEXT NOT NULL,
+            member_role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL,
+            UNIQUE(group_id,user_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_group_item_links (
+            id {pk}, group_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(group_id,item_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_group_posts (
+            id {pk}, group_id INTEGER NOT NULL, author_email TEXT NOT NULL,
+            body TEXT NOT NULL, parent_id INTEGER, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        # Keep this module safe if Calendar & Notifications is ever disabled in a custom build.
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_notifications (
+            id {pk}, recipient_email TEXT NOT NULL, course_id INTEGER, title TEXT NOT NULL,
+            message TEXT, href TEXT, kind TEXT NOT NULL DEFAULT 'course_event',
+            read_at TEXT, created_at TEXT NOT NULL
+        )""")
+
+
+def _group(conn: Any, group_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT g.*,c.course_code,c.title AS course_title,c.status AS course_status
+        FROM nuvedra_groups g JOIN nexus_admin_courses c ON c.id=g.course_id
+        WHERE g.id=?""", (group_id,)))
+    if not found:
+        raise HTTPException(404, "Group not found.")
+    return found[0]
+
+
+def _group_members(conn: Any, group_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT gm.*,e.course_role,e.status AS enrollment_status
+        FROM nuvedra_group_members gm
+        JOIN nuvedra_groups g ON g.id=gm.group_id
+        LEFT JOIN nexus_admin_enrollments e
+          ON e.course_id=g.course_id AND lower(e.user_email)=lower(gm.user_email)
+        WHERE gm.group_id=? ORDER BY gm.member_role DESC,lower(gm.user_email)""", (group_id,)))
+
+
+def _course_people(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT id,user_email,course_role,status,created_at
+        FROM nexus_admin_enrollments WHERE course_id=?
+        ORDER BY CASE course_role
+          WHEN 'instructor' THEN 1 WHEN 'teaching_assistant' THEN 2
+          WHEN 'course_builder' THEN 3 WHEN 'facilitator' THEN 4
+          WHEN 'student' THEN 5 WHEN 'observer' THEN 6 ELSE 7 END,
+          lower(user_email)""", (course_id,)))
+
+
+def _course_groups(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    groups = rows(execute(conn, """SELECT * FROM nuvedra_groups
+        WHERE course_id=? AND status='active' ORDER BY name,id""", (course_id,)))
+    for group in groups:
+        group["member_count"] = int(rows(execute(conn,
+            "SELECT COUNT(*) AS total FROM nuvedra_group_members WHERE group_id=?",
+            (int(group["id"]),)))[0]["total"])
+        group["activity_count"] = int(rows(execute(conn,
+            "SELECT COUNT(*) AS total FROM nuvedra_group_item_links WHERE group_id=?",
+            (int(group["id"]),)))[0]["total"])
+    return groups
+
+
+def _author_group(conn: Any, group_id: int, email: str) -> dict[str, Any]:
+    group = _group(conn, group_id)
+    academic_access.require_course_role(conn, int(group["course_id"]), email, academic_access.AUTHOR_ROLES)
+    return group
+
+
+def _student_group(conn: Any, group_id: int, email: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    group = _group(conn, group_id)
+    if str(group.get("status")) != "active" or str(group.get("course_status")) != "active":
+        raise HTTPException(403, "This group is not available.")
+    academic_access.require_course_role(conn, int(group["course_id"]), email, {"student"})
+    membership = rows(execute(conn, """SELECT * FROM nuvedra_group_members
+        WHERE group_id=? AND lower(user_email)=?""", (group_id, email.lower())))
+    if not membership:
+        raise HTTPException(403, "You are not a member of this group.")
+    return group, membership[0]
+
+
+def group_context_for_item(conn: Any, item_id: int, email: str) -> dict[str, Any] | None:
+    linked = rows(execute(conn, """SELECT g.id,g.name,g.course_id
+        FROM nuvedra_group_item_links l JOIN nuvedra_groups g ON g.id=l.group_id
+        WHERE l.item_id=? AND g.status='active' ORDER BY g.name,g.id""", (item_id,)))
+    if not linked:
+        return None
+    group_ids = [int(row["id"]) for row in linked]
+    placeholders = ",".join("?" for _ in group_ids)
+    membership = rows(execute(conn, f"""SELECT g.id,g.name,g.course_id
+        FROM nuvedra_group_members gm JOIN nuvedra_groups g ON g.id=gm.group_id
+        WHERE gm.group_id IN ({placeholders}) AND lower(gm.user_email)=?
+          AND g.status='active' ORDER BY g.name,g.id""", tuple(group_ids) + (email.lower(),)))
+    return membership[0] if membership else {}
+
+
+def require_group_item_access(conn: Any, item_id: int, email: str) -> dict[str, Any] | None:
+    context = group_context_for_item(conn, item_id, email)
+    if context == {}:
+        raise HTTPException(403, "This activity is assigned to a different course group.")
+    return context
+
+
+def _notify(conn: Any, recipient: str, course_id: int, title: str, message: str, href: str, kind: str = "group") -> None:
+    execute(conn, """INSERT INTO nuvedra_notifications
+        (recipient_email,course_id,title,message,href,kind,read_at,created_at)
+        VALUES (?,?,?,?,?,?,NULL,?)""",
+        (recipient.lower(), course_id, title, message, href, kind, utcnow()))
+
+
+def _notify_group(conn: Any, group_id: int, course_id: int, *, title: str, message: str,
+                  href: str, exclude: str = "") -> int:
+    members = rows(execute(conn, """SELECT lower(user_email) AS email
+        FROM nuvedra_group_members WHERE group_id=? ORDER BY lower(user_email)""", (group_id,)))
+    count = 0
+    for member in members:
+        email = str(member.get("email") or "").lower()
+        if email and email != exclude.lower():
+            _notify(conn, email, course_id, title, message, href, "group")
+            count += 1
+    return count
+
+
+def _group_activities(conn: Any, group_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT l.id AS link_id,i.id AS item_id,i.title,i.item_type,i.status,
+        i.points,i.due_at,m.title AS module_title,m.status AS module_status
+        FROM nuvedra_group_item_links l
+        JOIN nexus_content_items i ON i.id=l.item_id
+        JOIN nexus_modules m ON m.id=i.module_id
+        WHERE l.group_id=? ORDER BY m.position,m.id,i.position,i.id""", (group_id,)))
+
+
+def _course_activity_options(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in GROUP_ACTIVITY_TYPES)
+    return rows(execute(conn, f"""SELECT i.id,i.title,i.item_type,i.status,m.title AS module_title
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND i.item_type IN ({placeholders})
+        ORDER BY m.position,m.id,i.position,i.id""",
+        (course_id,) + tuple(sorted(GROUP_ACTIVITY_TYPES))))
+
+
+def register_people_groups(app: FastAPI) -> None:
+    ensure_people_groups_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/people", response_class=HTMLResponse, response_model=None)
+    async def people_groups_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/people")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            people = _course_people(conn, course_id)
+            groups = _course_groups(conn, course_id)
+        people_rows = "".join(
+            f"""<tr><td>{academic_access.esc(person.get('user_email'))}</td>
+            <td>{academic_access.esc(person.get('course_role'))}</td>
+            <td>{academic_access.esc(person.get('status'))}</td></tr>"""
+            for person in people
+        ) or '<tr><td colspan="3">No participants yet.</td></tr>'
+        group_cards = "".join(
+            f"""<article class="studio-panel"><h3>{academic_access.esc(group.get('name'))}</h3>
+            <p>{academic_access.esc(group.get('description'))}</p>
+            <p><strong>{int(group.get('member_count') or 0)}</strong> members ·
+            <strong>{int(group.get('activity_count') or 0)}</strong> assigned activities</p>
+            <a class="studio-button" href="{STUDIO_PREFIX}/groups/{int(group['id'])}"
+               data-i18n-en="Manage group" data-i18n-es="Administrar grupo">Manage group</a></article>"""
+            for group in groups
+        ) or '<section class="studio-empty" data-i18n-en="No active groups yet." data-i18n-es="Todavía no hay grupos activos.">No active groups yet.</section>'
+        body = f"""{_assets()}<main class="studio-shell" data-studio-root data-testid="people-groups-v1">
+        <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="People & Groups" data-i18n-es="Personas y grupos">People & Groups</p>
+        <h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2>
+        <p data-i18n-en="Review the course roster and organize enrolled students into private collaboration groups."
+           data-i18n-es="Revise la lista del curso y organice estudiantes matriculados en grupos privados de colaboración.">Review the course roster and organize enrolled students into private collaboration groups.</p></div></header>
+        <section class="studio-panel"><h3 data-i18n-en="Create group" data-i18n-es="Crear grupo">Create group</h3>
+        <form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/groups" class="studio-form">
+        <label><span data-i18n-en="Group name" data-i18n-es="Nombre del grupo">Group name</span><input name="name" required maxlength="160"></label>
+        <label><span data-i18n-en="Description" data-i18n-es="Descripción">Description</span><textarea name="description" rows="3"></textarea></label>
+        <button class="studio-button" data-i18n-en="Create group" data-i18n-es="Crear grupo">Create group</button></form></section>
+        <section class="studio-section"><h2 data-i18n-en="Active groups" data-i18n-es="Grupos activos">Active groups</h2><div class="studio-grid">{group_cards}</div></section>
+        <section class="studio-panel"><div class="studio-actions"><h2 style="margin-right:auto" data-i18n-en="Course roster" data-i18n-es="Lista del curso">Course roster</h2></div>
+        <p class="studio-notice" data-i18n-en="Enrollment and course-role changes remain administrator responsibilities. Instructors organize existing students into groups here."
+           data-i18n-es="La matrícula y los cambios de rol continúan siendo responsabilidad administrativa. Aquí el instructor organiza estudiantes existentes en grupos.">Enrollment and course-role changes remain administrator responsibilities. Instructors organize existing students into groups here.</p>
+        <div style="overflow:auto"><table><thead><tr><th>Email</th><th data-i18n-en="Course role" data-i18n-es="Rol del curso">Course role</th><th>Status</th></tr></thead><tbody>{people_rows}</tbody></table></div></section></main>"""
+        return academic_access.portal_page("People & Groups", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/groups", response_model=None)
+    async def create_group(course_id: int, request: Request, name: str = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/people")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean = name.strip()
+        if not clean:
+            raise HTTPException(400, "Group name is required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            duplicate = rows(execute(conn, """SELECT id FROM nuvedra_groups
+                WHERE course_id=? AND lower(name)=? AND status='active'""", (course_id, clean.lower())))
+            if duplicate:
+                raise HTTPException(409, "An active group with this name already exists.")
+            now = utcnow()
+            group_id = _insert_id(conn, """INSERT INTO nuvedra_groups
+                (course_id,name,description,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,'active',?,?,?)""",
+                (course_id, clean, description.strip(), user["email"], now, now))
+            audit(conn, user["email"], "group_created", "group", str(group_id), clean,
+                  request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/groups/{group_id}", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/groups/{{group_id}}", response_class=HTMLResponse, response_model=None)
+    async def manage_group(group_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            group = _author_group(conn, group_id, user["email"])
+            course_id = int(group["course_id"])
+            members = _group_members(conn, group_id)
+            students = rows(execute(conn, """SELECT lower(user_email) AS user_email FROM nexus_admin_enrollments
+                WHERE course_id=? AND status='active' AND course_role='student' ORDER BY lower(user_email)""", (course_id,)))
+            member_emails = {str(member.get("user_email") or "").lower() for member in members}
+            available_students = [student for student in students if str(student.get("user_email") or "").lower() not in member_emails]
+            activities = _group_activities(conn, group_id)
+            all_activities = _course_activity_options(conn, course_id)
+            linked_ids = {int(activity["item_id"]) for activity in activities}
+            available_activities = [item for item in all_activities if int(item["id"]) not in linked_ids]
+        member_rows = "".join(
+            f"""<tr><td>{academic_access.esc(member.get('user_email'))}</td><td>{academic_access.esc(member.get('member_role'))}</td>
+            <td><form method="post" action="{STUDIO_PREFIX}/groups/{group_id}/members/{int(member['id'])}/remove">
+            <button class="studio-button studio-button--quiet" data-i18n-en="Remove" data-i18n-es="Remover">Remove</button></form></td></tr>"""
+            for member in members
+        ) or '<tr><td colspan="3">No students assigned yet.</td></tr>'
+        student_options = "".join(f'<option value="{academic_access.esc(student["user_email"], attr=True)}">{academic_access.esc(student["user_email"])}</option>' for student in available_students)
+        activity_rows = "".join(
+            f"""<tr><td>{academic_access.esc(activity.get('module_title'))}</td><td>{academic_access.esc(activity.get('title'))}</td>
+            <td>{academic_access.esc(activity.get('item_type'))}</td><td>{academic_access.esc(activity.get('status'))}</td>
+            <td><form method="post" action="{STUDIO_PREFIX}/groups/{group_id}/activities/{int(activity['link_id'])}/remove">
+            <button class="studio-button studio-button--quiet" data-i18n-en="Unassign" data-i18n-es="Quitar asignación">Unassign</button></form></td></tr>"""
+            for activity in activities
+        ) or '<tr><td colspan="5">No group activities yet.</td></tr>'
+        activity_options = "".join(
+            f'<option value="{int(item["id"])}">{academic_access.esc(item.get("module_title"))} · {academic_access.esc(item.get("title"))} ({academic_access.esc(item.get("item_type"))})</option>'
+            for item in available_activities
+        )
+        add_member_form = f"""<form method="post" action="{STUDIO_PREFIX}/groups/{group_id}/members" class="studio-form">
+            <label><span data-i18n-en="Student" data-i18n-es="Estudiante">Student</span><select name="student_email" required>{student_options}</select></label>
+            <label><span data-i18n-en="Group role" data-i18n-es="Rol del grupo">Group role</span><select name="member_role"><option value="member">Member</option><option value="leader">Leader</option></select></label>
+            <button class="studio-button" data-i18n-en="Add student" data-i18n-es="Añadir estudiante">Add student</button></form>""" if student_options else '<p class="studio-notice" data-i18n-en="All active students are already in this group." data-i18n-es="Todos los estudiantes activos ya están en este grupo.">All active students are already in this group.</p>'
+        add_activity_form = f"""<form method="post" action="{STUDIO_PREFIX}/groups/{group_id}/activities" class="studio-form">
+            <label><span data-i18n-en="Activity" data-i18n-es="Actividad">Activity</span><select name="item_id" required>{activity_options}</select></label>
+            <button class="studio-button" data-i18n-en="Assign to group" data-i18n-es="Asignar al grupo">Assign to group</button></form>""" if activity_options else '<p class="studio-notice" data-i18n-en="No additional group-capable activities are available." data-i18n-es="No hay actividades adicionales disponibles para asignar al grupo.">No additional group-capable activities are available.</p>'
+        body = f"""{_assets()}<main class="studio-shell" data-studio-root data-testid="group-management-v1">
+        <nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{int(group['course_id'])}/people" data-i18n-en="People & Groups" data-i18n-es="Personas y grupos">People & Groups</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Group workspace" data-i18n-es="Espacio del grupo">Group workspace</p>
+        <h2>{academic_access.esc(group.get('name'))}</h2><p>{academic_access.esc(group.get('description'))}</p></div></header>
+        <section class="studio-grid"><article class="studio-panel"><h3 data-i18n-en="Add member" data-i18n-es="Añadir miembro">Add member</h3>{add_member_form}</article>
+        <article class="studio-panel"><h3 data-i18n-en="Assign course activity" data-i18n-es="Asignar actividad del curso">Assign course activity</h3>{add_activity_form}</article></section>
+        <section class="studio-panel"><h3 data-i18n-en="Members" data-i18n-es="Miembros">Members</h3><div style="overflow:auto"><table><thead><tr><th>Email</th><th>Role</th><th>Action</th></tr></thead><tbody>{member_rows}</tbody></table></div></section>
+        <section class="studio-panel"><h3 data-i18n-en="Assigned activities" data-i18n-es="Actividades asignadas">Assigned activities</h3><p data-i18n-en="When an assignment, project, or presentation is assigned to groups, only members of an assigned group can open its submission workflow. Submissions and grades remain individual records in v1."
+           data-i18n-es="Cuando una asignación, proyecto o presentación se asigna a grupos, solo los miembros de un grupo asignado pueden abrir su flujo de entrega. Las entregas y calificaciones continúan siendo registros individuales en v1.">When an assignment, project, or presentation is assigned to groups, only members of an assigned group can open its submission workflow. Submissions and grades remain individual records in v1.</p>
+        <div style="overflow:auto"><table><thead><tr><th>Module</th><th>Activity</th><th>Type</th><th>Status</th><th>Action</th></tr></thead><tbody>{activity_rows}</tbody></table></div></section>
+        <section class="studio-panel"><form method="post" action="{STUDIO_PREFIX}/groups/{group_id}/archive" data-confirm data-confirm-en="Archive this group?" data-confirm-es="¿Archivar este grupo?"><button class="studio-button studio-button--quiet" data-i18n-en="Archive group" data-i18n-es="Archivar grupo">Archive group</button></form></section></main>"""
+        return academic_access.portal_page("Manage Group", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/groups/{{group_id}}/members", response_model=None)
+    async def add_group_member(group_id: int, request: Request, student_email: str = Form(...), member_role: str = Form("member")):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        role = member_role if member_role in {"member", "leader"} else "member"
+        email = student_email.strip().lower()
+        with db() as conn:
+            group = _author_group(conn, group_id, user["email"])
+            course_id = int(group["course_id"])
+            academic_access.require_course_role(conn, course_id, email, {"student"})
+            existing = rows(execute(conn, """SELECT id FROM nuvedra_group_members
+                WHERE group_id=? AND lower(user_email)=?""", (group_id, email)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_group_members SET member_role=? WHERE id=?", (role, int(existing[0]["id"])))
+            else:
+                execute(conn, """INSERT INTO nuvedra_group_members
+                    (group_id,user_email,member_role,created_at) VALUES (?,?,?,?)""",
+                    (group_id, email, role, utcnow()))
+            _notify(conn, email, course_id, f"Added to group: {group.get('name')}",
+                    "You were added to a course collaboration group.", f"/learn/groups/{group_id}", "group")
+            audit(conn, user["email"], "group_member_added", "group", str(group_id), email,
+                  request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/groups/{group_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/groups/{{group_id}}/members/{{member_id}}/remove", response_model=None)
+    async def remove_group_member(group_id: int, member_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            _author_group(conn, group_id, user["email"])
+            member = rows(execute(conn, "SELECT * FROM nuvedra_group_members WHERE id=? AND group_id=?", (member_id, group_id)))
+            if not member:
+                raise HTTPException(404, "Group member not found.")
+            execute(conn, "DELETE FROM nuvedra_group_members WHERE id=?", (member_id,))
+            audit(conn, user["email"], "group_member_removed", "group", str(group_id),
+                  str(member[0].get("user_email") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/groups/{group_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/groups/{{group_id}}/activities", response_model=None)
+    async def assign_group_activity(group_id: int, request: Request, item_id: int = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            group = _author_group(conn, group_id, user["email"])
+            course_id = int(group["course_id"])
+            item_course_id, item, _module = academic_access.item_bundle(conn, item_id)
+            if item_course_id != course_id:
+                raise HTTPException(400, "The activity must belong to the same course as the group.")
+            if str(item.get("item_type") or "") not in GROUP_ACTIVITY_TYPES:
+                raise HTTPException(400, "This activity type cannot be assigned to a group.")
+            duplicate = rows(execute(conn, "SELECT id FROM nuvedra_group_item_links WHERE group_id=? AND item_id=?", (group_id, item_id)))
+            if not duplicate:
+                execute(conn, """INSERT INTO nuvedra_group_item_links
+                    (group_id,item_id,created_by,created_at) VALUES (?,?,?,?)""",
+                    (group_id, item_id, user["email"], utcnow()))
+            _notify_group(conn, group_id, course_id, title=f"Group activity: {item.get('title')}",
+                          message=f"{group.get('name')} received a course activity.",
+                          href=f"/learn/groups/{group_id}")
+            audit(conn, user["email"], "group_activity_assigned", "item", str(item_id),
+                  f"group={group_id}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/groups/{group_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/groups/{{group_id}}/activities/{{link_id}}/remove", response_model=None)
+    async def unassign_group_activity(group_id: int, link_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            _author_group(conn, group_id, user["email"])
+            link = rows(execute(conn, "SELECT * FROM nuvedra_group_item_links WHERE id=? AND group_id=?", (link_id, group_id)))
+            if not link:
+                raise HTTPException(404, "Group activity link not found.")
+            execute(conn, "DELETE FROM nuvedra_group_item_links WHERE id=?", (link_id,))
+            audit(conn, user["email"], "group_activity_unassigned", "group", str(group_id),
+                  f"item={link[0].get('item_id')}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/groups/{group_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/groups/{{group_id}}/archive", response_model=None)
+    async def archive_group(group_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            group = _author_group(conn, group_id, user["email"])
+            execute(conn, "UPDATE nuvedra_groups SET status='archived',updated_at=? WHERE id=?", (utcnow(), group_id))
+            audit(conn, user["email"], "group_archived", "group", str(group_id), "",
+                  request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(group['course_id'])}/people", status_code=303)
+
+    @app.get("/learn/groups", response_class=HTMLResponse, response_model=None)
+    async def student_groups(request: Request):
+        user = _user(request, "/learn/groups")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            groups = rows(execute(conn, """SELECT g.*,c.course_code,c.title AS course_title,gm.member_role
+                FROM nuvedra_group_members gm
+                JOIN nuvedra_groups g ON g.id=gm.group_id
+                JOIN nexus_admin_courses c ON c.id=g.course_id
+                JOIN nexus_admin_enrollments e ON e.course_id=g.course_id AND lower(e.user_email)=lower(gm.user_email)
+                WHERE lower(gm.user_email)=? AND gm.user_email IS NOT NULL
+                  AND e.status='active' AND e.course_role='student'
+                  AND g.status='active' AND c.status='active'
+                ORDER BY c.title,g.name""", (user["email"].lower(),)))
+        cards = "".join(
+            f"""<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(group.get('course_code'))}</p>
+            <h3>{academic_access.esc(group.get('name'))}</h3><p>{academic_access.esc(group.get('description'))}</p>
+            <p><small>{academic_access.esc(group.get('member_role'))}</small></p>
+            <a class="studio-button" href="/learn/groups/{int(group['id'])}" data-i18n-en="Open group" data-i18n-es="Abrir grupo">Open group</a></article>"""
+            for group in groups
+        ) or '<section class="studio-empty" data-i18n-en="You are not assigned to an active group." data-i18n-es="No está asignado a un grupo activo.">You are not assigned to an active group.</section>'
+        body = f"""{_assets()}<main class="studio-shell" data-studio-root data-testid="student-groups-v1">
+        <nav class="studio-breadcrumbs"><a href="/learn/dashboard" data-i18n-en="Dashboard" data-i18n-es="Panel">Dashboard</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="My Groups" data-i18n-es="Mis grupos">My Groups</p>
+        <h2 data-i18n-en="Private collaboration spaces" data-i18n-es="Espacios privados de colaboración">Private collaboration spaces</h2>
+        <p data-i18n-en="Work with your assigned classmates and review activities targeted to your group."
+           data-i18n-es="Colabore con sus compañeros asignados y revise actividades dirigidas a su grupo.">Work with your assigned classmates and review activities targeted to your group.</p></div></header>
+        <section class="studio-grid">{cards}</section></main>"""
+        return academic_access.portal_page("My Groups", body, user)
+
+    @app.get("/learn/groups/{group_id}", response_class=HTMLResponse, response_model=None)
+    async def student_group_space(group_id: int, request: Request):
+        user = _user(request, f"/learn/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            group, membership = _student_group(conn, group_id, user["email"])
+            members = _group_members(conn, group_id)
+            activities = _group_activities(conn, group_id)
+            posts = rows(execute(conn, """SELECT * FROM nuvedra_group_posts
+                WHERE group_id=? ORDER BY created_at,id""", (group_id,)))
+        member_html = "".join(f"<li>{academic_access.esc(member.get('user_email'))} · {academic_access.esc(member.get('member_role'))}</li>" for member in members)
+        activity_html = "".join(
+            f"""<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(item.get('module_title'))} · {academic_access.esc(item.get('item_type'))}</p>
+            <h3>{academic_access.esc(item.get('title'))}</h3>
+            <p>{academic_access.esc(item.get('status'))}{(' · '+academic_access.esc(item.get('points'))+' pts') if item.get('points') is not None else ''}</p>
+            <a class="studio-button" href="/learn/assignments/{int(item['item_id'])}" data-i18n-en="Open activity" data-i18n-es="Abrir actividad">Open activity</a></article>"""
+            for item in activities
+        ) or '<section class="studio-empty" data-i18n-en="No activities are assigned to this group yet." data-i18n-es="Todavía no hay actividades asignadas a este grupo.">No activities are assigned to this group yet.</section>'
+        post_html = "".join(
+            f"""<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(post.get('author_email'))}</p>
+            <p>{academic_access.esc(post.get('body'))}</p><small>{academic_access.esc(post.get('created_at'))}</small></article>"""
+            for post in posts
+        ) or '<section class="studio-empty" data-i18n-en="No group messages yet." data-i18n-es="Todavía no hay mensajes del grupo.">No group messages yet.</section>'
+        body = f"""{_assets()}<main class="studio-shell" data-studio-root data-testid="student-group-space-v1">
+        <nav class="studio-breadcrumbs"><a href="/learn/groups" data-i18n-en="My Groups" data-i18n-es="Mis grupos">My Groups</a><span>/</span><a href="/learn/courses/{int(group['course_id'])}" data-i18n-en="Course" data-i18n-es="Curso">Course</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow">{academic_access.esc(group.get('course_code'))} · {academic_access.esc(membership.get('member_role'))}</p>
+        <h2>{academic_access.esc(group.get('name'))}</h2><p>{academic_access.esc(group.get('description'))}</p></div></header>
+        <section class="studio-grid"><article class="studio-panel"><h3 data-i18n-en="Group members" data-i18n-es="Miembros del grupo">Group members</h3><ul>{member_html}</ul></article>
+        <article class="studio-panel"><h3 data-i18n-en="Post to group" data-i18n-es="Publicar al grupo">Post to group</h3>
+        <form method="post" action="/learn/groups/{group_id}/posts" class="studio-form"><label><span data-i18n-en="Message" data-i18n-es="Mensaje">Message</span><textarea name="body" rows="4" required maxlength="4000"></textarea></label>
+        <button class="studio-button" data-i18n-en="Post message" data-i18n-es="Publicar mensaje">Post message</button></form></article></section>
+        <section class="studio-section"><h2 data-i18n-en="Group activities" data-i18n-es="Actividades del grupo">Group activities</h2><div class="studio-grid">{activity_html}</div></section>
+        <section class="studio-section"><h2 data-i18n-en="Private collaboration" data-i18n-es="Colaboración privada">Private collaboration</h2>{post_html}</section></main>"""
+        return academic_access.portal_page("Group Space", body, user)
+
+    @app.post("/learn/groups/{group_id}/posts", response_model=None)
+    async def student_group_post(group_id: int, request: Request, body: str = Form(...)):
+        user = _user(request, f"/learn/groups/{group_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean = body.strip()
+        if not clean:
+            raise HTTPException(400, "Group message cannot be empty.")
+        if len(clean) > 4000:
+            raise HTTPException(400, "Group message is too long.")
+        with db() as conn:
+            group, _membership = _student_group(conn, group_id, user["email"])
+            now = utcnow()
+            _insert_id(conn, """INSERT INTO nuvedra_group_posts
+                (group_id,author_email,body,parent_id,created_at,updated_at)
+                VALUES (?,?,?,NULL,?,?)""", (group_id, user["email"], clean, now, now))
+            _notify_group(conn, group_id, int(group["course_id"]),
+                          title=f"New message in {group.get('name')}",
+                          message=f"{user['email']} posted to your group.",
+                          href=f"/learn/groups/{group_id}", exclude=user["email"])
+            audit(conn, user["email"], "group_post_created", "group", str(group_id), "",
+                  request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/groups/{group_id}", status_code=303)
+
+    print("NUVEDRA People & Groups v1 registered: read-only course roster, private student groups, targeted group activities, notifications, and collaboration spaces.", flush=True)
