@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+RULE_TYPES = {"item_completed", "item_grade", "module_completed", "course_progress", "outcome_attainment"}
+TARGET_TYPES = {"module", "item"}
+THRESHOLD_RULES = {"item_grade", "course_progress", "outcome_attainment"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def ensure_learning_paths_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_learning_path_rules (
+            id {pk}, course_id INTEGER NOT NULL, target_type TEXT NOT NULL, target_id INTEGER NOT NULL,
+            rule_type TEXT NOT NULL, source_id INTEGER, threshold REAL, position INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+
+def _item_complete(conn: Any, item_id: int, email: str) -> bool:
+    progress = rows(execute(conn, "SELECT status FROM nuvedra_content_progress WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    if progress and str(progress[0].get("status")) == "completed":
+        return True
+    submission = rows(execute(conn, "SELECT status FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    if submission and str(submission[0].get("status")) == "submitted":
+        return True
+    attempts = rows(execute(conn, "SELECT status FROM nuvedra_assessment_attempts WHERE item_id=? AND lower(student_email)=? ORDER BY id DESC LIMIT 1", (item_id, email.lower())))
+    return bool(attempts and str(attempts[0].get("status")) != "in_progress")
+
+
+def _item_grade_percent(conn: Any, item_id: int, email: str) -> float | None:
+    data = rows(execute(conn, """SELECT i.points,g.points_awarded,g.status
+        FROM nexus_content_items i
+        LEFT JOIN nuvedra_submissions s ON s.item_id=i.id AND lower(s.student_email)=?
+        LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+        WHERE i.id=? ORDER BY g.id DESC LIMIT 1""", (email.lower(), item_id)))
+    if not data or str(data[0].get("status") or "") != "graded":
+        return None
+    possible = float(data[0].get("points") or 0)
+    if possible <= 0 or data[0].get("points_awarded") is None:
+        return None
+    return max(0.0, min(100.0, (float(data[0]["points_awarded"]) / possible) * 100.0))
+
+
+def _module_complete(conn: Any, module_id: int, email: str) -> tuple[bool, int, int]:
+    items = rows(execute(conn, "SELECT id FROM nexus_content_items WHERE module_id=? AND status='published' ORDER BY position,id", (module_id,)))
+    total = len(items)
+    completed = sum(1 for item in items if _item_complete(conn, int(item["id"]), email))
+    return bool(total and completed == total), completed, total
+
+
+def _course_progress(conn: Any, course_id: int, email: str) -> float:
+    items = rows(execute(conn, """SELECT i.id FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND m.status='published' AND i.status='published'""", (course_id,)))
+    if not items:
+        return 0.0
+    completed = sum(1 for item in items if _item_complete(conn, int(item["id"]), email))
+    return (completed / len(items)) * 100.0
+
+
+def _outcome_attainment(conn: Any, outcome_id: int, email: str) -> float | None:
+    data = rows(execute(conn, """SELECT i.id,i.points,g.points_awarded,g.status
+        FROM nuvedra_outcome_links ol
+        JOIN nexus_content_items i ON i.id=ol.item_id
+        LEFT JOIN nuvedra_submissions s ON s.item_id=i.id AND lower(s.student_email)=?
+        LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+        WHERE ol.outcome_id=?""", (email.lower(), outcome_id)))
+    awarded = 0.0
+    possible = 0.0
+    for row in data:
+        if str(row.get("status") or "") != "graded" or row.get("points_awarded") is None:
+            continue
+        item_points = float(row.get("points") or 0)
+        if item_points <= 0:
+            continue
+        possible += item_points
+        awarded += max(0.0, min(item_points, float(row["points_awarded"])))
+    return None if possible <= 0 else (awarded / possible) * 100.0
+
+
+def _item_label(conn: Any, item_id: int) -> str:
+    found = rows(execute(conn, "SELECT title FROM nexus_content_items WHERE id=?", (item_id,)))
+    return str(found[0].get("title") or f"Item {item_id}") if found else f"Item {item_id}"
+
+
+def _module_label(conn: Any, module_id: int) -> str:
+    found = rows(execute(conn, "SELECT title FROM nexus_modules WHERE id=?", (module_id,)))
+    return str(found[0].get("title") or f"Module {module_id}") if found else f"Module {module_id}"
+
+
+def _outcome_label(conn: Any, outcome_id: int) -> str:
+    found = rows(execute(conn, "SELECT code,title FROM nuvedra_outcomes WHERE id=?", (outcome_id,)))
+    if not found:
+        return f"Outcome {outcome_id}"
+    code = str(found[0].get("code") or "").strip()
+    title = str(found[0].get("title") or "Learning outcome")
+    return f"{code}: {title}" if code else title
+
+
+def _target_course(conn: Any, target_type: str, target_id: int) -> int:
+    if target_type == "module":
+        found = rows(execute(conn, "SELECT course_id FROM nexus_modules WHERE id=?", (target_id,)))
+    else:
+        found = rows(execute(conn, "SELECT m.course_id FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id WHERE i.id=?", (target_id,)))
+    if not found:
+        raise HTTPException(404, "Learning-path target was not found.")
+    return int(found[0]["course_id"])
+
+
+def _source_node(rule_type: str, source_id: int | None) -> str | None:
+    if source_id is None:
+        return None
+    if rule_type in {"item_completed", "item_grade"}:
+        return f"item:{source_id}"
+    if rule_type == "module_completed":
+        return f"module:{source_id}"
+    return None
+
+
+def _target_node(target_type: str, target_id: int) -> str:
+    return f"{target_type}:{target_id}"
+
+
+def _creates_cycle(conn: Any, course_id: int, target_type: str, target_id: int, rule_type: str, source_id: int | None) -> bool:
+    source = _source_node(rule_type, source_id)
+    if source is None:
+        return False
+    target = _target_node(target_type, target_id)
+    if source == target:
+        return True
+    graph: dict[str, list[str]] = {}
+    existing = rows(execute(conn, "SELECT target_type,target_id,rule_type,source_id FROM nuvedra_learning_path_rules WHERE course_id=? AND status='active'", (course_id,)))
+    for rule in existing:
+        src = _source_node(str(rule.get("rule_type") or ""), int(rule["source_id"]) if rule.get("source_id") not in (None, "") else None)
+        if src:
+            graph.setdefault(_target_node(str(rule["target_type"]), int(rule["target_id"])), []).append(src)
+    stack = [source]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(graph.get(node, []))
+    return False
+
+
+def _rule_result(conn: Any, rule: dict[str, Any], email: str) -> tuple[bool, str]:
+    kind = str(rule.get("rule_type") or "")
+    source_id = int(rule["source_id"]) if rule.get("source_id") not in (None, "") else None
+    threshold = float(rule.get("threshold") or 0)
+    if kind == "item_completed" and source_id is not None:
+        passed = _item_complete(conn, source_id, email)
+        return passed, f"Complete {_item_label(conn, source_id)}."
+    if kind == "item_grade" and source_id is not None:
+        current = _item_grade_percent(conn, source_id, email)
+        passed = current is not None and current + 1e-9 >= threshold
+        current_text = "not graded" if current is None else f"{current:.1f}%"
+        return passed, f"Earn at least {threshold:g}% on {_item_label(conn, source_id)} (current: {current_text})."
+    if kind == "module_completed" and source_id is not None:
+        passed, completed, total = _module_complete(conn, source_id, email)
+        return passed, f"Complete {_module_label(conn, source_id)} ({completed}/{total} completed)."
+    if kind == "course_progress":
+        current = _course_progress(conn, int(rule["course_id"]), email)
+        return current + 1e-9 >= threshold, f"Reach {threshold:g}% course progress (current: {current:.1f}%)."
+    if kind == "outcome_attainment" and source_id is not None:
+        current = _outcome_attainment(conn, source_id, email)
+        passed = current is not None and current + 1e-9 >= threshold
+        current_text = "no graded evidence" if current is None else f"{current:.1f}%"
+        return passed, f"Reach {threshold:g}% attainment for {_outcome_label(conn, source_id)} (current: {current_text})."
+    return False, "A learning-path rule is incomplete and requires instructor review."
+
+
+def evaluate_target(conn: Any, course_id: int, target_type: str, target_id: int, email: str) -> dict[str, Any]:
+    rules = rows(execute(conn, """SELECT * FROM nuvedra_learning_path_rules
+        WHERE course_id=? AND target_type=? AND target_id=? AND status='active'
+        ORDER BY position,id""", (course_id, target_type, target_id)))
+    results = []
+    for rule in rules:
+        passed, reason = _rule_result(conn, rule, email)
+        results.append({"passed": passed, "reason": reason, "rule": rule})
+    return {"unlocked": all(result["passed"] for result in results), "results": results}
+
+
+def evaluate_item_access(conn: Any, item_id: int, email: str) -> dict[str, Any]:
+    course_id, item, module = academic_access.item_bundle(conn, item_id)
+    enrollment = academic_access.enrollment(conn, course_id, email)
+    if enrollment and str(enrollment.get("course_role")) != "student":
+        return {"unlocked": True, "results": [], "course_id": course_id, "item": item, "module": module}
+    module_result = evaluate_target(conn, course_id, "module", int(module["id"]), email)
+    item_result = evaluate_target(conn, course_id, "item", item_id, email)
+    return {
+        "unlocked": bool(module_result["unlocked"] and item_result["unlocked"]),
+        "results": module_result["results"] + item_result["results"],
+        "course_id": course_id,
+        "item": item,
+        "module": module,
+    }
+
+
+def require_item_access(conn: Any, item_id: int, email: str) -> dict[str, Any]:
+    result = evaluate_item_access(conn, item_id, email)
+    if not result["unlocked"]:
+        unmet = [entry["reason"] for entry in result["results"] if not entry["passed"]]
+        detail = "This learning activity is locked. " + " ".join(unmet[:4])
+        raise HTTPException(403, detail)
+    return result
+
+
+def _canonical_item_href(item: dict[str, Any]) -> str:
+    item_id = int(item["id"])
+    kind = str(item.get("item_type") or "")
+    if kind in {"assignment", "project", "presentation"}:
+        return f"/learn/assignments/{item_id}"
+    if kind == "discussion":
+        return f"/learn/discussions/{item_id}"
+    if kind in {"assessment", "quiz"}:
+        return f"/learn/assessments/{item_id}"
+    if kind in {"scorm", "lti", "lti13", "cmi5"} and str(item.get("external_url") or "").startswith("/"):
+        return str(item["external_url"])
+    return f"/learn/items/{item_id}"
+
+
+def _parse_target(value: str) -> tuple[str, int]:
+    prefix, sep, raw = value.partition(":")
+    if not sep or prefix not in TARGET_TYPES or not raw.isdigit():
+        raise HTTPException(400, "Invalid learning-path target.")
+    return prefix, int(raw)
+
+
+def _parse_source(value: str, rule_type: str) -> int | None:
+    if rule_type == "course_progress":
+        return None
+    prefix, sep, raw = value.partition(":")
+    expected = "item" if rule_type in {"item_completed", "item_grade"} else ("module" if rule_type == "module_completed" else "outcome")
+    if not sep or prefix != expected or not raw.isdigit():
+        raise HTTPException(400, "The prerequisite source does not match the selected rule type.")
+    return int(raw)
+
+
+def _validate_source_course(conn: Any, course_id: int, rule_type: str, source_id: int | None) -> None:
+    if source_id is None:
+        return
+    if rule_type in {"item_completed", "item_grade"}:
+        found = rows(execute(conn, "SELECT m.course_id FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id WHERE i.id=?", (source_id,)))
+    elif rule_type == "module_completed":
+        found = rows(execute(conn, "SELECT course_id FROM nexus_modules WHERE id=?", (source_id,)))
+    else:
+        found = rows(execute(conn, "SELECT course_id FROM nuvedra_outcomes WHERE id=?", (source_id,)))
+    if not found or int(found[0]["course_id"]) != course_id:
+        raise HTTPException(400, "Prerequisite source must belong to this course.")
+
+
+def register_learning_paths_prerequisites(app: FastAPI) -> None:
+    ensure_learning_paths_schema()
+    setattr(academic_access, "require_learning_path_item_access", require_item_access)
+    setattr(academic_access, "evaluate_learning_path_item_access", evaluate_item_access)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/paths", response_class=HTMLResponse, response_model=None)
+    async def instructor_paths(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/paths")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            modules = rows(execute(conn, "SELECT id,title,position,status FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+            items = rows(execute(conn, """SELECT i.id,i.title,i.item_type,m.title AS module_title,m.position AS module_position
+                FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id WHERE m.course_id=? ORDER BY m.position,i.position,i.id""", (course_id,)))
+            outcomes = rows(execute(conn, "SELECT id,code,title FROM nuvedra_outcomes WHERE course_id=? AND status='active' ORDER BY code,title,id", (course_id,)))
+            rules = rows(execute(conn, "SELECT * FROM nuvedra_learning_path_rules WHERE course_id=? AND status='active' ORDER BY target_type,target_id,position,id", (course_id,)))
+            rule_rows = []
+            for rule in rules:
+                target_label = _module_label(conn, int(rule["target_id"])) if rule["target_type"] == "module" else _item_label(conn, int(rule["target_id"]))
+                source_id = int(rule["source_id"]) if rule.get("source_id") not in (None, "") else None
+                kind = str(rule["rule_type"])
+                if kind in {"item_completed", "item_grade"} and source_id is not None: source_label = _item_label(conn, source_id)
+                elif kind == "module_completed" and source_id is not None: source_label = _module_label(conn, source_id)
+                elif kind == "outcome_attainment" and source_id is not None: source_label = _outcome_label(conn, source_id)
+                else: source_label = "Course progress"
+                threshold = f" · {float(rule['threshold']):g}%" if rule.get("threshold") is not None else ""
+                rule_rows.append(f'''<tr><td>{academic_access.esc(str(rule['target_type']).title())}: {academic_access.esc(target_label)}</td><td>{academic_access.esc(kind.replace('_',' ').title())}</td><td>{academic_access.esc(source_label)}{threshold}</td><td><form method="post" action="{STUDIO_PREFIX}/paths/rules/{int(rule['id'])}/archive"><button class="studio-button studio-button--quiet" data-i18n-en="Remove" data-i18n-es="Eliminar">Remove</button></form></td></tr>''')
+        target_options = "".join(f'<option value="module:{int(m["id"])}">Module · {academic_access.esc(m.get("title"))}</option>' for m in modules) + "".join(f'<option value="item:{int(i["id"])}">Item · {academic_access.esc(i.get("module_title"))} · {academic_access.esc(i.get("title"))}</option>' for i in items)
+        source_options = "".join(f'<option value="item:{int(i["id"])}">Item · {academic_access.esc(i.get("module_title"))} · {academic_access.esc(i.get("title"))}</option>' for i in items) + "".join(f'<option value="module:{int(m["id"])}">Module · {academic_access.esc(m.get("title"))}</option>' for m in modules) + "".join(f'<option value="outcome:{int(o["id"])}">Outcome · {academic_access.esc(o.get("code") or "")} {academic_access.esc(o.get("title"))}</option>' for o in outcomes)
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="learning-paths-prerequisites-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Learning Paths & Prerequisites" data-i18n-es="Rutas de aprendizaje y prerrequisitos">Learning Paths & Prerequisites</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Control when students can open modules and activities using transparent, reviewable academic rules." data-i18n-es="Controle cuándo el estudiante puede abrir módulos y actividades mediante reglas académicas transparentes y revisables.">Control when students can open modules and activities using transparent, reviewable academic rules.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Add prerequisite rule" data-i18n-es="Añadir regla de prerrequisito">Add prerequisite rule</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/paths/rules" class="studio-form"><label>Target / Destino<select name="target" required>{target_options}</select></label><label>Rule / Regla<select name="rule_type" required><option value="item_completed">Complete an item / Completar un elemento</option><option value="item_grade">Minimum item grade / Nota mínima en elemento</option><option value="module_completed">Complete a module / Completar un módulo</option><option value="course_progress">Minimum course progress / Progreso mínimo del curso</option><option value="outcome_attainment">Minimum outcome attainment / Logro mínimo de resultado</option></select></label><label>Source / Fuente<select name="source"><option value="">Course progress / Progreso del curso</option>{source_options}</select></label><label>Threshold % / Umbral %<input name="threshold" type="number" min="0" max="100" step="0.01" value="80"></label><button class="studio-button" data-i18n-en="Add rule" data-i18n-es="Añadir regla">Add rule</button></form><p><small data-i18n-en="All active rules on a target must be satisfied. NUVEDRA rejects direct prerequisite cycles." data-i18n-es="Todas las reglas activas de un destino deben cumplirse. NUVEDRA rechaza ciclos directos de prerrequisitos.">All active rules on a target must be satisfied. NUVEDRA rejects prerequisite cycles.</small></p></section><section class="studio-panel"><h3 data-i18n-en="Active rules" data-i18n-es="Reglas activas">Active rules</h3><div style="overflow:auto"><table><thead><tr><th>Target</th><th>Rule</th><th>Requirement</th><th>Action</th></tr></thead><tbody>{''.join(rule_rows) or '<tr><td colspan="4">No prerequisite rules yet.</td></tr>'}</tbody></table></div></section><section class="studio-panel"><p><strong>Design note:</strong> prerequisite rules control access; they do not alter grades. Outcome and grade thresholds use existing graded evidence. Observers remain read-only and are not forced through learner progression gates.</p></section></main>'''
+        return academic_access.portal_page("Learning Paths & Prerequisites", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/paths/rules", response_model=None)
+    async def add_rule(course_id: int, request: Request, target: str = Form(...), rule_type: str = Form(...), source: str = Form(""), threshold: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/paths")
+        if isinstance(user, RedirectResponse): return user
+        if rule_type not in RULE_TYPES:
+            raise HTTPException(400, "Unsupported prerequisite rule type.")
+        target_type, target_id = _parse_target(target)
+        source_id = _parse_source(source, rule_type)
+        value: float | None = None
+        if rule_type in THRESHOLD_RULES:
+            try: value = float(threshold)
+            except ValueError as exc: raise HTTPException(400, "Threshold must be numeric.") from exc
+            if value < 0 or value > 100: raise HTTPException(400, "Threshold must be between 0 and 100.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            if _target_course(conn, target_type, target_id) != course_id:
+                raise HTTPException(400, "Learning-path target must belong to this course.")
+            _validate_source_course(conn, course_id, rule_type, source_id)
+            if _creates_cycle(conn, course_id, target_type, target_id, rule_type, source_id):
+                raise HTTPException(409, "This prerequisite would create a learning-path cycle.")
+            position = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nuvedra_learning_path_rules WHERE course_id=? AND target_type=? AND target_id=? AND status='active'", (course_id, target_type, target_id)))[0]["p"])
+            now = utcnow()
+            rule_id = _insert_id(conn, """INSERT INTO nuvedra_learning_path_rules
+                (course_id,target_type,target_id,rule_type,source_id,threshold,position,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,'active',?,?,?)""", (course_id, target_type, target_id, rule_type, source_id, value, position, user["email"], now, now))
+            audit(conn, user["email"], "learning_path_rule_created", "learning_path_rule", str(rule_id), f"{target_type}:{target_id};{rule_type}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/paths", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/paths/rules/{{rule_id}}/archive", response_model=None)
+    async def archive_rule(rule_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            found = rows(execute(conn, "SELECT * FROM nuvedra_learning_path_rules WHERE id=?", (rule_id,)))
+            if not found: raise HTTPException(404, "Prerequisite rule not found.")
+            rule = found[0]
+            academic_access.require_course_role(conn, int(rule["course_id"]), user["email"], academic_access.AUTHOR_ROLES)
+            execute(conn, "UPDATE nuvedra_learning_path_rules SET status='archived',updated_at=? WHERE id=?", (utcnow(), rule_id))
+            audit(conn, user["email"], "learning_path_rule_archived", "learning_path_rule", str(rule_id), "archived", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(rule['course_id'])}/paths", status_code=303)
+
+    @app.get("/learn/paths/items/{item_id}", response_class=HTMLResponse, response_model=None)
+    async def learning_path_gateway(item_id: int, request: Request):
+        user = _user(request, f"/learn/paths/items/{item_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course_id, item, module = academic_access.item_bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This content is not available.")
+            result = evaluate_item_access(conn, item_id, user["email"])
+        if result["unlocked"]:
+            return RedirectResponse(_canonical_item_href(item), status_code=303)
+        unmet = [entry["reason"] for entry in result["results"] if not entry["passed"]]
+        reasons = "".join(f'<li>{academic_access.esc(reason)}</li>' for reason in unmet)
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="learning-path-locked-item"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a><span>/</span><a href="/learn/courses/{course_id}/path" data-i18n-en="Learning path" data-i18n-es="Ruta de aprendizaje">Learning path</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="Locked by prerequisites" data-i18n-es="Bloqueado por prerrequisitos">Locked by prerequisites</p><h2>{academic_access.esc(item.get('title'))}</h2><p data-i18n-en="Complete the requirements below to unlock this activity." data-i18n-es="Complete los requisitos siguientes para desbloquear esta actividad.">Complete the requirements below to unlock this activity.</p></div></header><section class="studio-panel"><h3 data-i18n-en="Requirements still pending" data-i18n-es="Requisitos pendientes">Requirements still pending</h3><ul>{reasons}</ul></section></main>'''
+        return academic_access.portal_page("Locked learning activity", body, user)
+
+    @app.get("/learn/courses/{course_id}/path", response_class=HTMLResponse, response_model=None)
+    async def student_learning_path(course_id: int, request: Request):
+        user = _user(request, f"/learn/courses/{course_id}/path")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active": raise HTTPException(403, "This course is not available.")
+            modules = rows(execute(conn, "SELECT * FROM nexus_modules WHERE course_id=? AND status='published' ORDER BY position,id", (course_id,)))
+            cards = []
+            for module in modules:
+                module_result = evaluate_target(conn, course_id, "module", int(module["id"]), user["email"]) if str(access.get("course_role")) == "student" else {"unlocked": True, "results": []}
+                item_rows = rows(execute(conn, "SELECT * FROM nexus_content_items WHERE module_id=? AND status='published' ORDER BY position,id", (int(module["id"]),)))
+                item_html = []
+                for item in item_rows:
+                    result = evaluate_item_access(conn, int(item["id"]), user["email"])
+                    complete = _item_complete(conn, int(item["id"]), user["email"])
+                    state = "Completed" if complete else ("Available" if result["unlocked"] else "Locked")
+                    pending = [entry["reason"] for entry in result["results"] if not entry["passed"]]
+                    note = f'<br><small>{academic_access.esc(" ".join(pending[:2]))}</small>' if pending else ""
+                    item_html.append(f'<li><strong>{academic_access.esc(state)}</strong> · <a href="/learn/paths/items/{int(item["id"])}">{academic_access.esc(item.get("title"))}</a>{note}</li>')
+                module_state = "Available" if module_result["unlocked"] else "Locked"
+                cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">Module {int(module.get('position') or 1)} · {module_state}</p><h3>{academic_access.esc(module.get('title'))}</h3><ol>{''.join(item_html) or '<li>No published activities.</li>'}</ol></article>''')
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-learning-path-v1"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="My learning path" data-i18n-es="Mi ruta de aprendizaje">My learning path</p><h2>{academic_access.esc(access.get('course_code'))}: {academic_access.esc(access.get('title'))}</h2><p data-i18n-en="See what is available now and exactly what remains before locked activities open." data-i18n-es="Vea qué está disponible ahora y qué falta exactamente para abrir las actividades bloqueadas.">See what is available now and exactly what remains before locked activities open.</p></div></header><section class="studio-grid">{''.join(cards)}</section></main>'''
+        return academic_access.portal_page("My learning path", body, user)
+
+    print("NUVEDRA Learning Paths & Prerequisites v1 registered: module/item gates, progress, grade and outcome rules, cycle protection, learner explanations, and observer-safe read-only access.", flush=True)
