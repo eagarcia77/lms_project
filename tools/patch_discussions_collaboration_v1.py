@@ -52,6 +52,12 @@ def patch_student_discussion_links() -> None:
         if old not in text:
             raise RuntimeError("Discussions & Collaboration v1 could not patch Student Experience discussion links.")
         text = text.replace(old, new, 1)
+
+        old_direct = '''            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)\n'''
+        new_direct = '''            if str(item.get("item_type")) == "discussion": return RedirectResponse(f"/learn/discussions/{item_id}",status_code=303)\n            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)\n'''
+        if old_direct not in text:
+            raise RuntimeError("Discussions & Collaboration v1 could not add the direct discussion redirect.")
+        text = text.replace(old_direct, new_direct, 1)
     STUDENT_EXPERIENCE.write_text(text, encoding="utf-8")
 
 
