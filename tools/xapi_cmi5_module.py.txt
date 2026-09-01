@@ -1,0 +1,605 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import secrets
+import urllib.parse
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+XAPI_VERSION = "1.0.3"
+COMPLETED_VERB = "http://adlnet.gov/expapi/verbs/completed"
+PASSED_VERB = "http://adlnet.gov/expapi/verbs/passed"
+FAILED_VERB = "http://adlnet.gov/expapi/verbs/failed"
+MOVE_ON = {"Completed", "Passed", "CompletedAndPassed", "CompletedOrPassed", "NotApplicable"}
+MAX_STATEMENT_BYTES = 256 * 1024
+MAX_STATE_BYTES = 64 * 1024
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _absolute(request: Request, path: str) -> str:
+    origin = (os.getenv("NUVEDRA_XAPI_ENDPOINT") or "").strip().rstrip("/")
+    if origin:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise HTTPException(500, "NUVEDRA_XAPI_ENDPOINT must be a canonical HTTPS origin.")
+        return origin + path
+    return str(request.base_url).rstrip("/") + path
+
+
+def _safe_launch_url(value: str) -> str:
+    clean = value.strip()
+    parsed = urllib.parse.urlparse(clean)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise HTTPException(400, "cmi5 launch URL must be HTTPS and must not contain embedded credentials.")
+    if parsed.hostname and (parsed.hostname.lower() in {"localhost", "localhost.localdomain"} or parsed.hostname.lower().endswith(".local")):
+        raise HTTPException(400, "cmi5 launch URL cannot target a local host.")
+    return clean
+
+
+def _hash_secret(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _actor_name(email: str) -> str:
+    salt = (os.getenv("NUVEDRA_XAPI_ACTOR_SALT") or os.getenv("SESSION_SECRET") or "nuvedra-xapi").encode("utf-8")
+    return hashlib.sha256(salt + b"|" + email.lower().encode("utf-8")).hexdigest()[:48]
+
+
+def _actor_payload(request: Request, email: str) -> dict[str, Any]:
+    return {
+        "objectType": "Agent",
+        "account": {
+            "homePage": _absolute(request, ""),
+            "name": _actor_name(email),
+        },
+    }
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def ensure_xapi_cmi5_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_xapi_sources (
+            id {pk}, course_id INTEGER NOT NULL, name TEXT NOT NULL, client_key TEXT NOT NULL UNIQUE,
+            secret_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, last_used_at TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_cmi5_aus (
+            id {pk}, course_id INTEGER NOT NULL, module_id INTEGER NOT NULL, item_id INTEGER NOT NULL UNIQUE,
+            title TEXT NOT NULL, launch_url TEXT NOT NULL, activity_id TEXT NOT NULL,
+            move_on TEXT NOT NULL DEFAULT 'CompletedOrPassed', mastery_score REAL, status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_cmi5_registrations (
+            id {pk}, au_id INTEGER NOT NULL, student_email TEXT NOT NULL, registration TEXT NOT NULL UNIQUE,
+            client_key TEXT NOT NULL UNIQUE, secret_hash TEXT NOT NULL, fetch_token TEXT NOT NULL UNIQUE,
+            fetch_expires_at TEXT NOT NULL, credential_expires_at TEXT NOT NULL, fetched_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, last_statement_at TEXT, completed_at TEXT,
+            UNIQUE(au_id,student_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_xapi_statements (
+            id {pk}, statement_id TEXT NOT NULL UNIQUE, course_id INTEGER NOT NULL, source_id INTEGER,
+            cmi5_registration_id INTEGER, actor_key TEXT, verb_id TEXT NOT NULL, activity_id TEXT,
+            registration TEXT, result_completion INTEGER, result_success INTEGER, result_score_raw REAL,
+            statement_json TEXT NOT NULL, stored_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_xapi_states (
+            id {pk}, course_id INTEGER NOT NULL, cmi5_registration_id INTEGER, activity_id TEXT NOT NULL,
+            agent_key TEXT NOT NULL, registration TEXT NOT NULL DEFAULT '', state_id TEXT NOT NULL,
+            document_text TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(course_id,activity_id,agent_key,registration,state_id)
+        )""")
+
+
+def _course_author(conn: Any, course_id: int, email: str) -> dict[str, Any]:
+    return academic_access.require_course_role(conn, course_id, email, academic_access.AUTHOR_ROLES)
+
+
+def _au(conn: Any, au_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT a.*,c.course_code,c.title AS course_title,c.status AS course_status,
+        m.status AS module_status,i.status AS item_status,i.points
+        FROM nuvedra_cmi5_aus a
+        JOIN nexus_admin_courses c ON c.id=a.course_id
+        JOIN nexus_modules m ON m.id=a.module_id
+        JOIN nexus_content_items i ON i.id=a.item_id
+        WHERE a.id=?""", (au_id,)))
+    if not found:
+        raise HTTPException(404, "cmi5 activity not found.")
+    return found[0]
+
+
+def _basic_credentials(request: Request) -> tuple[str, str]:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("basic "):
+        raise HTTPException(401, "xAPI Basic authentication required.", headers={"WWW-Authenticate": 'Basic realm="NUVEDRA xAPI"'})
+    try:
+        raw = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+        key, secret = raw.split(":", 1)
+    except Exception as exc:
+        raise HTTPException(401, "Invalid xAPI Basic credentials.", headers={"WWW-Authenticate": 'Basic realm="NUVEDRA xAPI"'}) from exc
+    if not key or not secret:
+        raise HTTPException(401, "Invalid xAPI Basic credentials.")
+    return key, secret
+
+
+def _xapi_principal(conn: Any, request: Request) -> dict[str, Any]:
+    key, secret = _basic_credentials(request)
+    digest = _hash_secret(secret)
+    source = rows(execute(conn, "SELECT * FROM nuvedra_xapi_sources WHERE client_key=? AND status='active'", (key,)))
+    if source and secrets.compare_digest(str(source[0]["secret_hash"]), digest):
+        execute(conn, "UPDATE nuvedra_xapi_sources SET last_used_at=? WHERE id=?", (utcnow(), int(source[0]["id"])))
+        return {"kind": "source", "course_id": int(source[0]["course_id"]), "source_id": int(source[0]["id"]), "client_key": key}
+    registration = rows(execute(conn, """SELECT r.*,a.course_id,a.item_id,a.activity_id,a.move_on,a.mastery_score
+        FROM nuvedra_cmi5_registrations r JOIN nuvedra_cmi5_aus a ON a.id=r.au_id
+        WHERE r.client_key=? AND r.status='active'""", (key,)))
+    if registration and secrets.compare_digest(str(registration[0]["secret_hash"]), digest):
+        expiry = _parse_iso(registration[0].get("credential_expires_at"))
+        if expiry is None or expiry <= datetime.now(timezone.utc):
+            raise HTTPException(401, "cmi5 xAPI credentials have expired.")
+        return {
+            "kind": "cmi5", "course_id": int(registration[0]["course_id"]),
+            "registration_id": int(registration[0]["id"]), "registration": str(registration[0]["registration"]),
+            "student_email": str(registration[0]["student_email"]).lower(), "item_id": int(registration[0]["item_id"]),
+            "activity_id": str(registration[0]["activity_id"]), "move_on": str(registration[0]["move_on"]),
+            "mastery_score": registration[0].get("mastery_score"), "client_key": key,
+        }
+    raise HTTPException(401, "Invalid xAPI credentials.", headers={"WWW-Authenticate": 'Basic realm="NUVEDRA xAPI"'})
+
+
+def _statement_actor_key(statement: dict[str, Any]) -> str:
+    actor = statement.get("actor")
+    if not isinstance(actor, dict):
+        return ""
+    account = actor.get("account")
+    if isinstance(account, dict) and account.get("name"):
+        return str(account.get("name"))[:255]
+    if actor.get("mbox"):
+        return str(actor.get("mbox"))[:255]
+    return ""
+
+
+def _statement_registration(statement: dict[str, Any]) -> str:
+    context = statement.get("context")
+    if not isinstance(context, dict):
+        return ""
+    return str(context.get("registration") or "")
+
+
+def _statement_activity(statement: dict[str, Any]) -> str:
+    obj = statement.get("object")
+    if not isinstance(obj, dict):
+        return ""
+    return str(obj.get("id") or "")
+
+
+def _score_raw(result: Any) -> float | None:
+    if not isinstance(result, dict):
+        return None
+    score = result.get("score")
+    if not isinstance(score, dict):
+        return None
+    try:
+        if score.get("raw") is not None:
+            return float(score["raw"])
+        if score.get("scaled") is not None:
+            return float(score["scaled"]) * 100.0
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _upsert_progress(conn: Any, item_id: int, email: str, completed: bool) -> None:
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_content_progress WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    status = "completed" if completed else "not_started"
+    completed_at = now if completed else None
+    if found:
+        execute(conn, "UPDATE nuvedra_content_progress SET status=?,completed_at=?,updated_at=? WHERE id=?", (status, completed_at, now, int(found[0]["id"])))
+    else:
+        execute(conn, "INSERT INTO nuvedra_content_progress (item_id,student_email,status,completed_at,updated_at) VALUES (?,?,?,?,?)", (item_id, email.lower(), status, completed_at, now))
+
+
+def _sync_cmi5_grade(conn: Any, principal: dict[str, Any], statement: dict[str, Any]) -> None:
+    result = statement.get("result")
+    if not isinstance(result, dict):
+        return
+    score = result.get("score")
+    if not isinstance(score, dict):
+        return
+    item = rows(execute(conn, "SELECT points FROM nexus_content_items WHERE id=?", (int(principal["item_id"]),)))
+    if not item:
+        return
+    possible = float(item[0].get("points") or 0)
+    awarded = None
+    try:
+        if score.get("scaled") is not None and possible > 0:
+            awarded = max(0.0, min(possible, float(score["scaled"]) * possible))
+        elif score.get("raw") is not None:
+            raw = float(score["raw"])
+            maximum = float(score.get("max")) if score.get("max") is not None else possible
+            minimum = float(score.get("min")) if score.get("min") is not None else 0.0
+            if maximum > minimum:
+                if possible <= 0:
+                    possible = maximum - minimum
+                    execute(conn, "UPDATE nexus_content_items SET points=?,updated_at=? WHERE id=?", (possible, utcnow(), int(principal["item_id"])))
+                awarded = max(0.0, min(possible, ((raw - minimum) / (maximum - minimum)) * possible))
+    except (TypeError, ValueError):
+        return
+    if awarded is None:
+        return
+    now = utcnow()
+    email = str(principal["student_email"])
+    submission = rows(execute(conn, "SELECT id FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?", (int(principal["item_id"]), email)))
+    if submission:
+        submission_id = int(submission[0]["id"])
+        execute(conn, "UPDATE nuvedra_submissions SET status='submitted',updated_at=? WHERE id=?", (now, submission_id))
+    else:
+        submission_id = _insert_id(conn, """INSERT INTO nuvedra_submissions
+            (item_id,student_email,response_text,response_url,status,submitted_at,updated_at)
+            VALUES (?,?,?,'','submitted',?,?)""", (int(principal["item_id"]), email, "cmi5/xAPI activity result received.", now, now))
+    grade = rows(execute(conn, "SELECT id FROM nuvedra_grades WHERE submission_id=?", (submission_id,)))
+    feedback = "Grade synchronized from a cmi5/xAPI activity."
+    if grade:
+        execute(conn, "UPDATE nuvedra_grades SET points_awarded=?,feedback=?,status='graded',graded_by=?,graded_at=?,updated_at=? WHERE submission_id=?", (awarded, feedback, "cmi5:xapi", now, now, submission_id))
+    else:
+        execute(conn, "INSERT INTO nuvedra_grades (submission_id,points_awarded,feedback,status,graded_by,graded_at,updated_at) VALUES (?,?,?,?,?,?,?)", (submission_id, awarded, feedback, "graded", "cmi5:xapi", now, now))
+
+
+def _cmi5_progress(conn: Any, principal: dict[str, Any], current_verb: str, statement: dict[str, Any]) -> None:
+    registration_id = int(principal["registration_id"])
+    historical = rows(execute(conn, "SELECT verb_id,result_success FROM nuvedra_xapi_statements WHERE cmi5_registration_id=?", (registration_id,)))
+    completed = current_verb == COMPLETED_VERB or any(str(row.get("verb_id")) == COMPLETED_VERB for row in historical)
+    passed = current_verb == PASSED_VERB or any(str(row.get("verb_id")) == PASSED_VERB or int(row.get("result_success") or 0) == 1 for row in historical)
+    result = statement.get("result")
+    if isinstance(result, dict) and result.get("completion") is True:
+        completed = True
+    if isinstance(result, dict) and result.get("success") is True:
+        passed = True
+    move_on = str(principal.get("move_on") or "CompletedOrPassed")
+    satisfied = (
+        move_on == "NotApplicable"
+        or (move_on == "Completed" and completed)
+        or (move_on == "Passed" and passed)
+        or (move_on == "CompletedAndPassed" and completed and passed)
+        or (move_on == "CompletedOrPassed" and (completed or passed))
+    )
+    if satisfied:
+        now = utcnow()
+        execute(conn, "UPDATE nuvedra_cmi5_registrations SET completed_at=COALESCE(completed_at,?),last_statement_at=? WHERE id=?", (now, now, registration_id))
+        _upsert_progress(conn, int(principal["item_id"]), str(principal["student_email"]), True)
+        _sync_cmi5_grade(conn, principal, statement)
+    else:
+        execute(conn, "UPDATE nuvedra_cmi5_registrations SET last_statement_at=? WHERE id=?", (utcnow(), registration_id))
+
+
+def _statement_headers() -> dict[str, str]:
+    return {"X-Experience-API-Version": XAPI_VERSION, "Access-Control-Allow-Origin": "*"}
+
+
+def register_xapi_cmi5(app: FastAPI) -> None:
+    ensure_xapi_cmi5_schema()
+
+    @app.options("/xapi/{path:path}", response_model=None)
+    async def xapi_options(path: str):
+        return Response(status_code=204, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Experience-API-Version, If-Match, If-None-Match",
+            "Access-Control-Expose-Headers": "X-Experience-API-Version, ETag",
+            "Access-Control-Max-Age": "600",
+        })
+
+    @app.get("/xapi/about", response_model=None)
+    async def xapi_about():
+        return JSONResponse({"version": [XAPI_VERSION]}, headers=_statement_headers())
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/xapi", response_class=HTMLResponse, response_model=None)
+    async def xapi_home(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/xapi")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = _course_author(conn, course_id, user["email"])
+            modules = rows(execute(conn, "SELECT id,title,status FROM nexus_modules WHERE course_id=? ORDER BY position,id", (course_id,)))
+            sources = rows(execute(conn, "SELECT id,name,client_key,status,created_at,last_used_at FROM nuvedra_xapi_sources WHERE course_id=? ORDER BY id DESC", (course_id,)))
+            aus = rows(execute(conn, "SELECT * FROM nuvedra_cmi5_aus WHERE course_id=? ORDER BY id DESC", (course_id,)))
+            statements = rows(execute(conn, "SELECT statement_id,actor_key,verb_id,activity_id,stored_at FROM nuvedra_xapi_statements WHERE course_id=? ORDER BY id DESC LIMIT 30", (course_id,)))
+        module_options = "".join(f'<option value="{int(m["id"])}">{academic_access.esc(m.get("title"))} · {academic_access.esc(m.get("status"))}</option>' for m in modules)
+        source_rows = "".join(f'''<tr><td>{academic_access.esc(s.get('name'))}</td><td><code>{academic_access.esc(s.get('client_key'))}</code></td><td>{academic_access.esc(s.get('status'))}</td><td>{academic_access.esc(s.get('last_used_at') or 'Never')}</td></tr>''' for s in sources) or '<tr><td colspan="4">No external xAPI sources yet.</td></tr>'
+        au_cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">cmi5 · {academic_access.esc(a.get('status'))}</p><h3>{academic_access.esc(a.get('title'))}</h3><p><small>MoveOn: {academic_access.esc(a.get('move_on'))}<br>Activity ID: {academic_access.esc(a.get('activity_id'))}</small></p><form method="post" action="{STUDIO_PREFIX}/xapi/cmi5/{int(a['id'])}/toggle"><button class="studio-button studio-button--quiet">{'Unpublish' if a.get('status')=='published' else 'Publish'}</button></form></article>''' for a in aus) or '<section class="studio-empty">No cmi5 activities yet.</section>'
+        statement_rows = "".join(f'''<tr><td>{academic_access.esc(s.get('stored_at'))}</td><td><code>{academic_access.esc(s.get('statement_id'))}</code></td><td>{academic_access.esc(s.get('actor_key') or '—')}</td><td>{academic_access.esc(s.get('verb_id'))}</td><td>{academic_access.esc(s.get('activity_id') or '—')}</td></tr>''' for s in statements) or '<tr><td colspan="5">No xAPI statements have been received.</td></tr>'
+        move_options = "".join(f'<option>{value}</option>' for value in ('CompletedOrPassed','CompletedAndPassed','Completed','Passed','NotApplicable'))
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="xapi-cmi5-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="xAPI & cmi5" data-i18n-es="xAPI y cmi5">xAPI & cmi5</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Receive learning-experience statements and launch cmi5-style assigned activities while preserving NUVEDRA course permissions." data-i18n-es="Reciba declaraciones de experiencias de aprendizaje y lance actividades asignadas estilo cmi5 preservando los permisos del curso NUVEDRA.">Receive learning-experience statements and launch cmi5-style assigned activities while preserving NUVEDRA course permissions.</p></div></header>
+        <section class="studio-grid"><article class="studio-panel"><h3>Create xAPI source credential</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/xapi/sources" class="studio-form"><label>Source name<input name="name" required maxlength="180"></label><button class="studio-button">Create credential</button></form><p><small>The generated secret is displayed once. External sources can send statements only to this course.</small></p></article>
+        <article class="studio-panel"><h3>Add cmi5 activity</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/xapi/cmi5" class="studio-form"><label>Module<select name="module_id" required>{module_options}</select></label><label>Title<input name="title" required maxlength="180"></label><label>Launch URL<input name="launch_url" type="url" required></label><label>Activity ID<input name="activity_id" type="url" required></label><label>MoveOn<select name="move_on">{move_options}</select></label><label>Points<input name="points" type="number" min="0" step="0.01"></label><button class="studio-button">Save as draft</button></form><p><small>NUVEDRA v1 provides xAPI statement/state services and a cmi5-compatible launch/fetch pattern, but does not claim 1EdTech cmi5 certification.</small></p></article></section>
+        <section class="studio-panel"><h3>xAPI source credentials</h3><div style="overflow:auto"><table><thead><tr><th>Source</th><th>Client key</th><th>Status</th><th>Last used</th></tr></thead><tbody>{source_rows}</tbody></table></div></section>
+        <section class="studio-section"><h2>cmi5 activities</h2><div class="studio-grid">{au_cards}</div></section>
+        <section class="studio-panel"><h3>Recent statements</h3><div style="overflow:auto"><table><thead><tr><th>Stored</th><th>Statement ID</th><th>Actor</th><th>Verb</th><th>Activity</th></tr></thead><tbody>{statement_rows}</tbody></table></div></section>
+        <section class="studio-panel"><p><strong>Privacy:</strong> xAPI statements may contain personal or behavioral data supplied by an external source. Only connect sources approved for the course and institutional privacy requirements.</p></section></main>'''
+        return academic_access.portal_page("xAPI & cmi5", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/xapi/sources", response_class=HTMLResponse, response_model=None)
+    async def create_xapi_source(course_id: int, request: Request, name: str = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/xapi")
+        if isinstance(user, RedirectResponse): return user
+        clean = name.strip()
+        if not clean:
+            raise HTTPException(400, "Source name is required.")
+        key = "nx_" + secrets.token_urlsafe(18)
+        secret = secrets.token_urlsafe(36)
+        with db() as conn:
+            _course_author(conn, course_id, user["email"])
+            _insert_id(conn, "INSERT INTO nuvedra_xapi_sources (course_id,name,client_key,secret_hash,status,created_by,created_at) VALUES (?,?,?,?, 'active',?,?)", (course_id, clean[:180], key, _hash_secret(secret), user["email"], utcnow()))
+            audit(conn, user["email"], "xapi_source_created", "course", str(course_id), clean[:180], request.client.host if request.client else "")
+        credential = base64.b64encode(f"{key}:{secret}".encode()).decode()
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="xapi-credential-created"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/xapi">Back to xAPI & cmi5</a></nav><section class="studio-panel"><p class="studio-eyebrow">Credential created</p><h2>Copy this secret now</h2><p>The secret is not stored in recoverable form and will not be displayed again.</p><p><strong>Client key</strong><br><code>{academic_access.esc(key)}</code></p><p><strong>Client secret</strong><br><code>{academic_access.esc(secret)}</code></p><p><strong>Authorization header</strong><br><code>Basic {academic_access.esc(credential)}</code></p><p><strong>Statements endpoint</strong><br><code>{academic_access.esc(_absolute(request, '/xapi/statements'))}</code></p></section></main>'''
+        response = academic_access.portal_page("xAPI credential", body, user)
+        response.status_code = 201
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/xapi/cmi5", response_model=None)
+    async def create_cmi5(course_id: int, request: Request, module_id: int = Form(...), title: str = Form(...), launch_url: str = Form(...), activity_id: str = Form(...), move_on: str = Form("CompletedOrPassed"), points: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/xapi")
+        if isinstance(user, RedirectResponse): return user
+        clean_title = title.strip()
+        if not clean_title or move_on not in MOVE_ON:
+            raise HTTPException(400, "Title and a supported MoveOn rule are required.")
+        clean_launch = _safe_launch_url(launch_url)
+        clean_activity = _safe_launch_url(activity_id)
+        try:
+            item_points = float(points) if points.strip() else None
+        except ValueError as exc:
+            raise HTTPException(400, "Points must be numeric.") from exc
+        if item_points is not None and item_points < 0:
+            raise HTTPException(400, "Points cannot be negative.")
+        with db() as conn:
+            _course_author(conn, course_id, user["email"])
+            module = rows(execute(conn, "SELECT id FROM nexus_modules WHERE id=? AND course_id=?", (module_id, course_id)))
+            if not module:
+                raise HTTPException(400, "Selected module does not belong to this course.")
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS p FROM nexus_content_items WHERE module_id=?", (module_id,)))[0]["p"])
+            now = utcnow()
+            item_id = _insert_id(conn, """INSERT INTO nexus_content_items
+                (module_id,item_type,title,body_html,external_url,embed_url,metadata_json,points,due_at,position,status,created_at,updated_at)
+                VALUES (?,?,?,'','','','{}',?,NULL,?,'draft',?,?)""", (module_id, "cmi5", clean_title[:180], item_points, pos, now, now))
+            au_id = _insert_id(conn, """INSERT INTO nuvedra_cmi5_aus
+                (course_id,module_id,item_id,title,launch_url,activity_id,move_on,mastery_score,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,NULL,'draft',?,?,?)""", (course_id, module_id, item_id, clean_title[:180], clean_launch, clean_activity, move_on, user["email"], now, now))
+            execute(conn, "UPDATE nexus_content_items SET external_url=?,updated_at=? WHERE id=?", (f"/learn/cmi5/{au_id}/launch", now, item_id))
+            audit(conn, user["email"], "cmi5_activity_created", "cmi5_au", str(au_id), move_on, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/xapi", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/xapi/cmi5/{{au_id}}/toggle", response_model=None)
+    async def toggle_cmi5(au_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            au = _au(conn, au_id)
+            _course_author(conn, int(au["course_id"]), user["email"])
+            new_status = "draft" if str(au.get("status")) == "published" else "published"
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_cmi5_aus SET status=?,updated_at=? WHERE id=?", (new_status, now, au_id))
+            execute(conn, "UPDATE nexus_content_items SET status=?,updated_at=? WHERE id=?", (new_status, now, int(au["item_id"])))
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{int(au['course_id'])}/xapi", status_code=303)
+
+    @app.get("/learn/cmi5/{au_id}/launch", response_model=None)
+    async def launch_cmi5(au_id: int, request: Request):
+        user = _user(request, f"/learn/cmi5/{au_id}/launch")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            au = _au(conn, au_id)
+            access = academic_access.require_course_role(conn, int(au["course_id"]), user["email"], {"student"})
+            if str(access.get("course_role")) != "student":
+                raise HTTPException(403, "cmi5 activities require a student enrollment.")
+            if au.get("course_status") != "active" or au.get("module_status") != "published" or au.get("item_status") != "published" or au.get("status") != "published":
+                raise HTTPException(403, "This cmi5 activity is not available.")
+            registration_rows = rows(execute(conn, "SELECT * FROM nuvedra_cmi5_registrations WHERE au_id=? AND lower(student_email)=?", (au_id, user["email"].lower())))
+            registration = str(registration_rows[0]["registration"]) if registration_rows else str(uuid.uuid4())
+            client_key = "c5_" + secrets.token_urlsafe(18)
+            secret = secrets.token_urlsafe(36)
+            fetch_token = secrets.token_urlsafe(32)
+            now_dt = datetime.now(timezone.utc)
+            fetch_expires = datetime.fromtimestamp(now_dt.timestamp() + 600, tz=timezone.utc).isoformat()
+            credential_expires = datetime.fromtimestamp(now_dt.timestamp() + 8 * 3600, tz=timezone.utc).isoformat()
+            now = now_dt.isoformat()
+            if registration_rows:
+                execute(conn, """UPDATE nuvedra_cmi5_registrations SET client_key=?,secret_hash=?,fetch_token=?,fetch_expires_at=?,
+                    credential_expires_at=?,fetched_at=NULL,status='active' WHERE id=?""", (client_key, _hash_secret(secret), fetch_token, fetch_expires, credential_expires, int(registration_rows[0]["id"])))
+            else:
+                _insert_id(conn, """INSERT INTO nuvedra_cmi5_registrations
+                    (au_id,student_email,registration,client_key,secret_hash,fetch_token,fetch_expires_at,credential_expires_at,status,created_at)
+                    VALUES (?,?,?,?,?,?,?,?, 'active',?)""", (au_id, user["email"].lower(), registration, client_key, _hash_secret(secret), fetch_token, fetch_expires, credential_expires, now))
+            actor = json.dumps(_actor_payload(request, user["email"]), separators=(",", ":"))
+            params = {
+                "endpoint": _absolute(request, "/xapi/"),
+                "fetch": _absolute(request, f"/xapi/cmi5/fetch/{fetch_token}"),
+                "registration": registration,
+                "activityId": str(au["activity_id"]),
+                "actor": actor,
+            }
+            target = str(au["launch_url"]) + ("&" if "?" in str(au["launch_url"]) else "?") + urllib.parse.urlencode(params)
+        return RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
+
+    @app.get("/xapi/cmi5/fetch/{fetch_token}", response_model=None)
+    async def cmi5_fetch(fetch_token: str):
+        with db() as conn:
+            found = rows(execute(conn, "SELECT * FROM nuvedra_cmi5_registrations WHERE fetch_token=? AND status='active'", (fetch_token,)))
+            if not found:
+                raise HTTPException(404, "cmi5 fetch token not found.")
+            row = found[0]
+            expiry = _parse_iso(row.get("fetch_expires_at"))
+            if expiry is None or expiry <= datetime.now(timezone.utc):
+                raise HTTPException(410, "cmi5 fetch token expired.")
+            if row.get("fetched_at"):
+                raise HTTPException(409, "cmi5 fetch token has already been consumed.")
+            client_key = "c5_" + secrets.token_urlsafe(18)
+            secret = secrets.token_urlsafe(36)
+            execute(conn, "UPDATE nuvedra_cmi5_registrations SET client_key=?,secret_hash=?,fetched_at=? WHERE id=?", (client_key, _hash_secret(secret), utcnow(), int(row["id"])))
+        auth = "Basic " + base64.b64encode(f"{client_key}:{secret}".encode()).decode()
+        return JSONResponse({"auth-token": auth}, headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"})
+
+    @app.post("/xapi/statements", response_model=None)
+    async def post_statements(request: Request):
+        raw = await request.body()
+        if not raw or len(raw) > MAX_STATEMENT_BYTES:
+            raise HTTPException(400, "xAPI statement payload is empty or too large.")
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            raise HTTPException(400, "xAPI statements payload must be valid JSON.") from exc
+        statements = payload if isinstance(payload, list) else [payload]
+        if not statements or len(statements) > 50 or not all(isinstance(s, dict) for s in statements):
+            raise HTTPException(400, "xAPI request must contain one statement or an array of up to 50 statements.")
+        ids: list[str] = []
+        with db() as conn:
+            principal = _xapi_principal(conn, request)
+            for statement in statements:
+                verb = statement.get("verb")
+                if not isinstance(verb, dict) or not verb.get("id"):
+                    raise HTTPException(400, "Each xAPI statement requires verb.id.")
+                statement_id = str(statement.get("id") or uuid.uuid4())
+                try:
+                    uuid.UUID(statement_id)
+                except ValueError as exc:
+                    raise HTTPException(400, "xAPI statement id must be a UUID.") from exc
+                if rows(execute(conn, "SELECT id FROM nuvedra_xapi_statements WHERE statement_id=?", (statement_id,))):
+                    raise HTTPException(409, "xAPI statement id already exists.")
+                actor_key = _statement_actor_key(statement)
+                activity = _statement_activity(statement)
+                registration = _statement_registration(statement)
+                if principal["kind"] == "cmi5":
+                    if registration != principal["registration"]:
+                        raise HTTPException(400, "cmi5 statement registration does not match the launch registration.")
+                    if actor_key != _actor_name(str(principal["student_email"])):
+                        raise HTTPException(400, "cmi5 statement actor does not match the launched learner.")
+                    if activity and activity != principal["activity_id"]:
+                        raise HTTPException(400, "cmi5 statement activity does not match the launched AU.")
+                result = statement.get("result")
+                completion = 1 if isinstance(result, dict) and result.get("completion") is True else 0
+                success = 1 if isinstance(result, dict) and result.get("success") is True else 0
+                score_raw = _score_raw(result)
+                stored = utcnow()
+                _insert_id(conn, """INSERT INTO nuvedra_xapi_statements
+                    (statement_id,course_id,source_id,cmi5_registration_id,actor_key,verb_id,activity_id,registration,
+                    result_completion,result_success,result_score_raw,statement_json,stored_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    statement_id, int(principal["course_id"]), principal.get("source_id"), principal.get("registration_id"),
+                    actor_key, str(verb["id"])[:500], activity[:1000] if activity else None, registration[:100] if registration else None,
+                    completion, success, score_raw, json.dumps(statement, separators=(",", ":"), ensure_ascii=False), stored,
+                ))
+                if principal["kind"] == "cmi5":
+                    _cmi5_progress(conn, principal, str(verb["id"]), statement)
+                ids.append(statement_id)
+        return JSONResponse(ids, status_code=200, headers=_statement_headers())
+
+    @app.get("/xapi/statements", response_model=None)
+    async def get_statements(request: Request, statementId: str = ""):
+        with db() as conn:
+            principal = _xapi_principal(conn, request)
+            if statementId:
+                found = rows(execute(conn, "SELECT * FROM nuvedra_xapi_statements WHERE statement_id=? AND course_id=?", (statementId, int(principal["course_id"]))))
+                if principal["kind"] == "cmi5":
+                    found = [row for row in found if int(row.get("cmi5_registration_id") or 0) == int(principal["registration_id"])]
+                if not found:
+                    raise HTTPException(404, "xAPI statement not found.")
+                return JSONResponse(json.loads(str(found[0]["statement_json"])), headers=_statement_headers())
+            if principal["kind"] == "cmi5":
+                data = rows(execute(conn, "SELECT statement_json FROM nuvedra_xapi_statements WHERE cmi5_registration_id=? ORDER BY id DESC LIMIT 100", (int(principal["registration_id"]),)))
+            else:
+                data = rows(execute(conn, "SELECT statement_json FROM nuvedra_xapi_statements WHERE course_id=? ORDER BY id DESC LIMIT 100", (int(principal["course_id"]),)))
+        return JSONResponse({"statements": [json.loads(str(row["statement_json"])) for row in data], "more": ""}, headers=_statement_headers())
+
+    @app.api_route("/xapi/activities/state", methods=["GET", "PUT", "POST", "DELETE"], response_model=None)
+    async def xapi_state(request: Request):
+        params = request.query_params
+        activity_id = str(params.get("activityId") or "")
+        state_id = str(params.get("stateId") or "")
+        registration = str(params.get("registration") or "")
+        agent_text = str(params.get("agent") or "")
+        if not activity_id or not state_id or not agent_text:
+            raise HTTPException(400, "activityId, stateId, and agent are required.")
+        try:
+            agent = json.loads(agent_text)
+        except Exception as exc:
+            raise HTTPException(400, "agent must be valid JSON.") from exc
+        agent_key = _statement_actor_key({"actor": agent})
+        if not agent_key:
+            raise HTTPException(400, "agent must include account.name or mbox.")
+        with db() as conn:
+            principal = _xapi_principal(conn, request)
+            if principal["kind"] == "cmi5":
+                if registration != principal["registration"] or activity_id != principal["activity_id"] or agent_key != _actor_name(str(principal["student_email"])):
+                    raise HTTPException(403, "cmi5 state request does not match the launched learner and activity.")
+            existing = rows(execute(conn, """SELECT * FROM nuvedra_xapi_states WHERE course_id=? AND activity_id=? AND agent_key=? AND registration=? AND state_id=?""",
+                (int(principal["course_id"]), activity_id, agent_key, registration, state_id)))
+            if request.method == "GET":
+                if not existing:
+                    raise HTTPException(404, "xAPI state document not found.")
+                return Response(str(existing[0]["document_text"]), media_type="application/json", headers={**_statement_headers(), "ETag": '"' + hashlib.sha256(str(existing[0]["document_text"]).encode()).hexdigest() + '"'})
+            if request.method == "DELETE":
+                if existing:
+                    execute(conn, "DELETE FROM nuvedra_xapi_states WHERE id=?", (int(existing[0]["id"]),))
+                return Response(status_code=204, headers=_statement_headers())
+            raw = await request.body()
+            if len(raw) > MAX_STATE_BYTES:
+                raise HTTPException(400, "xAPI state document is too large.")
+            try:
+                json.loads(raw or b"{}")
+            except Exception as exc:
+                raise HTTPException(400, "NUVEDRA xAPI state v1 accepts JSON state documents.") from exc
+            text = raw.decode("utf-8") if raw else "{}"
+            now = utcnow()
+            if existing:
+                execute(conn, "UPDATE nuvedra_xapi_states SET document_text=?,updated_at=? WHERE id=?", (text, now, int(existing[0]["id"])))
+            else:
+                _insert_id(conn, """INSERT INTO nuvedra_xapi_states
+                    (course_id,cmi5_registration_id,activity_id,agent_key,registration,state_id,document_text,updated_at)
+                    VALUES (?,?,?,?,?,?,?,?)""", (int(principal["course_id"]), principal.get("registration_id"), activity_id, agent_key, registration, state_id, text, now))
+        return Response(status_code=204, headers=_statement_headers())
+
+    print("NUVEDRA xAPI & cmi5 v1 registered: course-scoped xAPI credentials, statement/state services, cmi5 launch/fetch credentials, pseudonymous learner actors, progress and Gradebook synchronization, and Studio management.", flush=True)
