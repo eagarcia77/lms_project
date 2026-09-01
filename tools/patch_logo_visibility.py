@@ -81,6 +81,12 @@ def main() -> None:
     from patch_rubrics_outcomes_smoke import main as patch_rubrics_outcomes_smoke
     patch_rubrics_outcomes_smoke()
 
+    from patch_course_copy_import_v1 import main as patch_course_copy_import_v1
+    patch_course_copy_import_v1()
+
+    from patch_course_copy_import_smoke import main as patch_course_copy_import_smoke
+    patch_course_copy_import_smoke()
+
     if not STYLES.is_file() or not LOGO.is_file():
         raise RuntimeError("NUVEDRA logo visibility patch requires the homepage styles and logo asset.")
     css = STYLES.read_text(encoding="utf-8")
@@ -92,7 +98,7 @@ def main() -> None:
     missing = [marker for marker in required if marker not in svg]
     if missing:
         raise RuntimeError(f"NUVEDRA logo asset is not using the expanded safe viewport: {missing}")
-    print("NUVEDRA Accessibility Checker v1, Learning Analytics v1, Calendar and Notifications v1, Course Announcements v1, Discussions & Collaboration v1, Assignments & Submissions v2, Rubrics & Outcomes v1, and logo visibility finalized for production.", flush=True)
+    print("NUVEDRA Accessibility Checker v1, Learning Analytics v1, Calendar and Notifications v1, Course Announcements v1, Discussions & Collaboration v1, Assignments & Submissions v2, Rubrics & Outcomes v1, Course Copy & Import v1, and logo visibility finalized for production.", flush=True)
 
 
 if __name__ == "__main__":
