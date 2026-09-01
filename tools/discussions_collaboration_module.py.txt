@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+AUTHOR_ROLES = academic_access.AUTHOR_ROLES
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_discussions_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_discussion_settings (
+            id {pk}, item_id INTEGER NOT NULL UNIQUE, state TEXT NOT NULL DEFAULT 'open',
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_discussion_posts (
+            id {pk}, item_id INTEGER NOT NULL, parent_id INTEGER,
+            author_email TEXT NOT NULL, author_role TEXT NOT NULL,
+            body_text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'published',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        # Keep collaboration notifications available even if the calendar feature is disabled later.
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_notifications (
+            id {pk}, recipient_email TEXT NOT NULL, course_id INTEGER, title TEXT NOT NULL,
+            message TEXT, href TEXT, kind TEXT NOT NULL DEFAULT 'course_event',
+            read_at TEXT, created_at TEXT NOT NULL
+        )""")
+
+
+def _discussion_bundle(conn: Any, item_id: int) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    course_id, item, module = academic_access.item_bundle(conn, item_id)
+    if str(item.get("item_type") or "") != "discussion":
+        raise HTTPException(404, "Discussion not found.")
+    return course_id, item, module
+
+
+def _thread_state(conn: Any, item_id: int) -> str:
+    found = rows(execute(conn, "SELECT state FROM nuvedra_discussion_settings WHERE item_id=?", (item_id,)))
+    return str(found[0].get("state") or "open") if found else "open"
+
+
+def _set_thread_state(conn: Any, item_id: int, state: str, actor: str) -> None:
+    clean = state if state in {"open", "closed"} else "open"
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_discussion_settings WHERE item_id=?", (item_id,)))
+    if found:
+        execute(conn, "UPDATE nuvedra_discussion_settings SET state=?,updated_by=?,updated_at=? WHERE item_id=?", (clean, actor, now, item_id))
+    else:
+        execute(conn, "INSERT INTO nuvedra_discussion_settings (item_id,state,updated_by,updated_at) VALUES (?,?,?,?)", (item_id, clean, actor, now))
+
+
+def _discussion_posts(conn: Any, item_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, "SELECT * FROM nuvedra_discussion_posts WHERE item_id=? AND status='published' ORDER BY created_at,id", (item_id,)))
+
+
+def _course_discussions(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.*,m.title AS module_title,m.position AS module_position,
+        (SELECT COUNT(*) FROM nuvedra_discussion_posts p WHERE p.item_id=i.id AND p.status='published') AS post_count,
+        (SELECT COUNT(DISTINCT lower(p.author_email)) FROM nuvedra_discussion_posts p WHERE p.item_id=i.id AND p.status='published') AS participant_count
+        FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+        WHERE m.course_id=? AND i.item_type='discussion'
+        ORDER BY m.position,m.id,i.position,i.id""", (course_id,)))
+
+
+def _notify(conn: Any, course_id: int, recipients: list[str], *, title: str, message: str, href: str, kind: str = "discussion") -> int:
+    now = utcnow()
+    sent = 0
+    seen: set[str] = set()
+    for raw in recipients:
+        email = str(raw or "").strip().lower()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        execute(conn, "INSERT INTO nuvedra_notifications (recipient_email,course_id,title,message,href,kind,read_at,created_at) VALUES (?,?,?,?,?,?,NULL,?)", (email, course_id, title, message, href, kind, now))
+        sent += 1
+    return sent
+
+
+def _course_member_emails(conn: Any, course_id: int, roles: tuple[str, ...]) -> list[str]:
+    placeholders = ",".join("?" for _ in roles)
+    data = rows(execute(conn, f"SELECT lower(user_email) AS email FROM nexus_admin_enrollments WHERE course_id=? AND status='active' AND course_role IN ({placeholders}) ORDER BY lower(user_email)", (course_id,) + roles))
+    return [str(row.get("email") or "") for row in data]
+
+
+def _upsert_submission(conn: Any, item_id: int, email: str, body: str) -> None:
+    now = utcnow()
+    found = rows(execute(conn, "SELECT id FROM nuvedra_submissions WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    if found:
+        execute(conn, "UPDATE nuvedra_submissions SET response_text=?,status='submitted',updated_at=? WHERE id=?", (body, now, int(found[0]["id"])))
+    else:
+        execute(conn, "INSERT INTO nuvedra_submissions (item_id,student_email,response_text,response_url,status,submitted_at,updated_at) VALUES (?,?,?,?,'submitted',?,?)", (item_id, email.lower(), body, "", now, now))
+
+
+def _insert_post(conn: Any, item_id: int, parent_id: int | None, email: str, role: str, body: str) -> int:
+    now = utcnow()
+    params = (item_id, parent_id, email.lower(), role, body.strip(), now, now)
+    sql = "INSERT INTO nuvedra_discussion_posts (item_id,parent_id,author_email,author_role,body_text,status,created_at,updated_at) VALUES (?,?,?,?,?,'published',?,?)"
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _validate_parent(conn: Any, item_id: int, parent_id: int | None) -> None:
+    if parent_id is None:
+        return
+    found = rows(execute(conn, "SELECT id FROM nuvedra_discussion_posts WHERE id=? AND item_id=? AND status='published'", (parent_id, item_id)))
+    if not found:
+        raise HTTPException(400, "The reply target is not available in this discussion.")
+
+
+def _render_posts(posts: list[dict[str, Any]], *, reply_action: str | None = None, reply_enabled: bool = False, depth: int = 0, parent: int | None = None) -> str:
+    children = [post for post in posts if (int(post["parent_id"]) if post.get("parent_id") not in (None, "") else None) == parent]
+    cards: list[str] = []
+    for post in children:
+        post_id = int(post["id"])
+        role = str(post.get("author_role") or "participant")
+        role_label = "Instructor" if role in AUTHOR_ROLES else ("Observer" if role == "observer" else "Student")
+        reply_form = ""
+        if reply_action and reply_enabled:
+            reply_form = f'''<details class="studio-panel" style="margin-top:12px"><summary data-i18n-en="Reply" data-i18n-es="Responder">Reply</summary><form method="post" action="{reply_action}" class="studio-form"><input type="hidden" name="parent_id" value="{post_id}"><label><span data-i18n-en="Reply" data-i18n-es="Respuesta">Reply</span><textarea name="body" required rows="3" maxlength="6000"></textarea></label><button class="studio-button" data-i18n-en="Post reply" data-i18n-es="Publicar respuesta">Post reply</button></form></details>'''
+        nested = _render_posts(posts, reply_action=reply_action, reply_enabled=reply_enabled, depth=depth + 1, parent=post_id) if depth < 5 else ""
+        cards.append(f'''<article class="studio-panel" style="margin-left:{min(depth,4)*24}px"><p class="studio-eyebrow">{academic_access.esc(role_label)} · {academic_access.esc(post.get('created_at'))}</p><h3>{academic_access.esc(post.get('author_email'))}</h3><p style="white-space:pre-wrap">{academic_access.esc(post.get('body_text'))}</p>{reply_form}{nested}</article>''')
+    return "".join(cards)
+
+
+def register_discussions_collaboration(app: FastAPI) -> None:
+    ensure_discussions_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/discussions", response_class=HTMLResponse, response_model=None)
+    async def instructor_discussion_index(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/discussions")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], AUTHOR_ROLES)
+            data = _course_discussions(conn, course_id)
+            cards = []
+            for item in data:
+                state = _thread_state(conn, int(item["id"]))
+                cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(item.get('module_title'))} · {academic_access.esc(item.get('status') or 'draft')}</p><h3>{academic_access.esc(item.get('title'))}</h3><p>{int(item.get('participant_count') or 0)} participants · {int(item.get('post_count') or 0)} posts · <strong>{academic_access.esc(state)}</strong></p><div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/discussions/{int(item['id'])}" data-i18n-en="Open discussion" data-i18n-es="Abrir discusión">Open discussion</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/items/{int(item['id'])}/edit" data-i18n-en="Edit prompt" data-i18n-es="Editar consigna">Edit prompt</a></div></article>''')
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="course-discussions-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Discussions & Collaboration" data-i18n-es="Foros y colaboración">Discussions & Collaboration</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Moderate threaded academic discussions, participate as an instructor, close conversations, and grade initial student contributions through Gradebook." data-i18n-es="Modere discusiones académicas en hilo, participe como instructor, cierre conversaciones y califique las aportaciones iniciales mediante el libro de calificaciones.">Moderate threaded academic discussions, participate as an instructor, close conversations, and grade initial student contributions through Gradebook.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Libro de calificaciones">Gradebook</a></div></header><section class="studio-panel"><p data-i18n-en="Create a content item with type Discussion inside any module. Published discussion items automatically appear here and in the student course view." data-i18n-es="Cree un contenido de tipo Discussion dentro de cualquier módulo. Los foros publicados aparecen automáticamente aquí y en la vista del estudiante.">Create a content item with type Discussion inside any module. Published discussion items automatically appear here and in the student course view.</p></section><section class="studio-grid">{''.join(cards) or '<section class="studio-empty" data-i18n-en="No discussion content exists yet." data-i18n-es="Todavía no existe contenido de discusión.">No discussion content exists yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Discussions & Collaboration", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/discussions/{{item_id}}", response_class=HTMLResponse, response_model=None)
+    async def instructor_discussion(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/discussions/{item_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _discussion_bundle(conn, item_id)
+            course = academic_access.require_course_role(conn, course_id, user["email"], AUTHOR_ROLES)
+            state = _thread_state(conn, item_id)
+            posts = _discussion_posts(conn, item_id)
+        toggle = "open" if state == "closed" else "closed"
+        toggle_en = "Reopen discussion" if state == "closed" else "Close discussion"
+        toggle_es = "Reabrir discusión" if state == "closed" else "Cerrar discusión"
+        rendered = _render_posts(posts, reply_action=f"{STUDIO_PREFIX}/discussions/{item_id}/reply", reply_enabled=True)
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="instructor-discussion-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/discussions" data-i18n-en="All discussions" data-i18n-es="Todos los foros">All discussions</a><span>/</span><a href="{STUDIO_PREFIX}/items/{item_id}/edit" data-i18n-en="Edit prompt" data-i18n-es="Editar consigna">Edit prompt</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(course.get('course_code'))} · {academic_access.esc(module.get('title'))} · {academic_access.esc(state)}</p><h2>{academic_access.esc(item.get('title'))}</h2><div class="content-body">{item.get('body_html') or ''}</div></div><div class="studio-actions"><form method="post" action="{STUDIO_PREFIX}/discussions/{item_id}/state"><input type="hidden" name="state" value="{toggle}"><button class="studio-button studio-button--quiet" data-i18n-en="{toggle_en}" data-i18n-es="{toggle_es}">{toggle_en}</button></form></div></header><section class="studio-panel"><h3 data-i18n-en="Instructor contribution" data-i18n-es="Participación del instructor">Instructor contribution</h3><form method="post" action="{STUDIO_PREFIX}/discussions/{item_id}/reply" class="studio-form"><input type="hidden" name="parent_id" value=""><label><span data-i18n-en="Post to the discussion" data-i18n-es="Publicar en la discusión">Post to the discussion</span><textarea name="body" required rows="4" maxlength="6000"></textarea></label><button class="studio-button" data-i18n-en="Post as instructor" data-i18n-es="Publicar como instructor">Post as instructor</button></form></section><section class="studio-section"><h2 data-i18n-en="Conversation" data-i18n-es="Conversación">Conversation</h2>{rendered or '<section class="studio-empty" data-i18n-en="No posts yet." data-i18n-es="Todavía no hay publicaciones.">No posts yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Discussion", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/discussions/{{item_id}}/state", response_model=None)
+    async def instructor_discussion_state(item_id: int, request: Request, state: str = Form("open")):
+        user = _user(request, f"{STUDIO_PREFIX}/discussions/{item_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, _module = _discussion_bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], AUTHOR_ROLES)
+            _set_thread_state(conn, item_id, state, user["email"])
+            audit(conn, user["email"], "discussion_state_changed", "item", str(item_id), state, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/discussions/{item_id}", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/discussions/{{item_id}}/reply", response_model=None)
+    async def instructor_discussion_reply(item_id: int, request: Request, body: str = Form(...), parent_id: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/discussions/{item_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean = body.strip()
+        if not clean:
+            raise HTTPException(400, "Reply text is required.")
+        parent = int(parent_id) if str(parent_id).strip().isdigit() else None
+        with db() as conn:
+            course_id, item, _module = _discussion_bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], AUTHOR_ROLES)
+            _validate_parent(conn, item_id, parent)
+            post_id = _insert_post(conn, item_id, parent, user["email"], str(access.get("course_role") or "instructor"), clean)
+            recipients = _course_member_emails(conn, course_id, ("student", "observer"))
+            _notify(conn, course_id, recipients, title=f"Discussion update: {item.get('title')}", message="Your instructor posted in a course discussion.", href=f"/learn/discussions/{item_id}")
+            audit(conn, user["email"], "discussion_instructor_posted", "discussion_post", str(post_id), str(item.get("title") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/discussions/{item_id}", status_code=303)
+
+    @app.get("/learn/discussions/{item_id}", response_class=HTMLResponse, response_model=None)
+    async def student_discussion(item_id: int, request: Request):
+        user = _user(request, f"/learn/discussions/{item_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _discussion_bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This discussion is not available.")
+            state = _thread_state(conn, item_id)
+            posts = _discussion_posts(conn, item_id)
+            initial = rows(execute(conn, "SELECT id FROM nuvedra_discussion_posts WHERE item_id=? AND lower(author_email)=? AND author_role='student' AND parent_id IS NULL AND status='published' ORDER BY id LIMIT 1", (item_id, user["email"].lower())))
+        role = str(access.get("course_role") or "")
+        can_post = role == "student" and state == "open"
+        has_initial = bool(initial)
+        reply_enabled = can_post and has_initial
+        rendered = _render_posts(posts, reply_action=f"/learn/discussions/{item_id}/post", reply_enabled=reply_enabled)
+        initial_form = ""
+        if can_post and not has_initial:
+            initial_form = f'''<section class="studio-panel"><h3 data-i18n-en="Your initial contribution" data-i18n-es="Su aportación inicial">Your initial contribution</h3><form method="post" action="/learn/discussions/{item_id}/post" class="studio-form"><input type="hidden" name="parent_id" value=""><label><span data-i18n-en="Response" data-i18n-es="Respuesta">Response</span><textarea name="body" required rows="5" maxlength="6000"></textarea></label><button class="studio-button" data-i18n-en="Post contribution" data-i18n-es="Publicar aportación">Post contribution</button></form></section>'''
+        elif role == "observer":
+            initial_form = '<section class="studio-panel"><p data-i18n-en="Observers can read this discussion but cannot participate." data-i18n-es="Los observadores pueden leer esta discusión, pero no participar.">Observers can read this discussion but cannot participate.</p></section>'
+        elif state == "closed":
+            initial_form = '<section class="studio-panel"><p data-i18n-en="This discussion is closed. Existing posts remain available for review." data-i18n-es="Esta discusión está cerrada. Las publicaciones existentes permanecen disponibles para revisión.">This discussion is closed. Existing posts remain available for review.</p></section>'
+        else:
+            initial_form = '<section class="studio-panel"><p data-i18n-en="Your initial contribution has been submitted. You may now reply to other posts." data-i18n-es="Su aportación inicial fue entregada. Ahora puede responder a otras publicaciones.">Your initial contribution has been submitted. You may now reply to other posts.</p></section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-discussion-v1"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(access.get('course_code'))} · {academic_access.esc(module.get('title'))} · {academic_access.esc(state)}</p><h2>{academic_access.esc(item.get('title'))}</h2><div class="content-body">{item.get('body_html') or ''}</div></div></header>{initial_form}<section class="studio-section"><h2 data-i18n-en="Conversation" data-i18n-es="Conversación">Conversation</h2>{rendered or '<section class="studio-empty" data-i18n-en="No posts yet." data-i18n-es="Todavía no hay publicaciones.">No posts yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Discussion", body, user)
+
+    @app.post("/learn/discussions/{item_id}/post", response_model=None)
+    async def student_discussion_post(item_id: int, request: Request, body: str = Form(...), parent_id: str = Form("")):
+        user = _user(request, f"/learn/discussions/{item_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean = body.strip()
+        if not clean:
+            raise HTTPException(400, "Post text is required.")
+        parent = int(parent_id) if str(parent_id).strip().isdigit() else None
+        with db() as conn:
+            course_id, item, module = _discussion_bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This discussion is not available.")
+            if _thread_state(conn, item_id) != "open":
+                raise HTTPException(409, "This discussion is closed.")
+            _validate_parent(conn, item_id, parent)
+            existing_initial = rows(execute(conn, "SELECT id FROM nuvedra_discussion_posts WHERE item_id=? AND lower(author_email)=? AND author_role='student' AND parent_id IS NULL AND status='published' ORDER BY id LIMIT 1", (item_id, user["email"].lower())))
+            if parent is None and existing_initial:
+                raise HTTPException(409, "Your initial contribution has already been submitted. Reply to an existing post instead.")
+            if parent is not None and not existing_initial:
+                raise HTTPException(409, "Submit your initial contribution before replying to other posts.")
+            post_id = _insert_post(conn, item_id, parent, user["email"], "student", clean)
+            if parent is None:
+                _upsert_submission(conn, item_id, user["email"], clean)
+            instructors = _course_member_emails(conn, course_id, tuple(sorted(AUTHOR_ROLES)))
+            _notify(conn, course_id, instructors, title=f"New discussion post: {item.get('title')}", message=f"{user['email']} posted in the discussion.", href=f"{STUDIO_PREFIX}/discussions/{item_id}")
+            audit(conn, user["email"], "student_discussion_posted", "discussion_post", str(post_id), str(item.get("title") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/discussions/{item_id}", status_code=303)
+
+    print("NUVEDRA Discussions & Collaboration v1 registered: threaded posts, instructor moderation, close/reopen workflow, notifications, and Gradebook-linked initial contributions.", flush=True)
