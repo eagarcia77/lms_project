@@ -1,0 +1,502 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import urllib.parse
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+PROGRAM_ROLES = {"coordinator", "reviewer"}
+CURRICULUM_LEVELS = {"introduced", "reinforced", "mastered"}
+LEVEL_LABEL = {"introduced": "I", "reinforced": "R", "mastered": "M"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if user:
+        return user
+    admin = admin_console.session_user(request)
+    if admin:
+        return {"email": str(admin.get("email") or "").lower(), "name": admin.get("full_name") or admin.get("email")}
+    return academic_access.login_redirect(return_to)
+
+
+def _platform_role(request: Request) -> str:
+    admin = admin_console.session_user(request)
+    return str(admin.get("role") or "") if admin else ""
+
+
+def ensure_program_outcomes_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_programs (
+            id {pk}, program_code TEXT NOT NULL, title TEXT NOT NULL, description TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_members (
+            id {pk}, program_id INTEGER NOT NULL, user_email TEXT NOT NULL,
+            program_role TEXT NOT NULL DEFAULT 'reviewer', status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(program_id,user_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_courses (
+            id {pk}, program_id INTEGER NOT NULL, course_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active', added_by TEXT NOT NULL, added_at TEXT NOT NULL,
+            UNIQUE(program_id,course_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_outcomes (
+            id {pk}, program_id INTEGER NOT NULL, code TEXT NOT NULL, title TEXT NOT NULL,
+            description TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_outcome_links (
+            id {pk}, program_outcome_id INTEGER NOT NULL, course_outcome_id INTEGER NOT NULL,
+            curriculum_level TEXT NOT NULL DEFAULT 'introduced', weight REAL NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(program_outcome_id,course_outcome_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_settings (
+            id {pk}, program_id INTEGER NOT NULL UNIQUE, benchmark_threshold REAL NOT NULL DEFAULT 80,
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_snapshots (
+            id {pk}, program_id INTEGER NOT NULL, label TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+
+
+def _has_author_course(conn: Any, email: str) -> bool:
+    found = rows(execute(conn, """SELECT id FROM nexus_admin_enrollments
+        WHERE lower(user_email)=? AND status='active'
+          AND course_role IN ('instructor','teaching_assistant','course_builder','facilitator')
+        LIMIT 1""", (email.lower(),)))
+    return bool(found)
+
+
+def _program(conn: Any, program_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_programs WHERE id=?", (program_id,)))
+    if not found:
+        raise HTTPException(404, "Program not found.")
+    return found[0]
+
+
+def _program_access(conn: Any, request: Request, program_id: int, email: str) -> dict[str, Any]:
+    platform_role = _platform_role(request)
+    if platform_role in {"superadmin", "course_admin"}:
+        return {"program_role": "coordinator", "platform_role": platform_role}
+    if platform_role == "auditor":
+        return {"program_role": "reviewer", "platform_role": platform_role}
+    found = rows(execute(conn, """SELECT * FROM nuvedra_program_members
+        WHERE program_id=? AND lower(user_email)=? AND status='active'""", (program_id, email.lower())))
+    if not found:
+        raise HTTPException(403, "You do not have access to this program assessment workspace.")
+    return found[0]
+
+
+def _require_manage(conn: Any, request: Request, program_id: int, email: str) -> dict[str, Any]:
+    access = _program_access(conn, request, program_id, email)
+    if str(access.get("program_role")) != "coordinator":
+        raise HTTPException(403, "Program coordinator permission is required.")
+    return access
+
+
+def _program_courses(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT pc.id AS program_course_id,pc.course_id,pc.status AS mapping_status,
+        c.course_code,c.title,c.term,c.status AS course_status
+        FROM nuvedra_program_courses pc JOIN nexus_admin_courses c ON c.id=pc.course_id
+        WHERE pc.program_id=? AND pc.status='active'
+        ORDER BY c.course_code,c.term,c.id""", (program_id,)))
+
+
+def _program_outcomes(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT * FROM nuvedra_program_outcomes
+        WHERE program_id=? AND status='active' ORDER BY code,title,id""", (program_id,)))
+
+
+def _settings(conn: Any, program_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_program_settings WHERE program_id=?", (program_id,)))
+    return found[0] if found else {"program_id": program_id, "benchmark_threshold": 80.0}
+
+
+def _course_outcomes(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT o.id,o.course_id,o.code,o.title,o.description,c.course_code,c.title AS course_title,c.term
+        FROM nuvedra_outcomes o
+        JOIN nuvedra_program_courses pc ON pc.course_id=o.course_id AND pc.program_id=? AND pc.status='active'
+        JOIN nexus_admin_courses c ON c.id=o.course_id
+        WHERE o.status='active'
+        ORDER BY c.course_code,o.code,o.title,o.id""", (program_id,)))
+
+
+def _course_outcome_evidence(conn: Any, course_outcome_id: int) -> dict[str, Any]:
+    outcome_rows = rows(execute(conn, """SELECT o.id,o.code,o.title,o.course_id,c.course_code,c.title AS course_title,c.term
+        FROM nuvedra_outcomes o JOIN nexus_admin_courses c ON c.id=o.course_id WHERE o.id=?""", (course_outcome_id,)))
+    if not outcome_rows:
+        raise HTTPException(404, "Course outcome not found.")
+    outcome = outcome_rows[0]
+    evidence = rows(execute(conn, """SELECT i.id AS item_id,i.title AS item_title,i.points,
+        g.points_awarded,g.status AS grade_status,s.status AS submission_status
+        FROM nuvedra_outcome_links ol
+        JOIN nexus_content_items i ON i.id=ol.item_id
+        JOIN nuvedra_submissions s ON s.item_id=i.id AND s.status='submitted'
+        JOIN nuvedra_grades g ON g.submission_id=s.id AND g.status='graded'
+        WHERE ol.outcome_id=? AND i.points IS NOT NULL AND i.points>0 AND g.points_awarded IS NOT NULL""", (course_outcome_id,)))
+    earned = 0.0
+    possible = 0.0
+    for row in evidence:
+        maximum = float(row.get("points") or 0)
+        earned += max(0.0, min(maximum, float(row.get("points_awarded") or 0)))
+        possible += maximum
+    outcome["attainment"] = None if possible <= 0 else (earned / possible) * 100.0
+    outcome["graded_evidence"] = len(evidence)
+    outcome["earned_points"] = earned
+    outcome["possible_points"] = possible
+    return outcome
+
+
+def _program_outcome_mappings(conn: Any, program_outcome_id: int) -> list[dict[str, Any]]:
+    data = rows(execute(conn, """SELECT pol.*,o.code AS course_outcome_code,o.title AS course_outcome_title,
+        o.course_id,c.course_code,c.title AS course_title,c.term
+        FROM nuvedra_program_outcome_links pol
+        JOIN nuvedra_outcomes o ON o.id=pol.course_outcome_id
+        JOIN nexus_admin_courses c ON c.id=o.course_id
+        WHERE pol.program_outcome_id=?
+        ORDER BY c.course_code,o.code,o.title""", (program_outcome_id,)))
+    result: list[dict[str, Any]] = []
+    for mapping in data:
+        evidence = _course_outcome_evidence(conn, int(mapping["course_outcome_id"]))
+        mapping["attainment"] = evidence["attainment"]
+        mapping["graded_evidence"] = evidence["graded_evidence"]
+        result.append(mapping)
+    return result
+
+
+def _program_outcome_summary(conn: Any, outcome: dict[str, Any], benchmark: float) -> dict[str, Any]:
+    mappings = _program_outcome_mappings(conn, int(outcome["id"]))
+    numerator = 0.0
+    denominator = 0.0
+    evidence_records = 0
+    levels = {"introduced": 0, "reinforced": 0, "mastered": 0}
+    for mapping in mappings:
+        level = str(mapping.get("curriculum_level") or "introduced")
+        if level in levels:
+            levels[level] += 1
+        evidence_records += int(mapping.get("graded_evidence") or 0)
+        attainment = mapping.get("attainment")
+        weight = float(mapping.get("weight") or 1)
+        if attainment is not None and weight > 0:
+            numerator += float(attainment) * weight
+            denominator += weight
+    attainment = None if denominator <= 0 else numerator / denominator
+    if attainment is None:
+        status = "No evidence"
+    elif attainment + 1e-9 >= benchmark:
+        status = "Meets benchmark"
+    else:
+        status = "Review gap"
+    return {"outcome": outcome, "mappings": mappings, "attainment": attainment, "status": status,
+            "graded_evidence": evidence_records, "levels": levels}
+
+
+def _program_summary(conn: Any, program_id: int) -> dict[str, Any]:
+    program = _program(conn, program_id)
+    settings = _settings(conn, program_id)
+    benchmark = float(settings.get("benchmark_threshold") or 80)
+    courses = _program_courses(conn, program_id)
+    outcomes = [_program_outcome_summary(conn, outcome, benchmark) for outcome in _program_outcomes(conn, program_id)]
+    return {"program": program, "settings": settings, "courses": courses, "outcomes": outcomes}
+
+
+def _matrix_cells(summary: dict[str, Any]) -> dict[tuple[int, int], str]:
+    cells: dict[tuple[int, int], set[str]] = {}
+    for entry in summary["outcomes"]:
+        po_id = int(entry["outcome"]["id"])
+        for mapping in entry["mappings"]:
+            key = (po_id, int(mapping["course_id"]))
+            cells.setdefault(key, set()).add(LEVEL_LABEL.get(str(mapping.get("curriculum_level")), "?"))
+    return {key: " / ".join(level for level in ("I", "R", "M") if level in values) for key, values in cells.items()}
+
+
+def _snapshot_payload(conn: Any, program_id: int) -> dict[str, Any]:
+    summary = _program_summary(conn, program_id)
+    return {
+        "version": 1,
+        "captured_at": utcnow(),
+        "program": {key: summary["program"].get(key) for key in ("program_code", "title", "description", "status")},
+        "benchmark_threshold": float(summary["settings"].get("benchmark_threshold") or 80),
+        "courses": [{key: course.get(key) for key in ("course_code", "title", "term", "course_status")} for course in summary["courses"]],
+        "outcomes": [
+            {
+                "code": entry["outcome"].get("code"), "title": entry["outcome"].get("title"),
+                "attainment": entry["attainment"], "status": entry["status"], "graded_evidence": entry["graded_evidence"],
+                "coverage": entry["levels"],
+                "mappings": [
+                    {"course_code": mapping.get("course_code"), "course_outcome_code": mapping.get("course_outcome_code"),
+                     "course_outcome_title": mapping.get("course_outcome_title"), "curriculum_level": mapping.get("curriculum_level"),
+                     "weight": mapping.get("weight"), "attainment": mapping.get("attainment"), "graded_evidence": mapping.get("graded_evidence")}
+                    for mapping in entry["mappings"]
+                ],
+            }
+            for entry in summary["outcomes"]
+        ],
+    }
+
+
+def register_program_outcomes_accreditation(app: FastAPI) -> None:
+    ensure_program_outcomes_schema()
+
+    @app.get("/faculty/programs", response_class=HTMLResponse, response_model=None)
+    async def programs_home(request: Request):
+        user = _user(request, "/faculty/programs")
+        if isinstance(user, RedirectResponse): return user
+        platform_role = _platform_role(request)
+        course_filter = str(request.query_params.get("course_id") or "").strip()
+        with db() as conn:
+            if platform_role in {"superadmin", "course_admin", "auditor"}:
+                programs = rows(execute(conn, "SELECT * FROM nuvedra_programs WHERE status='active' ORDER BY program_code,title,id"))
+            else:
+                programs = rows(execute(conn, """SELECT p.* FROM nuvedra_program_members pm JOIN nuvedra_programs p ON p.id=pm.program_id
+                    WHERE lower(pm.user_email)=? AND pm.status='active' AND p.status='active' ORDER BY p.program_code,p.title,p.id""", (user["email"].lower(),)))
+            can_create = platform_role in {"superadmin", "course_admin"} or _has_author_course(conn, user["email"])
+        cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(p.get('program_code'))}</p><h3>{academic_access.esc(p.get('title'))}</h3><p>{academic_access.esc(p.get('description'))}</p><a class="studio-button" href="/faculty/programs/{int(p['id'])}" data-i18n-en="Open program assessment" data-i18n-es="Abrir assessment del programa">Open program assessment</a></article>''' for p in programs) or '<section class="studio-empty" data-i18n-en="No program assessment workspaces are available yet." data-i18n-es="Todavía no hay espacios de assessment de programas disponibles.">No program assessment workspaces are available yet.</section>'
+        create = ""
+        if can_create:
+            create = '''<section class="studio-panel"><h3 data-i18n-en="Create program workspace" data-i18n-es="Crear espacio del programa">Create program workspace</h3><form method="post" action="/faculty/programs" class="studio-form"><label>Program code / Código<input name="program_code" required maxlength="40"></label><label>Program title / Título<input name="title" required maxlength="180"></label><label>Description / Descripción<textarea name="description" rows="3"></textarea></label><button class="studio-button">Create program workspace</button></form></section>'''
+        filter_note = f'<section class="studio-panel"><p>Course Studio context: course ID <strong>{academic_access.esc(course_filter)}</strong>. Open a program below to review or create its alignment.</p></section>' if course_filter.isdigit() else ""
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="program-outcomes-accreditation-index"><nav class="studio-breadcrumbs"><a href="/portal">Portal</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Program Outcomes & Accreditation" data-i18n-es="Resultados de programa y acreditación">Program Outcomes & Accreditation</p><h2 data-i18n-en="Connect curriculum, outcomes, and assessment evidence" data-i18n-es="Conecte currículo, resultados y evidencia de assessment">Connect curriculum, outcomes, and assessment evidence</h2><p data-i18n-en="Organize program-level evidence without changing course grades or learner records." data-i18n-es="Organice evidencia a nivel de programa sin cambiar calificaciones ni expedientes estudiantiles.">Organize program-level evidence without changing course grades or learner records.</p></div></header>{filter_note}{create}<section class="studio-grid">{cards}</section><section class="studio-panel"><p><strong>Scope:</strong> NUVEDRA organizes assessment evidence and curriculum mappings. This workspace does not certify accreditation or replace institutional review.</p></section></main>'''
+        return academic_access.portal_page("Program Outcomes & Accreditation", body, user)
+
+    @app.post("/faculty/programs", response_model=None)
+    async def create_program(request: Request, program_code: str = Form(...), title: str = Form(...), description: str = Form("")):
+        user = _user(request, "/faculty/programs")
+        if isinstance(user, RedirectResponse): return user
+        code = program_code.strip().upper(); clean_title = title.strip()
+        if not code or not clean_title: raise HTTPException(400, "Program code and title are required.")
+        with db() as conn:
+            if _platform_role(request) not in {"superadmin", "course_admin"} and not _has_author_course(conn, user["email"]):
+                raise HTTPException(403, "Create a program workspace only when you have course-author responsibilities or platform administration permission.")
+            if rows(execute(conn, "SELECT id FROM nuvedra_programs WHERE upper(program_code)=upper(?) AND status='active'", (code,))):
+                raise HTTPException(409, "An active program workspace already uses this code.")
+            now = utcnow()
+            program_id = _insert_id(conn, "INSERT INTO nuvedra_programs (program_code,title,description,status,created_by,created_at,updated_at) VALUES (?,?,?,'active',?,?,?)", (code, clean_title, description.strip(), user["email"], now, now))
+            execute(conn, "INSERT INTO nuvedra_program_members (program_id,user_email,program_role,status,created_by,created_at) VALUES (?,?, 'coordinator','active',?,?)", (program_id, user["email"].lower(), user["email"], now))
+            audit(conn, user["email"], "program_assessment_workspace_created", "program", str(program_id), code, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}", response_class=HTMLResponse, response_model=None)
+    async def program_dashboard(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = _program_access(conn, request, program_id, user["email"])
+            summary = _program_summary(conn, program_id)
+            members = rows(execute(conn, "SELECT user_email,program_role,status FROM nuvedra_program_members WHERE program_id=? AND status='active' ORDER BY program_role,user_email", (program_id,)))
+            course_outcomes = _course_outcomes(conn, program_id)
+            snapshots = rows(execute(conn, "SELECT id,label,created_by,created_at FROM nuvedra_program_snapshots WHERE program_id=? ORDER BY id DESC LIMIT 20", (program_id,)))
+            if str(access.get("program_role")) == "coordinator":
+                if _platform_role(request) in {"superadmin", "course_admin"}:
+                    candidates = rows(execute(conn, "SELECT id,course_code,title,term FROM nexus_admin_courses ORDER BY course_code,term,id"))
+                else:
+                    candidates = rows(execute(conn, """SELECT c.id,c.course_code,c.title,c.term FROM nexus_admin_enrollments e
+                        JOIN nexus_admin_courses c ON c.id=e.course_id
+                        WHERE lower(e.user_email)=? AND e.status='active' AND e.course_role IN ('instructor','teaching_assistant','course_builder','facilitator')
+                        ORDER BY c.course_code,c.term,c.id""", (user["email"].lower(),)))
+            else:
+                candidates = []
+        program = summary["program"]; threshold = float(summary["settings"].get("benchmark_threshold") or 80)
+        matrix = _matrix_cells(summary)
+        course_headers = "".join(f'<th>{academic_access.esc(c.get("course_code"))}<br><small>{academic_access.esc(c.get("term") or "")}</small></th>' for c in summary["courses"])
+        matrix_rows = []
+        evidence_rows = []
+        meets = gaps = no_evidence = 0
+        for entry in summary["outcomes"]:
+            status = entry["status"]
+            if status == "Meets benchmark": meets += 1
+            elif status == "Review gap": gaps += 1
+            else: no_evidence += 1
+            attainment_text = "—" if entry["attainment"] is None else f"{float(entry['attainment']):.1f}%"
+            cells = "".join(f'<td><strong>{academic_access.esc(matrix.get((int(entry["outcome"]["id"]), int(course["course_id"])), "—"))}</strong></td>' for course in summary["courses"])
+            matrix_rows.append(f'''<tr><td><strong>{academic_access.esc(entry['outcome'].get('code'))}</strong><br>{academic_access.esc(entry['outcome'].get('title'))}</td>{cells}<td>{academic_access.esc(attainment_text)}</td><td>{academic_access.esc(status)}</td></tr>''')
+            for mapping in entry["mappings"]:
+                mapping_attainment = "—" if mapping.get("attainment") is None else f"{float(mapping['attainment']):.1f}%"
+                evidence_rows.append(f'''<tr><td>{academic_access.esc(entry['outcome'].get('code'))}</td><td>{academic_access.esc(mapping.get('course_code'))}</td><td>{academic_access.esc(mapping.get('course_outcome_code'))}: {academic_access.esc(mapping.get('course_outcome_title'))}</td><td>{academic_access.esc(LEVEL_LABEL.get(str(mapping.get('curriculum_level')), '?'))}</td><td>{float(mapping.get('weight') or 1):g}</td><td>{academic_access.esc(mapping_attainment)}</td><td>{int(mapping.get('graded_evidence') or 0)}</td></tr>''')
+        matrix_html = "".join(matrix_rows) or f'<tr><td colspan="{len(summary["courses"])+3}">Create program outcomes to build the curriculum matrix.</td></tr>'
+        evidence_html = "".join(evidence_rows) or '<tr><td colspan="7">No course outcomes are aligned to program outcomes yet.</td></tr>'
+        course_options = "".join(f'<option value="{int(c["id"])}">{academic_access.esc(c.get("course_code"))} · {academic_access.esc(c.get("title"))} · {academic_access.esc(c.get("term") or "")}</option>' for c in candidates)
+        po_options = "".join(f'<option value="{int(o["outcome"]["id"])}">{academic_access.esc(o["outcome"].get("code"))} · {academic_access.esc(o["outcome"].get("title"))}</option>' for o in summary["outcomes"])
+        co_options = "".join(f'<option value="{int(o["id"])}">{academic_access.esc(o.get("course_code"))} · {academic_access.esc(o.get("code"))}: {academic_access.esc(o.get("title"))}</option>' for o in course_outcomes)
+        member_rows = "".join(f'<tr><td>{academic_access.esc(m.get("user_email"))}</td><td>{academic_access.esc(m.get("program_role"))}</td></tr>' for m in members) or '<tr><td colspan="2">No program members.</td></tr>'
+        snapshot_rows = "".join(f'<li><a href="/faculty/programs/{program_id}/snapshots/{int(s["id"])}">{academic_access.esc(s.get("label"))}</a> · {academic_access.esc(s.get("created_at"))}</li>' for s in snapshots) or '<li>No immutable aggregate snapshots yet.</li>'
+        manage = ""
+        if str(access.get("program_role")) == "coordinator":
+            manage = f'''<section class="studio-grid"><article class="studio-panel"><h3>Add course / Añadir curso</h3><form method="post" action="/faculty/programs/{program_id}/courses" class="studio-form"><label>Course<select name="course_id" required>{course_options}</select></label><button class="studio-button">Add course</button></form></article><article class="studio-panel"><h3>Create program outcome</h3><form method="post" action="/faculty/programs/{program_id}/outcomes" class="studio-form"><label>Code<input name="code" required maxlength="40"></label><label>Title<input name="title" required maxlength="180"></label><label>Description<textarea name="description" rows="3"></textarea></label><button class="studio-button">Create outcome</button></form></article><article class="studio-panel"><h3>Map course outcome</h3><form method="post" action="/faculty/programs/{program_id}/alignments" class="studio-form"><label>Program outcome<select name="program_outcome_id" required>{po_options}</select></label><label>Course outcome<select name="course_outcome_id" required>{co_options}</select></label><label>Curriculum level<select name="curriculum_level"><option value="introduced">Introduced (I)</option><option value="reinforced">Reinforced (R)</option><option value="mastered">Mastered (M)</option></select></label><label>Evidence weight<input name="weight" type="number" min="0.1" max="10" step="0.1" value="1"></label><button class="studio-button">Save alignment</button></form></article><article class="studio-panel"><h3>Program benchmark</h3><form method="post" action="/faculty/programs/{program_id}/settings" class="studio-form"><label>Benchmark threshold %<input name="benchmark_threshold" type="number" min="0" max="100" step="0.1" value="{threshold:g}" required></label><button class="studio-button">Save benchmark</button></form><p><small>The benchmark classifies aggregate evidence; it does not change student grades.</small></p></article><article class="studio-panel"><h3>Program access</h3><form method="post" action="/faculty/programs/{program_id}/members" class="studio-form"><label>Email<input name="user_email" type="email" required></label><label>Role<select name="program_role"><option value="reviewer">Reviewer</option><option value="coordinator">Coordinator</option></select></label><button class="studio-button">Add or update member</button></form></article><article class="studio-panel"><h3>Accreditation evidence snapshot</h3><form method="post" action="/faculty/programs/{program_id}/snapshots" class="studio-form"><label>Snapshot label<input name="label" required maxlength="180" placeholder="Fall 2026 assessment review"></label><button class="studio-button">Capture aggregate snapshot</button></form><p><small>Snapshots contain aggregate curriculum/evidence data and no student email addresses.</small></p></article></section>'''
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="program-outcomes-accreditation-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs">Programs</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">{academic_access.esc(program.get('program_code'))} · Program Outcomes & Accreditation</p><h2>{academic_access.esc(program.get('title'))}</h2><p>{academic_access.esc(program.get('description'))}</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/matrix.csv">Curriculum matrix CSV</a><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence.csv">Evidence CSV</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{len(summary['courses'])}</strong><span>Courses / Cursos</span></article><article class="studio-panel"><strong>{len(summary['outcomes'])}</strong><span>Program outcomes</span></article><article class="studio-panel"><strong>{meets}</strong><span>Meet benchmark</span></article><article class="studio-panel"><strong>{gaps}</strong><span>Review gaps</span></article><article class="studio-panel"><strong>{no_evidence}</strong><span>No evidence</span></article><article class="studio-panel"><strong>{threshold:g}%</strong><span>Program benchmark</span></article></section>{manage}<section class="studio-panel"><h2>Curriculum matrix / Matriz curricular</h2><p>I = Introduced · R = Reinforced · M = Mastered. Multiple course-outcome mappings may appear in one course cell.</p><div style="overflow:auto"><table><thead><tr><th>Program outcome</th>{course_headers}<th>Aggregate attainment</th><th>Assessment status</th></tr></thead><tbody>{matrix_html}</tbody></table></div></section><section class="studio-panel"><h2>Aggregate evidence / Evidencia agregada</h2><div style="overflow:auto"><table><thead><tr><th>Program outcome</th><th>Course</th><th>Course outcome</th><th>Level</th><th>Weight</th><th>Attainment</th><th>Graded evidence records</th></tr></thead><tbody>{evidence_html}</tbody></table></div></section><section class="studio-grid"><article class="studio-panel"><h3>Program members</h3><table><thead><tr><th>Email</th><th>Role</th></tr></thead><tbody>{member_rows}</tbody></table></article><article class="studio-panel"><h3>Evidence snapshots</h3><ul>{snapshot_rows}</ul></article></section><section class="studio-panel"><p><strong>Interpretation:</strong> program attainment is the weighted average of mapped course-outcome attainment values that have graded evidence. Course-outcome attainment is calculated from canonical Gradebook points across explicitly aligned activities. Missing evidence is never converted to a zero or invented score.</p><p><strong>Accreditation note:</strong> this workspace supports evidence organization, curriculum mapping, and institutional review; it does not assert accreditation compliance or certification.</p></section></main>'''
+        return academic_access.portal_page("Program Outcomes & Accreditation", body, user)
+
+    @app.post("/faculty/programs/{program_id}/courses", response_model=None)
+    async def add_program_course(program_id: int, request: Request, course_id: int = Form(...)):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            course = rows(execute(conn, "SELECT id FROM nexus_admin_courses WHERE id=?", (course_id,)))
+            if not course: raise HTTPException(404, "Course not found.")
+            if _platform_role(request) not in {"superadmin", "course_admin"}:
+                academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_program_courses WHERE program_id=? AND course_id=?", (program_id, course_id)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_program_courses SET status='active',added_by=?,added_at=? WHERE id=?", (user["email"], utcnow(), int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_program_courses (program_id,course_id,status,added_by,added_at) VALUES (?,?,'active',?,?)", (program_id, course_id, user["email"], utcnow()))
+            audit(conn, user["email"], "program_course_added", "program", str(program_id), f"course_id={course_id}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/outcomes", response_model=None)
+    async def create_program_outcome(program_id: int, request: Request, code: str = Form(...), title: str = Form(...), description: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        clean_code = code.strip().upper(); clean_title = title.strip()
+        if not clean_code or not clean_title: raise HTTPException(400, "Program outcome code and title are required.")
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            if rows(execute(conn, "SELECT id FROM nuvedra_program_outcomes WHERE program_id=? AND upper(code)=upper(?) AND status='active'", (program_id, clean_code))):
+                raise HTTPException(409, "This program outcome code already exists.")
+            now = utcnow()
+            outcome_id = _insert_id(conn, "INSERT INTO nuvedra_program_outcomes (program_id,code,title,description,status,created_by,created_at,updated_at) VALUES (?,?,?,?,'active',?,?,?)", (program_id, clean_code, clean_title, description.strip(), user["email"], now, now))
+            audit(conn, user["email"], "program_outcome_created", "program_outcome", str(outcome_id), clean_code, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/alignments", response_model=None)
+    async def create_program_alignment(program_id: int, request: Request, program_outcome_id: int = Form(...), course_outcome_id: int = Form(...), curriculum_level: str = Form("introduced"), weight: float = Form(1)):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        if curriculum_level not in CURRICULUM_LEVELS: raise HTTPException(400, "Unsupported curriculum level.")
+        if weight < 0.1 or weight > 10: raise HTTPException(400, "Evidence weight must be between 0.1 and 10.")
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            po = rows(execute(conn, "SELECT id FROM nuvedra_program_outcomes WHERE id=? AND program_id=? AND status='active'", (program_outcome_id, program_id)))
+            co = rows(execute(conn, """SELECT o.id,o.course_id FROM nuvedra_outcomes o JOIN nuvedra_program_courses pc ON pc.course_id=o.course_id
+                WHERE o.id=? AND pc.program_id=? AND pc.status='active' AND o.status='active'""", (course_outcome_id, program_id)))
+            if not po or not co: raise HTTPException(400, "Both outcomes must belong to this active program curriculum.")
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_program_outcome_links WHERE program_outcome_id=? AND course_outcome_id=?", (program_outcome_id, course_outcome_id)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_program_outcome_links SET curriculum_level=?,weight=?,created_by=?,created_at=? WHERE id=?", (curriculum_level, weight, user["email"], utcnow(), int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_program_outcome_links (program_outcome_id,course_outcome_id,curriculum_level,weight,created_by,created_at) VALUES (?,?,?,?,?,?)", (program_outcome_id, course_outcome_id, curriculum_level, weight, user["email"], utcnow()))
+            audit(conn, user["email"], "program_outcome_alignment_saved", "program_outcome", str(program_outcome_id), f"course_outcome={course_outcome_id};level={curriculum_level};weight={weight:g}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/settings", response_model=None)
+    async def save_program_settings(program_id: int, request: Request, benchmark_threshold: float = Form(80)):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        if benchmark_threshold < 0 or benchmark_threshold > 100: raise HTTPException(400, "Benchmark must be between 0 and 100 percent.")
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_program_settings WHERE program_id=?", (program_id,)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_program_settings SET benchmark_threshold=?,updated_by=?,updated_at=? WHERE id=?", (benchmark_threshold, user["email"], utcnow(), int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_program_settings (program_id,benchmark_threshold,updated_by,updated_at) VALUES (?,?,?,?)", (program_id, benchmark_threshold, user["email"], utcnow()))
+            audit(conn, user["email"], "program_benchmark_updated", "program", str(program_id), f"benchmark={benchmark_threshold:g}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/members", response_model=None)
+    async def save_program_member(program_id: int, request: Request, user_email: str = Form(...), program_role: str = Form("reviewer")):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        email = user_email.strip().lower()
+        if program_role not in PROGRAM_ROLES or "@" not in email: raise HTTPException(400, "Valid email and program role are required.")
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_program_members WHERE program_id=? AND lower(user_email)=?", (program_id, email)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_program_members SET program_role=?,status='active',created_by=?,created_at=? WHERE id=?", (program_role, user["email"], utcnow(), int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_program_members (program_id,user_email,program_role,status,created_by,created_at) VALUES (?,?,?,'active',?,?)", (program_id, email, program_role, user["email"], utcnow()))
+            audit(conn, user["email"], "program_member_saved", "program", str(program_id), f"{email}:{program_role}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/matrix.csv", response_model=None)
+    async def program_matrix_csv(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            _program_access(conn, request, program_id, user["email"]); summary = _program_summary(conn, program_id)
+        matrix = _matrix_cells(summary); stream = io.StringIO(); writer = csv.writer(stream)
+        writer.writerow(["Program outcome"] + [f"{c.get('course_code')} {c.get('term') or ''}".strip() for c in summary["courses"]] + ["Aggregate attainment %", "Assessment status"])
+        for entry in summary["outcomes"]:
+            row = [f"{entry['outcome'].get('code')}: {entry['outcome'].get('title')}"]
+            row.extend(matrix.get((int(entry["outcome"]["id"]), int(course["course_id"])), "") for course in summary["courses"])
+            row.extend(["" if entry["attainment"] is None else round(float(entry["attainment"]), 2), entry["status"]]); writer.writerow(row)
+        filename = f"{str(summary['program'].get('program_code') or 'program').replace(' ', '_')}-curriculum-matrix.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/faculty/programs/{program_id}/evidence.csv", response_model=None)
+    async def program_evidence_csv(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            _program_access(conn, request, program_id, user["email"]); summary = _program_summary(conn, program_id)
+        stream = io.StringIO(); writer = csv.writer(stream)
+        writer.writerow(["Program outcome", "Course", "Term", "Course outcome", "Curriculum level", "Weight", "Course outcome attainment %", "Graded evidence records"])
+        for entry in summary["outcomes"]:
+            for mapping in entry["mappings"]:
+                writer.writerow([f"{entry['outcome'].get('code')}: {entry['outcome'].get('title')}", mapping.get("course_code"), mapping.get("term"), f"{mapping.get('course_outcome_code')}: {mapping.get('course_outcome_title')}", mapping.get("curriculum_level"), mapping.get("weight"), "" if mapping.get("attainment") is None else round(float(mapping["attainment"]), 2), mapping.get("graded_evidence")])
+        filename = f"{str(summary['program'].get('program_code') or 'program').replace(' ', '_')}-assessment-evidence.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.post("/faculty/programs/{program_id}/snapshots", response_model=None)
+    async def capture_program_snapshot(program_id: int, request: Request, label: str = Form(...)):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse): return user
+        clean = label.strip()
+        if not clean: raise HTTPException(400, "Snapshot label is required.")
+        with db() as conn:
+            _require_manage(conn, request, program_id, user["email"])
+            payload = _snapshot_payload(conn, program_id)
+            snapshot_id = _insert_id(conn, "INSERT INTO nuvedra_program_snapshots (program_id,label,snapshot_json,created_by,created_at) VALUES (?,?,?,?,?)", (program_id, clean[:180], json.dumps(payload, separators=(",", ":")), user["email"], utcnow()))
+            audit(conn, user["email"], "program_evidence_snapshot_created", "program_snapshot", str(snapshot_id), clean[:180], request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/snapshots/{snapshot_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/snapshots/{snapshot_id}", response_class=HTMLResponse, response_model=None)
+    async def program_snapshot(program_id: int, snapshot_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/snapshots/{snapshot_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            _program_access(conn, request, program_id, user["email"])
+            found = rows(execute(conn, "SELECT * FROM nuvedra_program_snapshots WHERE id=? AND program_id=?", (snapshot_id, program_id)))
+        if not found: raise HTTPException(404, "Program evidence snapshot not found.")
+        snap = found[0]
+        try: payload = json.loads(str(snap.get("snapshot_json") or "{}"))
+        except json.JSONDecodeError: raise HTTPException(500, "Stored program evidence snapshot is invalid.")
+        outcome_rows = "".join(f'''<tr><td>{academic_access.esc(o.get('code'))}: {academic_access.esc(o.get('title'))}</td><td>{'—' if o.get('attainment') is None else f"{float(o['attainment']):.1f}%"}</td><td>{academic_access.esc(o.get('status'))}</td><td>{int(o.get('graded_evidence') or 0)}</td><td>I {int((o.get('coverage') or {}).get('introduced') or 0)} · R {int((o.get('coverage') or {}).get('reinforced') or 0)} · M {int((o.get('coverage') or {}).get('mastered') or 0)}</td></tr>''' for o in payload.get("outcomes", [])) or '<tr><td colspan="5">No program outcomes were captured.</td></tr>'
+        course_rows = "".join(f'<li><strong>{academic_access.esc(c.get("course_code"))}</strong> · {academic_access.esc(c.get("title"))} · {academic_access.esc(c.get("term") or "")}</li>' for c in payload.get("courses", [])) or '<li>No courses were captured.</li>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="program-accreditation-snapshot-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}">Back to program</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Immutable aggregate assessment snapshot</p><h2>{academic_access.esc(snap.get('label'))}</h2><p>{academic_access.esc(payload.get('program', {}).get('program_code'))}: {academic_access.esc(payload.get('program', {}).get('title'))}</p><p>Captured {academic_access.esc(payload.get('captured_at'))} · benchmark {float(payload.get('benchmark_threshold') or 80):g}%</p></div></header><section class="studio-panel"><h3>Courses captured</h3><ul>{course_rows}</ul></section><section class="studio-panel"><h3>Program outcome evidence at capture time</h3><div style="overflow:auto"><table><thead><tr><th>Program outcome</th><th>Attainment</th><th>Status</th><th>Graded evidence</th><th>Curriculum coverage</th></tr></thead><tbody>{outcome_rows}</tbody></table></div></section><section class="studio-panel"><p>This snapshot stores aggregate program evidence only; it intentionally excludes student email addresses and individual learner records.</p></section></main>'''
+        return academic_access.portal_page("Program evidence snapshot", body, user)
+
+    print("NUVEDRA Program Outcomes & Accreditation v1 registered: program workspaces, curriculum matrix, course-to-program outcome mapping, aggregate evidence, benchmark review, CSV export, and privacy-preserving snapshots.", flush=True)
