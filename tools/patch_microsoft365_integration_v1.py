@@ -46,11 +46,18 @@ def patch_portal_login_choices() -> None:
     marker = "NUVEDRA_MICROSOFT365_INTEGRATION_V1_LOGIN"
     if marker in text:
         return
-    old = '''            body = \'\'\'<section class="card" style="max-width:680px;margin:auto"><h2>Acceso para profesores y estudiantes</h2><p>Utilice su cuenta institucional de Google. NUVEDRA mostrará únicamente los cursos y las funciones asignadas por el administrador.</p><a class="button" href="/portal/login">Continuar con Google</a></section>\'\'\'\n'''
-    new = '''            # NUVEDRA_MICROSOFT365_INTEGRATION_V1_LOGIN\n            body = \'\'\'<section class="card" style="max-width:720px;margin:auto"><h2>Acceso para profesores y estudiantes</h2><p>Utilice su cuenta institucional. NUVEDRA mostrará únicamente los cursos y funciones asignados por el administrador.</p><a class="button" href="/portal/login">Continuar con Google</a><a class="button secondary" href="/portal/microsoft-connect">Continuar con Microsoft 365</a><p class="muted">Google y Microsoft 365 son opciones de identidad independientes; la institución puede habilitar una o ambas.</p></section>\'\'\'\n'''
-    if old not in text:
+    if "import os\n" not in text:
+        text = text.replace("from __future__ import annotations\n", "from __future__ import annotations\n\nimport os\n", 1)
+    old_login = '''        request.session["post_google_redirect"] = safe_next(next)\n        return RedirectResponse("/auth/google/login", status_code=303)\n'''
+    new_login = '''        target = safe_next(next)\n        if not os.getenv("GOOGLE_CLIENT_ID", "").strip() and os.getenv("MICROSOFT_CLIENT_ID", "").strip():\n            request.session["post_microsoft_redirect"] = target\n            request.session["microsoft_connect_only"] = False\n            return RedirectResponse("/auth/microsoft/login", status_code=303)\n        request.session["post_google_redirect"] = target\n        return RedirectResponse("/auth/google/login", status_code=303)\n'''
+    if old_login not in text:
+        raise RuntimeError("Microsoft 365 Integration v1 could not locate the existing Google portal-login redirect.")
+    text = text.replace(old_login, new_login, 1)
+    old_card = '''            body = \'\'\'<section class="card" style="max-width:680px;margin:auto"><h2>Acceso para profesores y estudiantes</h2><p>Utilice su cuenta institucional de Google. NUVEDRA mostrará únicamente los cursos y las funciones asignadas por el administrador.</p><a class="button" href="/portal/login">Continuar con Google</a></section>\'\'\'\n'''
+    new_card = '''            # NUVEDRA_MICROSOFT365_INTEGRATION_V1_LOGIN\n            google_button = '<a class="button" href="/portal/login">Continuar con Google</a>' if os.getenv("GOOGLE_CLIENT_ID", "").strip() else ''\n            microsoft_button = '<a class="button secondary" href="/portal/microsoft-connect">Continuar con Microsoft 365</a>' if os.getenv("MICROSOFT_CLIENT_ID", "").strip() else ''\n            provider_note = '' if (google_button or microsoft_button) else '<p class="error">No hay un proveedor de identidad académico configurado. Comuníquese con el administrador.</p>'\n            body = f\'\'\'<section class="card" style="max-width:720px;margin:auto"><h2>Acceso para profesores y estudiantes</h2><p>Utilice su cuenta institucional. NUVEDRA mostrará únicamente los cursos y funciones asignados por el administrador.</p>{google_button}{microsoft_button}{provider_note}<p class="muted">Google y Microsoft 365 son opciones de identidad independientes; la institución puede habilitar una o ambas.</p></section>\'\'\'\n'''
+    if old_card not in text:
         raise RuntimeError("Microsoft 365 Integration v1 could not locate the academic portal sign-in card.")
-    GOOGLE_HUB.write_text(text.replace(old, new, 1), encoding="utf-8")
+    GOOGLE_HUB.write_text(text.replace(old_card, new_card, 1), encoding="utf-8")
 
 
 def patch_studio_link() -> None:
@@ -104,7 +111,7 @@ def main() -> None:
     patch_studio_link()
     compile(ACADEMIC_PORTAL.read_text(encoding="utf-8"), str(ACADEMIC_PORTAL), "exec")
     compile(GOOGLE_HUB.read_text(encoding="utf-8"), str(GOOGLE_HUB), "exec")
-    print("NUVEDRA Microsoft 365 Integration v1 installed: Entra ID sign-in/connect, encrypted Microsoft Graph tokens, OneDrive, SharePoint, Content Library links, Teams-enabled Outlook events, and Course Studio navigation.", flush=True)
+    print("NUVEDRA Microsoft 365 Integration v1 installed: Entra ID sign-in/connect, provider fallback, encrypted Microsoft Graph tokens, OneDrive, SharePoint, Content Library links, Teams-enabled Outlook events, and Course Studio navigation.", flush=True)
 
 
 if __name__ == "__main__":
