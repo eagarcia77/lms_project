@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Institutional Evidence Repository & Accreditation Portfolio v1 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install the next program-assessment layer after the evidence repository exists.
+    from patch_accreditation_standards_crosswalk_v1 import main as patch_accreditation_standards_crosswalk_v1
+    patch_accreditation_standards_crosswalk_v1()
+
+    from patch_accreditation_standards_crosswalk_smoke import main as patch_accreditation_standards_crosswalk_smoke
+    patch_accreditation_standards_crosswalk_smoke()
+
 
 if __name__ == "__main__":
     main()
