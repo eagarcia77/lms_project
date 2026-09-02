@@ -1,0 +1,383 @@
+from __future__ import annotations
+
+import hashlib
+import secrets
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import quote
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+import app.program_outcomes_accreditation as program_outcomes
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+REQUEST_STATES = {"open", "addressed", "closed"}
+MAX_COMMENT = 6000
+MAX_REQUEST = 6000
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _parse_iso(value: str) -> datetime:
+    clean = str(value or "").strip()
+    if not clean:
+        raise HTTPException(400, "Expiration date and time are required.")
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(400, "Expiration date/time is invalid.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _future_expiration(value: str) -> str:
+    parsed = _parse_iso(value)
+    if parsed <= datetime.now(timezone.utc):
+        raise HTTPException(400, "External-review access must expire in the future.")
+    return parsed.isoformat()
+
+
+def ensure_external_review_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_external_review_invites (
+            id {pk}, program_id INTEGER NOT NULL, portfolio_id INTEGER NOT NULL,
+            reviewer_name TEXT NOT NULL, reviewer_email TEXT, organization TEXT,
+            token_hash TEXT NOT NULL UNIQUE, token_hint TEXT,
+            expires_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            revoked_at TEXT, revoked_by TEXT, last_accessed_at TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_external_review_comments (
+            id {pk}, invite_id INTEGER NOT NULL, portfolio_id INTEGER NOT NULL,
+            standard_code TEXT, criterion_code TEXT, comment_text TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_external_evidence_requests (
+            id {pk}, invite_id INTEGER NOT NULL, portfolio_id INTEGER NOT NULL,
+            standard_code TEXT, criterion_code TEXT, request_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open', response_note TEXT,
+            requested_at TEXT NOT NULL, addressed_at TEXT, addressed_by TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_external_review_access_log (
+            id {pk}, invite_id INTEGER NOT NULL, action TEXT NOT NULL,
+            resource_type TEXT, resource_id TEXT, occurred_at TEXT NOT NULL,
+            ip_address TEXT, user_agent TEXT
+        )""")
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    return program_outcomes._user(request, return_to)
+
+
+def _portfolio(conn: Any, program_id: int, portfolio_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_portfolios WHERE id=? AND program_id=?", (portfolio_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Accreditation portfolio not found.")
+    return found[0]
+
+
+def _require_frozen(portfolio: dict[str, Any]) -> None:
+    if str(portfolio.get("status")) != "frozen":
+        raise HTTPException(409, "External review can only be opened for a frozen accreditation portfolio.")
+
+
+def _invite(conn: Any, invite_id: int, program_id: int | None = None) -> dict[str, Any]:
+    if program_id is None:
+        found = rows(execute(conn, "SELECT * FROM nuvedra_external_review_invites WHERE id=?", (invite_id,)))
+    else:
+        found = rows(execute(conn, "SELECT * FROM nuvedra_external_review_invites WHERE id=? AND program_id=?", (invite_id, program_id)))
+    if not found:
+        raise HTTPException(404, "External review invitation not found.")
+    return found[0]
+
+
+def _external_invite(conn: Any, token: str) -> dict[str, Any]:
+    token = str(token or "").strip()
+    if len(token) < 20:
+        raise HTTPException(404, "External review link not found.")
+    found = rows(execute(conn, """SELECT i.*,p.title AS portfolio_title,p.status AS portfolio_status,
+        p.accreditor,p.review_period,p.description AS portfolio_description,
+        pr.program_code,pr.title AS program_title
+        FROM nuvedra_external_review_invites i
+        JOIN nuvedra_accreditation_portfolios p ON p.id=i.portfolio_id
+        JOIN nuvedra_programs pr ON pr.id=i.program_id
+        WHERE i.token_hash=?""", (_token_hash(token),)))
+    if not found:
+        raise HTTPException(404, "External review link not found.")
+    invite = found[0]
+    if str(invite.get("status")) != "active":
+        raise HTTPException(410, "This external review invitation has been revoked.")
+    if str(invite.get("portfolio_status")) != "frozen":
+        raise HTTPException(409, "This accreditation portfolio is not frozen for external review.")
+    try:
+        expires = _parse_iso(str(invite.get("expires_at") or ""))
+    except HTTPException:
+        raise HTTPException(410, "This external review invitation has an invalid expiration.")
+    if expires <= datetime.now(timezone.utc):
+        raise HTTPException(410, "This external review invitation has expired.")
+    return invite
+
+
+def _access_log(conn: Any, request: Request, invite_id: int, action: str, resource_type: str = "", resource_id: str = "") -> None:
+    execute(conn, """INSERT INTO nuvedra_external_review_access_log
+        (invite_id,action,resource_type,resource_id,occurred_at,ip_address,user_agent)
+        VALUES (?,?,?,?,?,?,?)""", (
+        invite_id, action, resource_type or None, resource_id or None, utcnow(),
+        request.client.host if request.client else "", str(request.headers.get("user-agent") or "")[:500],
+    ))
+    execute(conn, "UPDATE nuvedra_external_review_invites SET last_accessed_at=? WHERE id=?", (utcnow(), invite_id))
+
+
+def _portfolio_items(conn: Any, portfolio_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT pi.*,a.title,a.description,a.evidence_type,a.tags,
+        v.version_no,v.file_name,v.mime_type,v.file_size,v.source_url,
+        l.standard_code,l.criterion_code,l.cycle_id,l.program_outcome_id,l.improvement_action_id
+        FROM nuvedra_accreditation_portfolio_items pi
+        JOIN nuvedra_evidence_assets a ON a.id=pi.asset_id
+        JOIN nuvedra_evidence_versions v ON v.id=pi.evidence_version_id
+        JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+        JOIN nuvedra_accreditation_portfolios p ON p.id=pi.portfolio_id AND p.program_id=l.program_id
+        WHERE pi.portfolio_id=?
+        ORDER BY COALESCE(l.standard_code,''),COALESCE(l.criterion_code,''),pi.position,pi.id""", (portfolio_id,)))
+
+
+def _criteria_for_portfolio(conn: Any, program_id: int, items: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    pairs = {(str(x.get("standard_code") or "").strip(), str(x.get("criterion_code") or "").strip()) for x in items}
+    pairs.discard(("", ""))
+    crosswalk = rows(execute(conn, """SELECT DISTINCT s.code AS standard_code,c.code AS criterion_code
+        FROM nuvedra_program_frameworks pf
+        JOIN nuvedra_accreditation_standards s ON s.framework_id=pf.framework_id AND s.status='active'
+        JOIN nuvedra_accreditation_criteria c ON c.standard_id=s.id AND c.status='active'
+        WHERE pf.program_id=? AND pf.status='active'
+        ORDER BY s.position,s.code,c.position,c.code""", (program_id,)))
+    for row in crosswalk:
+        pairs.add((str(row.get("standard_code") or "").strip(), str(row.get("criterion_code") or "").strip()))
+    return sorted(pairs, key=lambda x: (x[0], x[1]))
+
+
+def _validate_scope(standards: list[tuple[str, str]], standard_code: str, criterion_code: str) -> tuple[str, str]:
+    standard = standard_code.strip()[:80]
+    criterion = criterion_code.strip()[:80]
+    if not standard and not criterion:
+        return "", ""
+    allowed = set(standards)
+    if (standard, criterion) in allowed:
+        return standard, criterion
+    if not criterion and any(s == standard for s, _ in allowed):
+        return standard, ""
+    raise HTTPException(400, "The selected accreditation standard/criterion is not part of this review package.")
+
+
+def _review_html(token: str, invite: dict[str, Any], items: list[dict[str, Any]], standards: list[tuple[str, str]], comments: list[dict[str, Any]], evidence_requests: list[dict[str, Any]]) -> str:
+    evidence_cards = []
+    for item in items:
+        version_id = int(item["evidence_version_id"])
+        link = ""
+        if item.get("file_name") or item.get("source_url"):
+            link = f'<a href="/external/review/{academic_access.esc(token, attr=True)}/evidence/{version_id}" target="_blank" rel="noopener">Open protected evidence</a>'
+        evidence_cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(item.get('standard_code') or 'Program')} · {academic_access.esc(item.get('criterion_code') or 'General')}</p><h3>{academic_access.esc(item.get('title'))}</h3><p>{academic_access.esc(item.get('description'))}</p><p><strong>Frozen version:</strong> v{int(item.get('version_no') or 1)} · {academic_access.esc(item.get('evidence_type'))}</p><p>{academic_access.esc(item.get('narrative'))}</p><p>{link}</p></article>''')
+    options = ['<option value="|">Portfolio-wide</option>']
+    for standard, criterion in standards:
+        label = f"{standard} / {criterion}" if criterion else standard
+        options.append(f'<option value="{academic_access.esc(standard + "|" + criterion, attr=True)}">{academic_access.esc(label)}</option>')
+    option_html = "".join(options)
+    comment_rows = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(c.get('standard_code') or 'Portfolio')} {academic_access.esc(c.get('criterion_code') or '')}</p><p>{academic_access.esc(c.get('comment_text'))}</p><small>{academic_access.esc(c.get('created_at'))}</small></article>''' for c in comments) or '<section class="studio-empty">No external review comments yet.</section>'
+    request_rows = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(r.get('standard_code') or 'Portfolio')} {academic_access.esc(r.get('criterion_code') or '')}</p><h4>{academic_access.esc(r.get('status'))}</h4><p>{academic_access.esc(r.get('request_text'))}</p>{f'<p><strong>Institution response:</strong> {academic_access.esc(r.get("response_note"))}</p>' if r.get('response_note') else ''}</article>''' for r in evidence_requests) or '<section class="studio-empty">No additional-evidence requests yet.</section>'
+    return f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="external-accreditation-review-portal-v1"><header class="studio-hero"><div><p class="studio-eyebrow">External Accreditation Review</p><h2>{academic_access.esc(invite.get('portfolio_title'))}</h2><p>{academic_access.esc(invite.get('program_code'))}: {academic_access.esc(invite.get('program_title'))}</p><p>{academic_access.esc(invite.get('accreditor') or 'Institutional review')} · {academic_access.esc(invite.get('review_period') or '')}</p></div></header><section class="studio-panel"><p><strong>Reviewer:</strong> {academic_access.esc(invite.get('reviewer_name'))}{' · ' + academic_access.esc(invite.get('organization')) if invite.get('organization') else ''}</p><p><strong>Access expires:</strong> {academic_access.esc(invite.get('expires_at'))}</p><p>This is a read-only frozen institutional review package. Comments and evidence requests are recorded in the audit trail; they do not modify learner records, grades, or the frozen evidence package.</p></section><section class="studio-section"><h2>Frozen evidence package</h2><div class="studio-grid">{''.join(evidence_cards) or '<section class="studio-empty">No evidence items are available.</section>'}</div></section><section class="studio-grid"><article class="studio-panel"><h3>Reviewer comment</h3><form method="post" action="/external/review/{academic_access.esc(token, attr=True)}/comments" class="studio-form"><label>Standard / criterion<select name="scope">{option_html}</select></label><label>Comment<textarea name="comment_text" maxlength="{MAX_COMMENT}" rows="5" required></textarea></label><button class="studio-button">Submit comment</button></form></article><article class="studio-panel"><h3>Request additional evidence</h3><form method="post" action="/external/review/{academic_access.esc(token, attr=True)}/requests" class="studio-form"><label>Standard / criterion<select name="scope">{option_html}</select></label><label>Request<textarea name="request_text" maxlength="{MAX_REQUEST}" rows="5" required></textarea></label><button class="studio-button">Submit evidence request</button></form></article></section><section class="studio-section"><h2>Review comments</h2><div class="studio-grid">{comment_rows}</div></section><section class="studio-section"><h2>Evidence requests</h2><div class="studio-grid">{request_rows}</div></section><section class="studio-panel"><p><strong>Confidential review link:</strong> do not forward this URL. Access is time-limited and may be revoked by the institution.</p></section></main>'''
+
+
+def _management_html(program_id: int, program: dict[str, Any], portfolio: dict[str, Any], invites: list[dict[str, Any]], evidence_requests: list[dict[str, Any]], can_manage: bool, generated_url: str = "") -> str:
+    invite_form = ""
+    if can_manage:
+        invite_form = f'''<section class="studio-panel"><h3>Create external reviewer access</h3><p>Only frozen portfolios can be shared. The access token is stored only as a hash and the complete reviewer URL is shown only immediately after creation.</p><form method="post" action="/faculty/programs/{program_id}/evidence/portfolios/{int(portfolio['id'])}/external-review/invites" class="studio-form"><label>Reviewer name<input name="reviewer_name" required maxlength="180"></label><label>Reviewer email<input type="email" name="reviewer_email" maxlength="240"></label><label>Organization<input name="organization" maxlength="180"></label><label>Expires at (UTC)<input type="datetime-local" name="expires_at" required></label><button class="studio-button">Create secure review link</button></form></section>'''
+    generated = f'''<section class="studio-panel" data-testid="external-review-generated-link"><h3>New external review link</h3><p>This complete link is shown once. Copy it now and deliver it through an approved institutional channel.</p><p style="overflow-wrap:anywhere"><code>{academic_access.esc(generated_url)}</code></p></section>''' if generated_url else ""
+    invite_rows = []
+    for invite in invites:
+        controls = ""
+        if can_manage and str(invite.get("status")) == "active":
+            controls = f'''<form method="post" action="/faculty/programs/{program_id}/external-review/invites/{int(invite['id'])}/revoke"><button class="studio-button studio-button--quiet">Revoke access</button></form>'''
+        invite_rows.append(f'''<tr><td>{academic_access.esc(invite.get('reviewer_name'))}<br><small>{academic_access.esc(invite.get('organization') or '')}</small></td><td>{academic_access.esc(invite.get('reviewer_email') or '—')}</td><td>{academic_access.esc(invite.get('expires_at'))}</td><td>{academic_access.esc(invite.get('status'))}</td><td>{academic_access.esc(invite.get('last_accessed_at') or 'Never')}</td><td>…{academic_access.esc(invite.get('token_hint') or '')}</td><td>{controls}</td></tr>''')
+    request_rows = []
+    for req in evidence_requests:
+        form = ""
+        if can_manage:
+            options = "".join(f'<option value="{state}"{" selected" if str(req.get("status")) == state else ""}>{state}</option>' for state in ("open", "addressed", "closed"))
+            form = f'''<form method="post" action="/faculty/programs/{program_id}/external-review/requests/{int(req['id'])}/status" class="studio-form"><label>Status<select name="status">{options}</select></label><label>Institution response<textarea name="response_note" rows="2">{academic_access.esc(req.get('response_note'))}</textarea></label><button class="studio-button studio-button--quiet">Save response</button></form>'''
+        request_rows.append(f'''<tr><td>{academic_access.esc(req.get('reviewer_name'))}</td><td>{academic_access.esc(req.get('standard_code') or 'Portfolio')} {academic_access.esc(req.get('criterion_code') or '')}</td><td>{academic_access.esc(req.get('request_text'))}</td><td>{academic_access.esc(req.get('status'))}</td><td>{academic_access.esc(req.get('response_note') or '—')}{form}</td></tr>''')
+    return f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="external-accreditation-review-management-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}/evidence/portfolios/{int(portfolio['id'])}">Accreditation Portfolio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">External Accreditation Review Portal</p><h2>{academic_access.esc(portfolio.get('title'))}</h2><p>{academic_access.esc(program.get('program_code'))}: {academic_access.esc(program.get('title'))}</p></div></header>{generated}{invite_form}<section class="studio-panel"><h3>External reviewer invitations</h3><div style="overflow:auto"><table><thead><tr><th>Reviewer</th><th>Email</th><th>Expires</th><th>Status</th><th>Last access</th><th>Token hint</th><th>Action</th></tr></thead><tbody>{''.join(invite_rows) or '<tr><td colspan="7">No external reviewer invitations yet.</td></tr>'}</tbody></table></div></section><section class="studio-panel"><h3>Additional-evidence requests</h3><div style="overflow:auto"><table><thead><tr><th>Reviewer</th><th>Scope</th><th>Request</th><th>Status</th><th>Institution response</th></tr></thead><tbody>{''.join(request_rows) or '<tr><td colspan="5">No external evidence requests.</td></tr>'}</tbody></table></div></section><section class="studio-panel"><p><strong>Security:</strong> reviewer tokens are capability links, stored only as SHA-256 hashes. Access can be revoked at any time and every review-page view, evidence open, comment, and evidence request is logged.</p></section></main>'''
+
+
+def register_external_accreditation_review_portal(app: FastAPI) -> None:
+    ensure_external_review_schema()
+
+    @app.get("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review", response_class=HTMLResponse, response_model=None)
+    async def manage_external_review(program_id: int, portfolio_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review")
+        if isinstance(user, RedirectResponse):
+            return user
+        generated_url = str(request.session.pop("external_review_generated_url", "") or "")
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            portfolio = _portfolio(conn, program_id, portfolio_id)
+            _require_frozen(portfolio)
+            invites = rows(execute(conn, "SELECT * FROM nuvedra_external_review_invites WHERE program_id=? AND portfolio_id=? ORDER BY id DESC", (program_id, portfolio_id)))
+            evidence_requests = rows(execute(conn, """SELECT r.*,i.reviewer_name FROM nuvedra_external_evidence_requests r
+                JOIN nuvedra_external_review_invites i ON i.id=r.invite_id
+                WHERE r.portfolio_id=? ORDER BY r.id DESC""", (portfolio_id,)))
+        body = _management_html(program_id, program, portfolio, invites, evidence_requests, str(access.get("program_role")) == "coordinator", generated_url)
+        return academic_access.portal_page("External Accreditation Review", body, user)
+
+    @app.post("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review/invites", response_model=None)
+    async def create_external_invite(program_id: int, portfolio_id: int, request: Request, reviewer_name: str = Form(...), reviewer_email: str = Form(""), organization: str = Form(""), expires_at: str = Form(...)):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_name = reviewer_name.strip()
+        if not clean_name:
+            raise HTTPException(400, "Reviewer name is required.")
+        expiration = _future_expiration(expires_at)
+        token = secrets.token_urlsafe(32)
+        hint = token[-6:]
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            if str(access.get("program_role")) != "coordinator":
+                raise HTTPException(403, "Program coordinator permission is required to create external review access.")
+            portfolio = _portfolio(conn, program_id, portfolio_id)
+            _require_frozen(portfolio)
+            invite_id = _insert_id(conn, """INSERT INTO nuvedra_external_review_invites
+                (program_id,portfolio_id,reviewer_name,reviewer_email,organization,token_hash,token_hint,expires_at,status,created_by,created_at)
+                VALUES (?,?,?,?,?,?,?,?, 'active',?,?)""", (program_id, portfolio_id, clean_name, reviewer_email.strip() or None, organization.strip() or None, _token_hash(token), hint, expiration, user["email"], utcnow()))
+            audit(conn, user["email"], "external_accreditation_review_invite_created", "external_review_invite", str(invite_id), f"portfolio={portfolio_id};hint={hint}", request.client.host if request.client else "")
+        base = str(request.base_url).rstrip("/")
+        request.session["external_review_generated_url"] = f"{base}/external/review/{token}"
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/external-review/invites/{invite_id}/revoke", response_model=None)
+    async def revoke_external_invite(program_id: int, invite_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            if str(access.get("program_role")) != "coordinator":
+                raise HTTPException(403, "Program coordinator permission is required to revoke external review access.")
+            invite = _invite(conn, invite_id, program_id)
+            execute(conn, "UPDATE nuvedra_external_review_invites SET status='revoked',revoked_at=?,revoked_by=? WHERE id=?", (utcnow(), user["email"], invite_id))
+            audit(conn, user["email"], "external_accreditation_review_invite_revoked", "external_review_invite", str(invite_id), str(invite.get("portfolio_id")), request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{int(invite['portfolio_id'])}/external-review", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/external-review/requests/{request_id}/status", response_model=None)
+    async def update_external_request(program_id: int, request_id: int, request: Request, status: str = Form(...), response_note: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_status = status.strip().lower()
+        if clean_status not in REQUEST_STATES:
+            raise HTTPException(400, "Unsupported evidence-request status.")
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            if str(access.get("program_role")) != "coordinator":
+                raise HTTPException(403, "Program coordinator permission is required to respond to external evidence requests.")
+            found = rows(execute(conn, """SELECT r.*,i.program_id FROM nuvedra_external_evidence_requests r
+                JOIN nuvedra_external_review_invites i ON i.id=r.invite_id WHERE r.id=? AND i.program_id=?""", (request_id, program_id)))
+            if not found:
+                raise HTTPException(404, "External evidence request not found.")
+            req = found[0]
+            addressed_at = utcnow() if clean_status in {"addressed", "closed"} else None
+            addressed_by = user["email"] if addressed_at else None
+            execute(conn, "UPDATE nuvedra_external_evidence_requests SET status=?,response_note=?,addressed_at=?,addressed_by=? WHERE id=?", (clean_status, response_note.strip() or None, addressed_at, addressed_by, request_id))
+            audit(conn, user["email"], "external_accreditation_evidence_request_updated", "external_evidence_request", str(request_id), clean_status, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{int(req['portfolio_id'])}/external-review", status_code=303)
+
+    @app.get("/external/review/{token}", response_class=HTMLResponse, response_model=None)
+    async def external_review_portal(token: str, request: Request):
+        with db() as conn:
+            invite = _external_invite(conn, token)
+            items = _portfolio_items(conn, int(invite["portfolio_id"]))
+            standards = _criteria_for_portfolio(conn, int(invite["program_id"]), items)
+            comments = rows(execute(conn, "SELECT * FROM nuvedra_external_review_comments WHERE invite_id=? ORDER BY id DESC", (int(invite["id"]),)))
+            evidence_requests = rows(execute(conn, "SELECT * FROM nuvedra_external_evidence_requests WHERE invite_id=? ORDER BY id DESC", (int(invite["id"]),)))
+            _access_log(conn, request, int(invite["id"]), "portal_view", "portfolio", str(invite["portfolio_id"]))
+        return HTMLResponse(_review_html(token, invite, items, standards, comments, evidence_requests), headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+
+    @app.get("/external/review/{token}/evidence/{version_id}", response_model=None)
+    async def external_review_evidence(token: str, version_id: int, request: Request):
+        with db() as conn:
+            invite = _external_invite(conn, token)
+            found = rows(execute(conn, """SELECT v.* FROM nuvedra_accreditation_portfolio_items pi
+                JOIN nuvedra_evidence_versions v ON v.id=pi.evidence_version_id
+                WHERE pi.portfolio_id=? AND pi.evidence_version_id=?""", (int(invite["portfolio_id"]), version_id)))
+            if not found:
+                raise HTTPException(404, "Evidence is not part of this frozen review package.")
+            version = found[0]
+            _access_log(conn, request, int(invite["id"]), "evidence_open", "evidence_version", str(version_id))
+        if version.get("file_bytes") is not None:
+            filename = str(version.get("file_name") or f"evidence-{version_id}")
+            return Response(content=bytes(version["file_bytes"]), media_type=str(version.get("mime_type") or "application/octet-stream"), headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}", "Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+        url = str(version.get("source_url") or "").strip()
+        if not url:
+            raise HTTPException(404, "Evidence version has no file or source URL.")
+        return RedirectResponse(url, status_code=307, headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"})
+
+    @app.post("/external/review/{token}/comments", response_model=None)
+    async def external_review_comment(token: str, request: Request, scope: str = Form("|"), comment_text: str = Form(...)):
+        clean = comment_text.strip()
+        if not clean:
+            raise HTTPException(400, "Review comment is required.")
+        if len(clean) > MAX_COMMENT:
+            raise HTTPException(400, "Review comment exceeds the allowed length.")
+        standard_code, _, criterion_code = scope.partition("|")
+        with db() as conn:
+            invite = _external_invite(conn, token)
+            items = _portfolio_items(conn, int(invite["portfolio_id"]))
+            standards = _criteria_for_portfolio(conn, int(invite["program_id"]), items)
+            standard, criterion = _validate_scope(standards, standard_code, criterion_code)
+            comment_id = _insert_id(conn, """INSERT INTO nuvedra_external_review_comments
+                (invite_id,portfolio_id,standard_code,criterion_code,comment_text,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?)""", (int(invite["id"]), int(invite["portfolio_id"]), standard or None, criterion or None, clean, utcnow(), utcnow()))
+            _access_log(conn, request, int(invite["id"]), "comment_created", "external_review_comment", str(comment_id))
+        return RedirectResponse(f"/external/review/{token}", status_code=303, headers={"Cache-Control": "no-store"})
+
+    @app.post("/external/review/{token}/requests", response_model=None)
+    async def external_evidence_request(token: str, request: Request, scope: str = Form("|"), request_text: str = Form(...)):
+        clean = request_text.strip()
+        if not clean:
+            raise HTTPException(400, "Evidence request is required.")
+        if len(clean) > MAX_REQUEST:
+            raise HTTPException(400, "Evidence request exceeds the allowed length.")
+        standard_code, _, criterion_code = scope.partition("|")
+        with db() as conn:
+            invite = _external_invite(conn, token)
+            items = _portfolio_items(conn, int(invite["portfolio_id"]))
+            standards = _criteria_for_portfolio(conn, int(invite["program_id"]), items)
+            standard, criterion = _validate_scope(standards, standard_code, criterion_code)
+            evidence_request_id = _insert_id(conn, """INSERT INTO nuvedra_external_evidence_requests
+                (invite_id,portfolio_id,standard_code,criterion_code,request_text,status,requested_at)
+                VALUES (?,?,?,?,?,'open',?)""", (int(invite["id"]), int(invite["portfolio_id"]), standard or None, criterion or None, clean, utcnow()))
+            _access_log(conn, request, int(invite["id"]), "evidence_request_created", "external_evidence_request", str(evidence_request_id))
+        return RedirectResponse(f"/external/review/{token}", status_code=303, headers={"Cache-Control": "no-store"})
+
+    print("NUVEDRA External Accreditation Review Portal v1 registered: expiring hashed capability links, frozen-portfolio review, protected evidence access, reviewer comments, evidence requests, revocation, and audit logging.", flush=True)
