@@ -162,7 +162,7 @@ def main() -> None:
             raise RuntimeError("Frozen portfolio silently replaced its pinned v2 evidence with v3.")
         expect(client.post(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/items", data={"asset_id": str(asset_id), "narrative": "Attempted refresh", "position": "1"}), 409, "frozen portfolio mutation protection")
 
-        csv_export = client.get(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv")
+        csv_export = client.get(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/export.csv")
         expect(csv_export, 200, "portfolio CSV")
         require(csv_export, "MSCHE V", "CSV standard")
         require(csv_export, "5.2", "CSV criterion")
@@ -183,7 +183,7 @@ def main() -> None:
         expect(client.get(f"/faculty/programs/{program_id}/evidence"), 200, "reviewer repository read access")
         expect(client.get(portfolio_url), 200, "reviewer portfolio read access")
         expect(client.get(f"/faculty/programs/{program_id}/evidence/versions/{version2_id}/download"), 200, "reviewer protected evidence download")
-        expect(client.get(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv"), 200, "reviewer portfolio export")
+        expect(client.get(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/export.csv"), 200, "reviewer portfolio export")
         reviewer_write = client.post(f"/faculty/programs/{program_id}/evidence/assets", data={
             "title": "Reviewer cannot add", "evidence_type": "report", "description": "", "tags": "", "standard_code": "", "criterion_code": "", "cycle_id": "", "program_outcome_id": "", "improvement_action_id": "", "source_url": "https://example.com/evidence", "change_note": "Attempt",
         })
