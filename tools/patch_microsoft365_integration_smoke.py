@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Integration v1 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install the institutional Teams layer only after Microsoft 365 Integration v1 exists.
+    from patch_microsoft365_education_v2 import main as patch_microsoft365_education_v2
+    patch_microsoft365_education_v2()
+
+    from patch_microsoft365_education_v2_smoke import main as patch_microsoft365_education_v2_smoke
+    patch_microsoft365_education_v2_smoke()
+
 
 if __name__ == "__main__":
     main()
