@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import csv
+import io
+import urllib.parse
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_mastery_competency_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_mastery_settings (
+            id {pk}, course_id INTEGER NOT NULL UNIQUE,
+            proficient_threshold REAL NOT NULL DEFAULT 80,
+            mastery_threshold REAL NOT NULL DEFAULT 90,
+            updated_by TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+
+
+def _settings(conn: Any, course_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_mastery_settings WHERE course_id=?", (course_id,)))
+    if found:
+        return found[0]
+    return {"course_id": course_id, "proficient_threshold": 80.0, "mastery_threshold": 90.0}
+
+
+def _outcomes(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    data = rows(execute(conn, """SELECT o.*,
+        (SELECT COUNT(*) FROM nuvedra_outcome_links ol WHERE ol.outcome_id=o.id) AS aligned_items
+        FROM nuvedra_outcomes o
+        WHERE o.course_id=? AND o.status='active'
+        ORDER BY o.code,o.title,o.id""", (course_id,)))
+    return data
+
+
+def _students(conn: Any, course_id: int) -> list[str]:
+    data = rows(execute(conn, """SELECT DISTINCT lower(user_email) AS email
+        FROM nexus_admin_enrollments
+        WHERE course_id=? AND status='active' AND course_role='student'
+        ORDER BY lower(user_email)""", (course_id,)))
+    return [str(row.get("email") or "").lower() for row in data if str(row.get("email") or "").strip()]
+
+
+def _evidence(conn: Any, outcome_id: int, email: str) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT i.id AS item_id,i.title AS item_title,i.item_type,i.points,
+        s.id AS submission_id,s.status AS submission_status,
+        g.points_awarded,g.status AS grade_status,g.graded_at,
+        re.raw_score AS rubric_raw_score,re.possible_raw_score AS rubric_possible_raw_score,
+        re.grade_points AS rubric_grade_points,re.graded_at AS rubric_graded_at
+        FROM nuvedra_outcome_links ol
+        JOIN nexus_content_items i ON i.id=ol.item_id
+        LEFT JOIN nuvedra_submissions s ON s.item_id=i.id AND lower(s.student_email)=?
+        LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+        LEFT JOIN nuvedra_rubric_links rl ON rl.item_id=i.id
+        LEFT JOIN nuvedra_rubric_evaluations re ON re.submission_id=s.id AND re.rubric_id=rl.rubric_id AND re.status='graded'
+        WHERE ol.outcome_id=?
+        ORDER BY i.title,i.id""", (email.lower(), outcome_id)))
+
+
+def _attainment(evidence: list[dict[str, Any]]) -> tuple[float | None, int, int, int]:
+    earned = 0.0
+    possible = 0.0
+    graded = 0
+    rubric_evidence = 0
+    for row in evidence:
+        item_points = float(row.get("points") or 0)
+        if str(row.get("grade_status") or "") == "graded" and row.get("points_awarded") is not None and item_points > 0:
+            awarded = max(0.0, min(item_points, float(row.get("points_awarded") or 0)))
+            earned += awarded
+            possible += item_points
+            graded += 1
+        if row.get("rubric_raw_score") is not None and float(row.get("rubric_possible_raw_score") or 0) > 0:
+            rubric_evidence += 1
+    return (None if possible <= 0 else (earned / possible) * 100.0), graded, len(evidence), rubric_evidence
+
+
+def _level(percent: float | None, settings: dict[str, Any]) -> dict[str, str]:
+    proficient = float(settings.get("proficient_threshold") or 80)
+    mastery = float(settings.get("mastery_threshold") or 90)
+    if percent is None:
+        return {"key": "no-evidence", "en": "No evidence", "es": "Sin evidencia"}
+    if percent + 1e-9 >= mastery:
+        return {"key": "mastered", "en": "Mastered", "es": "Dominado"}
+    if percent + 1e-9 >= proficient:
+        return {"key": "proficient", "en": "Proficient", "es": "Competente"}
+    return {"key": "developing", "en": "Developing", "es": "En desarrollo"}
+
+
+def _outcome_label(outcome: dict[str, Any]) -> str:
+    code = str(outcome.get("code") or "").strip()
+    title = str(outcome.get("title") or "Learning outcome")
+    return f"{code}: {title}" if code else title
+
+
+def _student_mastery(conn: Any, course_id: int, email: str, settings: dict[str, Any], outcomes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    outcome_rows = outcomes if outcomes is not None else _outcomes(conn, course_id)
+    result: list[dict[str, Any]] = []
+    for outcome in outcome_rows:
+        evidence = _evidence(conn, int(outcome["id"]), email)
+        percent, graded, aligned, rubric_evidence = _attainment(evidence)
+        result.append({
+            "outcome": outcome,
+            "evidence": evidence,
+            "percent": percent,
+            "graded": graded,
+            "aligned": aligned,
+            "rubric_evidence": rubric_evidence,
+            "level": _level(percent, settings),
+        })
+    return result
+
+
+def _evidence_table(evidence: list[dict[str, Any]]) -> str:
+    body = []
+    for row in evidence:
+        possible = float(row.get("points") or 0)
+        if str(row.get("grade_status") or "") == "graded" and row.get("points_awarded") is not None and possible > 0:
+            awarded = float(row.get("points_awarded") or 0)
+            grade = f"{awarded:g}/{possible:g} · {(awarded / possible) * 100:.1f}%"
+        else:
+            grade = "Awaiting graded evidence"
+        rubric = "—"
+        rubric_possible = float(row.get("rubric_possible_raw_score") or 0)
+        if row.get("rubric_raw_score") is not None and rubric_possible > 0:
+            rubric = f"{float(row.get('rubric_raw_score') or 0):g}/{rubric_possible:g} rubric points"
+        body.append(f'''<tr><td>{academic_access.esc(row.get('item_title'))}<br><small>{academic_access.esc(row.get('item_type'))}</small></td><td>{academic_access.esc(grade)}</td><td>{academic_access.esc(rubric)}</td></tr>''')
+    return "".join(body) or '<tr><td colspan="3" data-i18n-en="No activities are aligned to this outcome yet." data-i18n-es="Todavía no hay actividades alineadas con este resultado.">No activities are aligned to this outcome yet.</td></tr>'
+
+
+def _student_cards(data: list[dict[str, Any]]) -> str:
+    cards = []
+    for entry in data:
+        outcome = entry["outcome"]
+        percent = entry["percent"]
+        level = entry["level"]
+        percent_text = "—" if percent is None else f"{percent:.1f}%"
+        cards.append(f'''<article class="studio-panel" data-mastery-level="{academic_access.esc(level['key'], attr=True)}"><p class="studio-eyebrow">{academic_access.esc(outcome.get('code') or 'Outcome')}</p><h3>{academic_access.esc(outcome.get('title'))}</h3><p>{academic_access.esc(outcome.get('description'))}</p><p><strong>{academic_access.esc(percent_text)}</strong> · <span data-i18n-en="{academic_access.esc(level['en'], attr=True)}" data-i18n-es="{academic_access.esc(level['es'], attr=True)}">{academic_access.esc(level['en'])}</span> · {int(entry['graded'])}/{int(entry['aligned'])} graded evidence items</p><details><summary data-i18n-en="View evidence" data-i18n-es="Ver evidencia">View evidence</summary><div style="overflow:auto"><table><thead><tr><th data-i18n-en="Evidence" data-i18n-es="Evidencia">Evidence</th><th data-i18n-en="Grade" data-i18n-es="Calificación">Grade</th><th data-i18n-en="Rubric evidence" data-i18n-es="Evidencia de rúbrica">Rubric evidence</th></tr></thead><tbody>{_evidence_table(entry['evidence'])}</tbody></table></div></details></article>''')
+    return "".join(cards) or '<section class="studio-empty" data-i18n-en="No active learning outcomes are configured for this course." data-i18n-es="No hay resultados de aprendizaje activos configurados para este curso.">No active learning outcomes are configured for this course.</section>'
+
+
+def register_mastery_competency(app: FastAPI) -> None:
+    ensure_mastery_competency_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/mastery", response_class=HTMLResponse, response_model=None)
+    async def instructor_mastery(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/mastery")
+        if isinstance(user, RedirectResponse):
+            return user
+        selected_email = str(request.query_params.get("student") or "").strip().lower()
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            settings = _settings(conn, course_id)
+            outcomes = _outcomes(conn, course_id)
+            students = _students(conn, course_id)
+            matrix: dict[str, list[dict[str, Any]]] = {email: _student_mastery(conn, course_id, email, settings, outcomes) for email in students}
+            if selected_email and selected_email not in students:
+                raise HTTPException(404, "Student is not actively enrolled in this course.")
+
+        outcome_summary = []
+        evidence_cells = 0
+        at_or_above = 0
+        for index, outcome in enumerate(outcomes):
+            values = [matrix[email][index] for email in students]
+            percents = [float(row["percent"]) for row in values if row["percent"] is not None]
+            avg = None if not percents else sum(percents) / len(percents)
+            counts = {"mastered": 0, "proficient": 0, "developing": 0, "no-evidence": 0}
+            for row in values:
+                counts[row["level"]["key"]] += 1
+                if row["percent"] is not None:
+                    evidence_cells += 1
+                    if row["level"]["key"] in {"mastered", "proficient"}:
+                        at_or_above += 1
+            outcome_summary.append((outcome, avg, counts))
+
+        student_rows = []
+        for email in students:
+            data = matrix[email]
+            measured = [row for row in data if row["percent"] is not None]
+            avg = None if not measured else sum(float(row["percent"]) for row in measured) / len(measured)
+            proficient_count = sum(1 for row in data if row["level"]["key"] in {"proficient", "mastered"})
+            gaps = sum(1 for row in data if row["level"]["key"] in {"developing", "no-evidence"})
+            avg_text = "—" if avg is None else f"{avg:.1f}%"
+            href = f"{STUDIO_PREFIX}/courses/{course_id}/mastery?student={urllib.parse.quote(email)}"
+            student_rows.append(f'''<tr><td><a href="{href}"><strong>{academic_access.esc(email)}</strong></a></td><td>{academic_access.esc(avg_text)}</td><td>{proficient_count}/{len(data)}</td><td>{gaps}</td><td>{len(measured)}/{len(data)}</td></tr>''')
+        students_html = "".join(student_rows) or '<tr><td colspan="5" data-i18n-en="No active students are enrolled." data-i18n-es="No hay estudiantes activos matriculados.">No active students are enrolled.</td></tr>'
+
+        outcome_rows = []
+        for outcome, avg, counts in outcome_summary:
+            avg_text = "—" if avg is None else f"{avg:.1f}%"
+            outcome_rows.append(f'''<tr><td><strong>{academic_access.esc(_outcome_label(outcome))}</strong><br><small>{int(outcome.get('aligned_items') or 0)} aligned activities</small></td><td>{academic_access.esc(avg_text)}</td><td>{counts['mastered']}</td><td>{counts['proficient']}</td><td>{counts['developing']}</td><td>{counts['no-evidence']}</td></tr>''')
+        outcomes_html = "".join(outcome_rows) or '<tr><td colspan="6" data-i18n-en="Create and align learning outcomes before using mastery analytics." data-i18n-es="Cree y alinee resultados de aprendizaje antes de utilizar la analítica de dominio.">Create and align learning outcomes before using mastery analytics.</td></tr>'
+
+        proficiency_rate = round((at_or_above / evidence_cells) * 100, 1) if evidence_cells else 0.0
+        detail = ""
+        if selected_email:
+            detail = f'''<section class="studio-section"><div class="studio-actions"><h2 style="margin-right:auto">{academic_access.esc(selected_email)}</h2><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/mastery" data-i18n-en="Close student detail" data-i18n-es="Cerrar detalle del estudiante">Close student detail</a></div><div class="studio-grid">{_student_cards(matrix[selected_email])}</div></section>'''
+
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="mastery-competency-dashboard-v1"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}" data-i18n-en="Back to Course Studio" data-i18n-es="Volver a Course Studio">Back to Course Studio</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}/rubrics" data-i18n-en="Rubrics & Outcomes" data-i18n-es="Rúbricas y resultados">Rubrics & Outcomes</a><span>/</span><a href="{STUDIO_PREFIX}/courses/{course_id}/analytics" data-i18n-en="Learning Analytics" data-i18n-es="Analítica de aprendizaje">Learning Analytics</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Mastery & Competency Dashboard" data-i18n-es="Panel de dominio y competencias">Mastery & Competency Dashboard</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p data-i18n-en="Review outcome attainment from graded course evidence. Levels are transparent threshold labels for instructor review, not predictive decisions." data-i18n-es="Revise el logro de resultados utilizando evidencia calificada del curso. Los niveles son etiquetas transparentes basadas en umbrales para revisión docente, no decisiones predictivas.">Review outcome attainment from graded course evidence. Levels are transparent threshold labels for instructor review, not predictive decisions.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/mastery.csv" data-i18n-en="Export CSV" data-i18n-es="Exportar CSV">Export CSV</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{len(outcomes)}</strong><span data-i18n-en="Active outcomes" data-i18n-es="Resultados activos">Active outcomes</span></article><article class="studio-panel"><strong>{len(students)}</strong><span data-i18n-en="Active students" data-i18n-es="Estudiantes activos">Active students</span></article><article class="studio-panel"><strong>{evidence_cells}</strong><span data-i18n-en="Measured student-outcome records" data-i18n-es="Registros estudiante-resultado medidos">Measured student-outcome records</span></article><article class="studio-panel"><strong>{proficiency_rate:.1f}%</strong><span data-i18n-en="At or above proficiency" data-i18n-es="En o sobre competencia">At or above proficiency</span></article></section><section class="studio-panel"><h3 data-i18n-en="Mastery thresholds" data-i18n-es="Umbrales de dominio">Mastery thresholds</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/mastery/settings" class="studio-form"><div class="studio-form-grid"><label><span data-i18n-en="Proficient at or above (%)" data-i18n-es="Competente en o sobre (%)">Proficient at or above (%)</span><input type="number" name="proficient_threshold" min="0" max="100" step="0.1" value="{float(settings.get('proficient_threshold') or 80):g}" required></label><label><span data-i18n-en="Mastered at or above (%)" data-i18n-es="Dominado en o sobre (%)">Mastered at or above (%)</span><input type="number" name="mastery_threshold" min="0" max="100" step="0.1" value="{float(settings.get('mastery_threshold') or 90):g}" required></label></div><button class="studio-button" data-i18n-en="Save thresholds" data-i18n-es="Guardar umbrales">Save thresholds</button></form><p><small data-i18n-en="Developing means graded evidence is below the proficiency threshold. No evidence means no aligned graded evidence is available yet. These labels do not change grades." data-i18n-es="En desarrollo significa que la evidencia calificada está por debajo del umbral de competencia. Sin evidencia significa que todavía no existe evidencia alineada y calificada. Estas etiquetas no cambian calificaciones.">Developing means graded evidence is below the proficiency threshold. No evidence means no aligned graded evidence is available yet. These labels do not change grades.</small></p></section><section class="studio-panel"><h3 data-i18n-en="Student competency overview" data-i18n-es="Resumen de competencias por estudiante">Student competency overview</h3><div style="overflow:auto"><table><thead><tr><th data-i18n-en="Student" data-i18n-es="Estudiante">Student</th><th data-i18n-en="Average measured attainment" data-i18n-es="Logro medido promedio">Average measured attainment</th><th data-i18n-en="Proficient or mastered" data-i18n-es="Competente o dominado">Proficient or mastered</th><th data-i18n-en="Review gaps" data-i18n-es="Brechas para revisar">Review gaps</th><th data-i18n-en="Measured outcomes" data-i18n-es="Resultados medidos">Measured outcomes</th></tr></thead><tbody>{students_html}</tbody></table></div></section><section class="studio-panel"><h3 data-i18n-en="Outcome overview" data-i18n-es="Resumen por resultado">Outcome overview</h3><div style="overflow:auto"><table><thead><tr><th data-i18n-en="Outcome" data-i18n-es="Resultado">Outcome</th><th data-i18n-en="Average attainment" data-i18n-es="Logro promedio">Average attainment</th><th data-i18n-en="Mastered" data-i18n-es="Dominado">Mastered</th><th data-i18n-en="Proficient" data-i18n-es="Competente">Proficient</th><th data-i18n-en="Developing" data-i18n-es="En desarrollo">Developing</th><th data-i18n-en="No evidence" data-i18n-es="Sin evidencia">No evidence</th></tr></thead><tbody>{outcomes_html}</tbody></table></div></section>{detail}<section class="studio-panel"><p data-i18n-en="Attainment uses only graded activities explicitly aligned to each outcome. Rubric evaluations are shown as supporting evidence when present, but rubric criteria are not treated as outcome-aligned unless the activity itself is aligned." data-i18n-es="El logro utiliza únicamente actividades calificadas alineadas explícitamente con cada resultado. Las evaluaciones por rúbrica se muestran como evidencia de apoyo cuando existen, pero los criterios de la rúbrica no se consideran alineados con un resultado a menos que la actividad esté alineada.">Attainment uses only graded activities explicitly aligned to each outcome. Rubric evaluations are shown as supporting evidence when present, but rubric criteria are not treated as outcome-aligned unless the activity itself is aligned.</p></section></main>'''
+        return academic_access.portal_page("Mastery & Competencies", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/mastery/settings", response_model=None)
+    async def save_mastery_settings(course_id: int, request: Request, proficient_threshold: float = Form(80), mastery_threshold: float = Form(90)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/mastery")
+        if isinstance(user, RedirectResponse):
+            return user
+        if proficient_threshold < 0 or proficient_threshold > 100 or mastery_threshold < 0 or mastery_threshold > 100:
+            raise HTTPException(400, "Mastery thresholds must be between 0 and 100.")
+        if mastery_threshold + 1e-9 < proficient_threshold:
+            raise HTTPException(400, "The mastery threshold cannot be lower than the proficiency threshold.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            now = utcnow()
+            found = rows(execute(conn, "SELECT id FROM nuvedra_mastery_settings WHERE course_id=?", (course_id,)))
+            if found:
+                execute(conn, "UPDATE nuvedra_mastery_settings SET proficient_threshold=?,mastery_threshold=?,updated_by=?,updated_at=? WHERE course_id=?", (proficient_threshold, mastery_threshold, user["email"], now, course_id))
+            else:
+                execute(conn, "INSERT INTO nuvedra_mastery_settings (course_id,proficient_threshold,mastery_threshold,updated_by,updated_at) VALUES (?,?,?,?,?)", (course_id, proficient_threshold, mastery_threshold, user["email"], now))
+            audit(conn, user["email"], "mastery_thresholds_updated", "course", str(course_id), f"proficient={proficient_threshold:g};mastered={mastery_threshold:g}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/mastery", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/mastery.csv", response_model=None)
+    async def export_mastery(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/mastery")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            settings = _settings(conn, course_id)
+            outcomes = _outcomes(conn, course_id)
+            students = _students(conn, course_id)
+            payload = [(email, _student_mastery(conn, course_id, email, settings, outcomes)) for email in students]
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["Student", "Outcome code", "Outcome title", "Attainment percent", "Level", "Graded evidence", "Aligned activities", "Rubric evidence"])
+        for email, data in payload:
+            for entry in data:
+                outcome = entry["outcome"]
+                writer.writerow([email, outcome.get("code") or "", outcome.get("title") or "", "" if entry["percent"] is None else round(float(entry["percent"]), 2), entry["level"]["en"], entry["graded"], entry["aligned"], entry["rubric_evidence"]])
+        filename = f"{str(course.get('course_code') or 'course').replace(' ', '_')}-mastery-competencies.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @app.get("/learn/courses/{course_id}/mastery", response_class=HTMLResponse, response_model=None)
+    async def student_mastery(course_id: int, request: Request):
+        user = _user(request, f"/learn/courses/{course_id}/mastery")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            access = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            if str(access.get("course_role") or "") != "student" or str(access.get("course_status") or "") != "active":
+                raise HTTPException(403, "Mastery details are available only to active students in this course.")
+            settings = _settings(conn, course_id)
+            data = _student_mastery(conn, course_id, user["email"], settings)
+        measured = [row for row in data if row["percent"] is not None]
+        avg = None if not measured else sum(float(row["percent"]) for row in measured) / len(measured)
+        proficient_count = sum(1 for row in data if row["level"]["key"] in {"proficient", "mastered"})
+        avg_text = "—" if avg is None else f"{avg:.1f}%"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-mastery-dashboard-v1"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}" data-i18n-en="Back to course" data-i18n-es="Volver al curso">Back to course</a><span>/</span><a href="/learn/courses/{course_id}/path" data-i18n-en="My Learning Path" data-i18n-es="Mi ruta de aprendizaje">My Learning Path</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow" data-i18n-en="My Mastery & Competencies" data-i18n-es="Mi dominio y competencias">My Mastery & Competencies</p><h2>{academic_access.esc(access.get('course_code'))}: {academic_access.esc(access.get('title'))}</h2><p data-i18n-en="See which course outcomes have graded evidence and how your current evidence compares with the instructor-defined proficiency thresholds." data-i18n-es="Vea qué resultados del curso tienen evidencia calificada y cómo su evidencia actual se compara con los umbrales de competencia definidos por el instructor.">See which course outcomes have graded evidence and how your current evidence compares with the instructor-defined proficiency thresholds.</p></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{academic_access.esc(avg_text)}</strong><span data-i18n-en="Average measured attainment" data-i18n-es="Logro medido promedio">Average measured attainment</span></article><article class="studio-panel"><strong>{proficient_count}/{len(data)}</strong><span data-i18n-en="Proficient or mastered outcomes" data-i18n-es="Resultados competentes o dominados">Proficient or mastered outcomes</span></article><article class="studio-panel"><strong>{float(settings.get('proficient_threshold') or 80):g}%</strong><span data-i18n-en="Proficiency threshold" data-i18n-es="Umbral de competencia">Proficiency threshold</span></article><article class="studio-panel"><strong>{float(settings.get('mastery_threshold') or 90):g}%</strong><span data-i18n-en="Mastery threshold" data-i18n-es="Umbral de dominio">Mastery threshold</span></article></section><section class="studio-grid">{_student_cards(data)}</section><section class="studio-panel"><p data-i18n-en="These levels summarize graded evidence currently aligned to each outcome. They do not replace instructor feedback, final grades, or institutional academic decisions." data-i18n-es="Estos niveles resumen la evidencia calificada actualmente alineada con cada resultado. No sustituyen la retroalimentación del instructor, las calificaciones finales ni las decisiones académicas institucionales.">These levels summarize graded evidence currently aligned to each outcome. They do not replace instructor feedback, final grades, or institutional academic decisions.</p></section></main>'''
+        return academic_access.portal_page("My Mastery & Competencies", body, user)
+
+    print("NUVEDRA Mastery & Competency Dashboard v1 registered: outcome attainment, configurable proficiency thresholds, rubric-supported evidence, instructor/student views, and CSV export.", flush=True)
