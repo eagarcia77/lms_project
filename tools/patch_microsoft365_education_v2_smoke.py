@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Institutional Setup & Teams Education v2 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install production/tenant provisioning only after Microsoft 365 v1 and Teams Education v2 exist.
+    from patch_microsoft365_production_v3 import main as patch_microsoft365_production_v3
+    patch_microsoft365_production_v3()
+
+    from patch_microsoft365_production_v3_smoke import main as patch_microsoft365_production_v3_smoke
+    patch_microsoft365_production_v3_smoke()
+
 
 if __name__ == "__main__":
     main()
