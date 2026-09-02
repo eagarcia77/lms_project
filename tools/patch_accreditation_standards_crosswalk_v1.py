@@ -58,6 +58,11 @@ def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Accreditation Standards Catalog & Crosswalk v1 source template is missing.")
     source = SOURCE.read_text(encoding="utf-8")
+    anchor = '''        platform_role = _platform_role(request)\n        with db() as conn:\n            frameworks = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_frameworks WHERE status='active' ORDER BY code,name,id"))\n'''
+    protected = '''        platform_role = _platform_role(request)\n        with db() as conn:\n            if platform_role not in {"superadmin", "course_admin", "auditor"}:\n                member = rows(execute(conn, "SELECT id FROM nuvedra_program_members WHERE lower(user_email)=? AND status='active' LIMIT 1", (user["email"].lower(),)))\n                if not member:\n                    raise HTTPException(403, "Program assessment access is required to view the standards catalog.")\n            frameworks = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_frameworks WHERE status='active' ORDER BY code,name,id"))\n'''
+    if anchor not in source:
+        raise RuntimeError("Accreditation Standards Catalog & Crosswalk v1 could not protect the global standards catalog.")
+    source = source.replace(anchor, protected, 1)
     compile(source, str(MODULE), "exec")
     MODULE.write_text(source, encoding="utf-8")
     patch_academic_portal()
