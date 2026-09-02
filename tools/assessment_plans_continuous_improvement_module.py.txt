@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import csv
+import io
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+import app.program_outcomes_accreditation as program_outcomes
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+MEASURE_TYPES = {"direct", "indirect"}
+CYCLE_STATES = {"open", "closed", "archived"}
+ACTION_STATES = {"planned", "in_progress", "completed", "verified"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    return program_outcomes._user(request, return_to)
+
+
+def ensure_assessment_plans_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_cycles (
+            id {pk}, program_id INTEGER NOT NULL, label TEXT NOT NULL,
+            start_date TEXT, end_date TEXT, status TEXT NOT NULL DEFAULT 'open',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_measures (
+            id {pk}, cycle_id INTEGER NOT NULL, program_outcome_id INTEGER NOT NULL,
+            title TEXT NOT NULL, measure_type TEXT NOT NULL, method TEXT,
+            data_source TEXT, frequency TEXT, target_threshold REAL NOT NULL DEFAULT 80,
+            responsible_email TEXT, status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_assessment_results (
+            id {pk}, measure_id INTEGER NOT NULL UNIQUE, result_value REAL,
+            sample_size INTEGER, target_met INTEGER, finding_summary TEXT,
+            evidence_reference TEXT, recorded_by TEXT NOT NULL,
+            recorded_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_improvement_actions (
+            id {pk}, cycle_id INTEGER NOT NULL, program_outcome_id INTEGER,
+            measure_id INTEGER, title TEXT NOT NULL, action_plan TEXT NOT NULL,
+            responsible_email TEXT, due_date TEXT, status TEXT NOT NULL DEFAULT 'planned',
+            evidence_note TEXT, follow_up_result TEXT, closing_note TEXT,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            completed_at TEXT, verified_at TEXT, verified_by TEXT
+        )""")
+
+
+def _cycle(conn: Any, program_id: int, cycle_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_assessment_cycles WHERE id=? AND program_id=?", (cycle_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Assessment cycle not found.")
+    return found[0]
+
+
+def _require_open_cycle(conn: Any, program_id: int, cycle_id: int) -> dict[str, Any]:
+    cycle = _cycle(conn, program_id, cycle_id)
+    if str(cycle.get("status")) != "open":
+        raise HTTPException(409, "This assessment cycle is closed and is read-only.")
+    return cycle
+
+
+def _measure(conn: Any, program_id: int, measure_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT m.*,c.program_id,c.status AS cycle_status,
+        po.code AS outcome_code,po.title AS outcome_title
+        FROM nuvedra_assessment_measures m
+        JOIN nuvedra_assessment_cycles c ON c.id=m.cycle_id
+        JOIN nuvedra_program_outcomes po ON po.id=m.program_outcome_id
+        WHERE m.id=? AND c.program_id=?""", (measure_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Assessment measure not found.")
+    return found[0]
+
+
+def _action(conn: Any, program_id: int, action_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT a.*,c.program_id,c.status AS cycle_status
+        FROM nuvedra_improvement_actions a JOIN nuvedra_assessment_cycles c ON c.id=a.cycle_id
+        WHERE a.id=? AND c.program_id=?""", (action_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Improvement action not found.")
+    return found[0]
+
+
+def _cycles(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT c.*,
+        (SELECT COUNT(*) FROM nuvedra_assessment_measures m WHERE m.cycle_id=c.id AND m.status='active') AS measure_count,
+        (SELECT COUNT(*) FROM nuvedra_improvement_actions a WHERE a.cycle_id=c.id) AS action_count
+        FROM nuvedra_assessment_cycles c WHERE c.program_id=? ORDER BY c.id DESC""", (program_id,)))
+
+
+def _cycle_bundle(conn: Any, program_id: int, cycle_id: int) -> dict[str, Any]:
+    cycle = _cycle(conn, program_id, cycle_id)
+    measures = rows(execute(conn, """SELECT m.*,po.code AS outcome_code,po.title AS outcome_title,
+        r.result_value,r.sample_size,r.target_met,r.finding_summary,r.evidence_reference,r.recorded_at
+        FROM nuvedra_assessment_measures m
+        JOIN nuvedra_program_outcomes po ON po.id=m.program_outcome_id
+        LEFT JOIN nuvedra_assessment_results r ON r.measure_id=m.id
+        WHERE m.cycle_id=? AND m.status='active'
+        ORDER BY po.code,m.measure_type,m.title,m.id""", (cycle_id,)))
+    actions = rows(execute(conn, """SELECT a.*,po.code AS outcome_code,po.title AS outcome_title,m.title AS measure_title
+        FROM nuvedra_improvement_actions a
+        LEFT JOIN nuvedra_program_outcomes po ON po.id=a.program_outcome_id
+        LEFT JOIN nuvedra_assessment_measures m ON m.id=a.measure_id
+        WHERE a.cycle_id=? ORDER BY CASE a.status WHEN 'planned' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'completed' THEN 3 ELSE 4 END,a.due_date,a.id""", (cycle_id,)))
+    return {"cycle": cycle, "measures": measures, "actions": actions}
+
+
+def _measure_status(row: dict[str, Any]) -> str:
+    if row.get("result_value") is None:
+        return "Pending result"
+    return "Target met" if int(row.get("target_met") or 0) == 1 else "Target not met"
+
+
+def _program_outcome_context(conn: Any, program_id: int) -> dict[int, dict[str, Any]]:
+    settings = program_outcomes._settings(conn, program_id)
+    benchmark = float(settings.get("benchmark_threshold") or 80)
+    result: dict[int, dict[str, Any]] = {}
+    for outcome in program_outcomes._program_outcomes(conn, program_id):
+        result[int(outcome["id"])] = program_outcomes._program_outcome_summary(conn, outcome, benchmark)
+    return result
+
+
+def _dashboard(program_id: int, program: dict[str, Any], access: dict[str, Any], cycles: list[dict[str, Any]], bundle: dict[str, Any] | None, outcomes: list[dict[str, Any]], context: dict[int, dict[str, Any]]) -> str:
+    can_manage = str(access.get("program_role")) == "coordinator"
+    cycle_options = "".join(
+        f'<option value="{int(c["id"])}"{" selected" if bundle and int(bundle["cycle"]["id"]) == int(c["id"]) else ""}>{academic_access.esc(c.get("label"))} · {academic_access.esc(c.get("status"))}</option>'
+        for c in cycles
+    )
+    cycle_cards = "".join(
+        f'''<article class="studio-panel"><h3>{academic_access.esc(c.get('label'))}</h3><p>{academic_access.esc(c.get('start_date') or '—')} → {academic_access.esc(c.get('end_date') or '—')}</p><p><strong>{academic_access.esc(c.get('status'))}</strong> · {int(c.get('measure_count') or 0)} measures · {int(c.get('action_count') or 0)} actions</p><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/assessment-plans?cycle_id={int(c['id'])}">Open cycle</a></article>'''
+        for c in cycles
+    ) or '<section class="studio-empty">No assessment cycles yet.</section>'
+    create_cycle = ""
+    if can_manage:
+        create_cycle = f'''<section class="studio-panel"><h3 data-i18n-en="Create assessment cycle" data-i18n-es="Crear ciclo de assessment">Create assessment cycle</h3><form method="post" action="/faculty/programs/{program_id}/assessment-plans/cycles" class="studio-form"><label>Cycle label / Nombre<input name="label" required maxlength="180" placeholder="2026–2027 Assessment Cycle"></label><div class="studio-grid"><label>Start date<input name="start_date" type="date"></label><label>End date<input name="end_date" type="date"></label></div><button class="studio-button">Create cycle</button></form></section>'''
+    detail = ""
+    if bundle:
+        cycle = bundle["cycle"]
+        open_cycle = str(cycle.get("status")) == "open"
+        direct = sum(1 for m in bundle["measures"] if str(m.get("measure_type")) == "direct")
+        indirect = sum(1 for m in bundle["measures"] if str(m.get("measure_type")) == "indirect")
+        results = [m for m in bundle["measures"] if m.get("result_value") is not None]
+        targets_met = sum(1 for m in results if int(m.get("target_met") or 0) == 1)
+        open_actions = sum(1 for a in bundle["actions"] if str(a.get("status")) in {"planned", "in_progress"})
+        verified_actions = sum(1 for a in bundle["actions"] if str(a.get("status")) == "verified")
+        outcome_options = "".join(f'<option value="{int(o["id"])}">{academic_access.esc(o.get("code"))}: {academic_access.esc(o.get("title"))}</option>' for o in outcomes)
+        measure_options = "".join(f'<option value="{int(m["id"])}">{academic_access.esc(m.get("outcome_code"))} · {academic_access.esc(m.get("title"))}</option>' for m in bundle["measures"])
+        measure_rows = []
+        for m in bundle["measures"]:
+            result_text = "—" if m.get("result_value") is None else f"{float(m.get('result_value') or 0):.1f}%"
+            target = float(m.get("target_threshold") or 0)
+            current = context.get(int(m["program_outcome_id"]))
+            current_attainment = "—" if not current or current.get("attainment") is None else f"{float(current['attainment']):.1f}%"
+            result_form = ""
+            if can_manage and open_cycle:
+                result_form = f'''<details><summary>Record / update result</summary><form method="post" action="/faculty/programs/{program_id}/assessment-plans/measures/{int(m['id'])}/result" class="studio-form"><label>Result %<input name="result_value" type="number" min="0" max="100" step="0.1" value="{'' if m.get('result_value') is None else float(m.get('result_value') or 0):g}" required></label><label>Sample size<input name="sample_size" type="number" min="0" value="{'' if m.get('sample_size') is None else int(m.get('sample_size') or 0)}"></label><label>Finding summary<textarea name="finding_summary" rows="3">{academic_access.esc(m.get('finding_summary'))}</textarea></label><label>Evidence reference<textarea name="evidence_reference" rows="2">{academic_access.esc(m.get('evidence_reference'))}</textarea></label><button class="studio-button">Save result</button></form></details>'''
+            measure_rows.append(f'''<tr><td><strong>{academic_access.esc(m.get('outcome_code'))}</strong><br>{academic_access.esc(m.get('outcome_title'))}</td><td>{academic_access.esc(m.get('measure_type'))}</td><td><strong>{academic_access.esc(m.get('title'))}</strong><br><small>{academic_access.esc(m.get('method'))}</small></td><td>{target:g}%</td><td>{academic_access.esc(result_text)}<br><small>{academic_access.esc(_measure_status(m))}</small></td><td>{academic_access.esc(current_attainment)}</td><td>{result_form}</td></tr>''')
+        measures_html = "".join(measure_rows) or '<tr><td colspan="7">No measures are defined for this cycle.</td></tr>'
+        action_rows = []
+        for a in bundle["actions"]:
+            manage_action = ""
+            if can_manage and open_cycle:
+                options = "".join(f'<option value="{state}"{" selected" if str(a.get("status")) == state else ""}>{state.replace("_", " ")}</option>' for state in ("planned", "in_progress", "completed", "verified"))
+                manage_action = f'''<details><summary>Update action</summary><form method="post" action="/faculty/programs/{program_id}/assessment-plans/actions/{int(a['id'])}/status" class="studio-form"><label>Status<select name="status">{options}</select></label><label>Evidence note<textarea name="evidence_note" rows="2">{academic_access.esc(a.get('evidence_note'))}</textarea></label><label>Follow-up result<textarea name="follow_up_result" rows="2">{academic_access.esc(a.get('follow_up_result'))}</textarea></label><label>Closing-the-loop note<textarea name="closing_note" rows="3">{academic_access.esc(a.get('closing_note'))}</textarea></label><button class="studio-button">Save action status</button></form></details>'''
+            action_rows.append(f'''<tr><td><strong>{academic_access.esc(a.get('title'))}</strong><br><small>{academic_access.esc(a.get('action_plan'))}</small></td><td>{academic_access.esc(a.get('outcome_code') or 'Program-wide')}</td><td>{academic_access.esc(a.get('responsible_email') or '—')}</td><td>{academic_access.esc(a.get('due_date') or '—')}</td><td>{academic_access.esc(a.get('status'))}</td><td>{academic_access.esc(a.get('follow_up_result') or '—')}</td><td>{academic_access.esc(a.get('closing_note') or '—')}{manage_action}</td></tr>''')
+        actions_html = "".join(action_rows) or '<tr><td colspan="7">No continuous-improvement actions are recorded.</td></tr>'
+        manage_cycle = ""
+        if can_manage and open_cycle:
+            manage_cycle = f'''<section class="studio-grid"><article class="studio-panel"><h3>Add assessment measure</h3><form method="post" action="/faculty/programs/{program_id}/assessment-plans/measures" class="studio-form"><input type="hidden" name="cycle_id" value="{int(cycle['id'])}"><label>Program outcome<select name="program_outcome_id" required>{outcome_options}</select></label><label>Measure title<input name="title" required maxlength="180"></label><label>Type<select name="measure_type"><option value="direct">Direct</option><option value="indirect">Indirect</option></select></label><label>Method<textarea name="method" rows="2"></textarea></label><label>Data source<input name="data_source" maxlength="240"></label><label>Frequency<input name="frequency" maxlength="120" placeholder="Annual"></label><label>Target %<input name="target_threshold" type="number" min="0" max="100" step="0.1" value="80" required></label><label>Responsible email<input name="responsible_email" type="email"></label><button class="studio-button">Add measure</button></form></article><article class="studio-panel"><h3>Create improvement action</h3><form method="post" action="/faculty/programs/{program_id}/assessment-plans/actions" class="studio-form"><input type="hidden" name="cycle_id" value="{int(cycle['id'])}"><label>Program outcome<select name="program_outcome_id"><option value="">Program-wide</option>{outcome_options}</select></label><label>Related measure<select name="measure_id"><option value="">None / General finding</option>{measure_options}</select></label><label>Action title<input name="title" required maxlength="180"></label><label>Action plan<textarea name="action_plan" required rows="4"></textarea></label><label>Responsible email<input name="responsible_email" type="email"></label><label>Due date<input name="due_date" type="date"></label><button class="studio-button">Create improvement action</button></form></article></section><section class="studio-panel"><form method="post" action="/faculty/programs/{program_id}/assessment-plans/cycles/{int(cycle['id'])}/close"><p><strong>Close cycle:</strong> once closed, measures, findings, and improvement actions become read-only historical evidence.</p><button class="studio-button">Close assessment cycle</button></form></section>'''
+        detail = f'''<section class="studio-section"><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Selected assessment cycle</p><h2>{academic_access.esc(cycle.get('label'))}</h2><p>{academic_access.esc(cycle.get('start_date') or '—')} → {academic_access.esc(cycle.get('end_date') or '—')} · <strong>{academic_access.esc(cycle.get('status'))}</strong></p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/assessment-plans.csv?cycle_id={int(cycle['id'])}">Export cycle CSV</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{direct}</strong><span>Direct measures</span></article><article class="studio-panel"><strong>{indirect}</strong><span>Indirect measures</span></article><article class="studio-panel"><strong>{targets_met}/{len(results)}</strong><span>Targets met / results recorded</span></article><article class="studio-panel"><strong>{open_actions}</strong><span>Open improvement actions</span></article><article class="studio-panel"><strong>{verified_actions}</strong><span>Verified closing-the-loop actions</span></article></section>{manage_cycle}<section class="studio-panel"><h3>Assessment measures and findings</h3><div style="overflow:auto"><table><thead><tr><th>Program outcome</th><th>Type</th><th>Measure</th><th>Target</th><th>Recorded result</th><th>Current program evidence</th><th>Finding</th></tr></thead><tbody>{measures_html}</tbody></table></div></section><section class="studio-panel"><h3>Continuous-improvement actions</h3><div style="overflow:auto"><table><thead><tr><th>Action</th><th>Outcome</th><th>Responsible</th><th>Due</th><th>Status</th><th>Follow-up result</th><th>Closing the loop</th></tr></thead><tbody>{actions_html}</tbody></table></div></section><section class="studio-panel"><p><strong>Interpretation:</strong> targets and findings are entered by authorized program personnel. Current program evidence is shown only as context. NUVEDRA does not automatically convert a finding into an academic decision or accreditation conclusion.</p></section></section>'''
+    return f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="assessment-plans-continuous-improvement-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}">Program Outcomes & Accreditation</a></nav><header class="studio-hero"><div><p class="studio-eyebrow" data-i18n-en="Assessment Plans & Continuous Improvement" data-i18n-es="Planes de assessment y mejoramiento continuo">Assessment Plans & Continuous Improvement</p><h2>{academic_access.esc(program.get('program_code'))}: {academic_access.esc(program.get('title'))}</h2><p data-i18n-en="Plan direct and indirect measures, document findings, assign improvement actions, and preserve closing-the-loop evidence across assessment cycles." data-i18n-es="Planifique medidas directas e indirectas, documente hallazgos, asigne acciones de mejoramiento y conserve evidencia de cierre del ciclo de assessment.">Plan direct and indirect measures, document findings, assign improvement actions, and preserve closing-the-loop evidence across assessment cycles.</p></div></header>{create_cycle}<section class="studio-grid">{cycle_cards}</section>{detail}<section class="studio-panel"><p><strong>Scope:</strong> this workspace documents institutional assessment and continuous-improvement evidence. It does not certify accreditation compliance and does not change learner grades.</p></section></main>'''
+
+
+def register_assessment_plans_continuous_improvement(app: FastAPI) -> None:
+    ensure_assessment_plans_schema()
+
+    @app.get("/faculty/programs/{program_id}/assessment-plans", response_class=HTMLResponse, response_model=None)
+    async def assessment_plans(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse):
+            return user
+        requested = str(request.query_params.get("cycle_id") or "").strip()
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            cycles = _cycles(conn, program_id)
+            outcomes = program_outcomes._program_outcomes(conn, program_id)
+            context = _program_outcome_context(conn, program_id)
+            selected_id = int(requested) if requested.isdigit() else (int(cycles[0]["id"]) if cycles else 0)
+            bundle = _cycle_bundle(conn, program_id, selected_id) if selected_id else None
+        return academic_access.portal_page("Assessment Plans & Continuous Improvement", _dashboard(program_id, program, access, cycles, bundle, outcomes, context), user)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/cycles", response_model=None)
+    async def create_cycle(program_id: int, request: Request, label: str = Form(...), start_date: str = Form(""), end_date: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        clean = label.strip()
+        if not clean: raise HTTPException(400, "Assessment cycle label is required.")
+        if start_date and end_date and end_date < start_date: raise HTTPException(400, "Cycle end date must not precede start date.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            now = utcnow()
+            cycle_id = _insert_id(conn, "INSERT INTO nuvedra_assessment_cycles (program_id,label,start_date,end_date,status,created_by,created_at,updated_at) VALUES (?,?,?,?, 'open',?,?,?)", (program_id, clean[:180], start_date.strip(), end_date.strip(), user["email"], now, now))
+            audit(conn, user["email"], "assessment_cycle_created", "assessment_cycle", str(cycle_id), clean[:180], request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={cycle_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/measures", response_model=None)
+    async def create_measure(program_id: int, request: Request, cycle_id: int = Form(...), program_outcome_id: int = Form(...), title: str = Form(...), measure_type: str = Form(...), method: str = Form(""), data_source: str = Form(""), frequency: str = Form(""), target_threshold: float = Form(...), responsible_email: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        clean = title.strip()
+        if not clean or measure_type not in MEASURE_TYPES or target_threshold < 0 or target_threshold > 100:
+            raise HTTPException(400, "Valid measure title, type, and 0–100 target are required.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _require_open_cycle(conn, program_id, cycle_id)
+            outcome = rows(execute(conn, "SELECT id FROM nuvedra_program_outcomes WHERE id=? AND program_id=? AND status='active'", (program_outcome_id, program_id)))
+            if not outcome: raise HTTPException(400, "Program outcome must belong to this program.")
+            now = utcnow()
+            measure_id = _insert_id(conn, """INSERT INTO nuvedra_assessment_measures
+                (cycle_id,program_outcome_id,title,measure_type,method,data_source,frequency,target_threshold,responsible_email,status,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,'active',?,?,?)""", (cycle_id, program_outcome_id, clean[:180], measure_type, method.strip(), data_source.strip(), frequency.strip(), target_threshold, responsible_email.strip().lower(), user["email"], now, now))
+            audit(conn, user["email"], "assessment_measure_created", "assessment_measure", str(measure_id), measure_type, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={cycle_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/measures/{measure_id}/result", response_model=None)
+    async def record_result(program_id: int, measure_id: int, request: Request, result_value: float = Form(...), sample_size: int | None = Form(None), finding_summary: str = Form(""), evidence_reference: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        if result_value < 0 or result_value > 100 or (sample_size is not None and sample_size < 0):
+            raise HTTPException(400, "Result must be 0–100 and sample size cannot be negative.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            measure = _measure(conn, program_id, measure_id)
+            _require_open_cycle(conn, program_id, int(measure["cycle_id"]))
+            target_met = 1 if result_value + 1e-9 >= float(measure.get("target_threshold") or 0) else 0
+            now = utcnow()
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_assessment_results WHERE measure_id=?", (measure_id,)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_assessment_results SET result_value=?,sample_size=?,target_met=?,finding_summary=?,evidence_reference=?,recorded_by=?,recorded_at=?,updated_at=? WHERE measure_id=?", (result_value, sample_size, target_met, finding_summary.strip(), evidence_reference.strip(), user["email"], now, now, measure_id))
+                result_id = int(existing[0]["id"])
+            else:
+                result_id = _insert_id(conn, "INSERT INTO nuvedra_assessment_results (measure_id,result_value,sample_size,target_met,finding_summary,evidence_reference,recorded_by,recorded_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (measure_id, result_value, sample_size, target_met, finding_summary.strip(), evidence_reference.strip(), user["email"], now, now))
+            audit(conn, user["email"], "assessment_result_recorded", "assessment_result", str(result_id), f"{result_value:g}% target_met={target_met}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={int(measure['cycle_id'])}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/actions", response_model=None)
+    async def create_action(program_id: int, request: Request, cycle_id: int = Form(...), program_outcome_id: str = Form(""), measure_id: str = Form(""), title: str = Form(...), action_plan: str = Form(...), responsible_email: str = Form(""), due_date: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        clean_title, clean_plan = title.strip(), action_plan.strip()
+        if not clean_title or not clean_plan: raise HTTPException(400, "Action title and plan are required.")
+        outcome_id = int(program_outcome_id) if program_outcome_id.isdigit() else None
+        related_measure_id = int(measure_id) if measure_id.isdigit() else None
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _require_open_cycle(conn, program_id, cycle_id)
+            if outcome_id is not None and not rows(execute(conn, "SELECT id FROM nuvedra_program_outcomes WHERE id=? AND program_id=?", (outcome_id, program_id))):
+                raise HTTPException(400, "Program outcome does not belong to this program.")
+            if related_measure_id is not None:
+                related = _measure(conn, program_id, related_measure_id)
+                if int(related["cycle_id"]) != cycle_id: raise HTTPException(400, "Related measure must belong to the selected cycle.")
+                if outcome_id is None: outcome_id = int(related["program_outcome_id"])
+            now = utcnow()
+            action_id = _insert_id(conn, """INSERT INTO nuvedra_improvement_actions
+                (cycle_id,program_outcome_id,measure_id,title,action_plan,responsible_email,due_date,status,evidence_note,follow_up_result,closing_note,created_by,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,'planned','','','',?,?,?)""", (cycle_id, outcome_id, related_measure_id, clean_title[:180], clean_plan, responsible_email.strip().lower(), due_date.strip(), user["email"], now, now))
+            audit(conn, user["email"], "continuous_improvement_action_created", "improvement_action", str(action_id), clean_title[:180], request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={cycle_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/actions/{action_id}/status", response_model=None)
+    async def update_action(program_id: int, action_id: int, request: Request, status: str = Form(...), evidence_note: str = Form(""), follow_up_result: str = Form(""), closing_note: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        if status not in ACTION_STATES: raise HTTPException(400, "Invalid improvement-action status.")
+        if status == "verified" and not closing_note.strip(): raise HTTPException(400, "A closing-the-loop note is required before verification.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            action = _action(conn, program_id, action_id)
+            _require_open_cycle(conn, program_id, int(action["cycle_id"]))
+            now = utcnow()
+            completed_at = now if status in {"completed", "verified"} else None
+            verified_at = now if status == "verified" else None
+            verified_by = user["email"] if status == "verified" else None
+            execute(conn, """UPDATE nuvedra_improvement_actions SET status=?,evidence_note=?,follow_up_result=?,closing_note=?,updated_at=?,completed_at=?,verified_at=?,verified_by=? WHERE id=?""", (status, evidence_note.strip(), follow_up_result.strip(), closing_note.strip(), now, completed_at, verified_at, verified_by, action_id))
+            audit(conn, user["email"], "continuous_improvement_action_updated", "improvement_action", str(action_id), status, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={int(action['cycle_id'])}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/assessment-plans/cycles/{cycle_id}/close", response_model=None)
+    async def close_cycle(program_id: int, cycle_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _require_open_cycle(conn, program_id, cycle_id)
+            execute(conn, "UPDATE nuvedra_assessment_cycles SET status='closed',updated_at=? WHERE id=?", (utcnow(), cycle_id))
+            audit(conn, user["email"], "assessment_cycle_closed", "assessment_cycle", str(cycle_id), "Historical assessment evidence locked read-only", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/assessment-plans?cycle_id={cycle_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/assessment-plans.csv", response_model=None)
+    async def assessment_plan_csv(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/assessment-plans")
+        if isinstance(user, RedirectResponse): return user
+        requested = str(request.query_params.get("cycle_id") or "").strip()
+        if not requested.isdigit(): raise HTTPException(400, "cycle_id is required.")
+        cycle_id = int(requested)
+        with db() as conn:
+            program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            bundle = _cycle_bundle(conn, program_id, cycle_id)
+        stream = io.StringIO(); writer = csv.writer(stream)
+        writer.writerow(["Record type", "Cycle", "Program outcome", "Measure type", "Title", "Target %", "Result %", "Target status", "Sample size", "Finding / action plan", "Responsible", "Due date", "Action status", "Follow-up result", "Closing-the-loop note"])
+        for m in bundle["measures"]:
+            writer.writerow(["Measure", bundle["cycle"].get("label"), f"{m.get('outcome_code')}: {m.get('outcome_title')}", m.get("measure_type"), m.get("title"), m.get("target_threshold"), "" if m.get("result_value") is None else m.get("result_value"), _measure_status(m), "" if m.get("sample_size") is None else m.get("sample_size"), m.get("finding_summary") or "", m.get("responsible_email") or "", "", "", "", ""])
+        for a in bundle["actions"]:
+            writer.writerow(["Improvement action", bundle["cycle"].get("label"), f"{a.get('outcome_code') or ''}: {a.get('outcome_title') or ''}".strip(": "), "", a.get("title"), "", "", "", "", a.get("action_plan") or "", a.get("responsible_email") or "", a.get("due_date") or "", a.get("status"), a.get("follow_up_result") or "", a.get("closing_note") or ""])
+        filename = f"{str(program.get('program_code') or 'program').replace(' ', '_')}-{str(bundle['cycle'].get('label') or 'assessment-cycle').replace(' ', '_')}-continuous-improvement.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    print("NUVEDRA Assessment Plans & Continuous Improvement v1 registered: assessment cycles, direct/indirect measures, findings, targets, improvement actions, closing-the-loop verification, read-only closed cycles, and CSV export.", flush=True)
