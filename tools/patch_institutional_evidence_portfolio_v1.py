@@ -70,6 +70,12 @@ def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Institutional Evidence Repository & Accreditation Portfolio v1 source template is missing.")
     source = SOURCE.read_text(encoding="utf-8")
+    # Keep the CSV export on a distinct path segment so the integer portfolio-detail
+    # route cannot intercept a value such as "12.csv" before FastAPI validation.
+    source = source.replace(
+        "/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv",
+        "/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/export.csv",
+    )
     compile(source, str(MODULE), "exec")
     MODULE.write_text(source, encoding="utf-8")
     patch_academic_portal()
