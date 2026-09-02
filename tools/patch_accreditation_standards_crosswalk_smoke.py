@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Accreditation Standards Catalog & Crosswalk v1 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install the external review layer only after standards and frozen evidence portfolios exist.
+    from patch_external_accreditation_review_portal_v1 import main as patch_external_accreditation_review_portal_v1
+    patch_external_accreditation_review_portal_v1()
+
+    from patch_external_accreditation_review_portal_smoke import main as patch_external_accreditation_review_portal_smoke
+    patch_external_accreditation_review_portal_smoke()
+
 
 if __name__ == "__main__":
     main()
