@@ -66,13 +66,18 @@ def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("External Accreditation Review Portal v1 source template is missing.")
     source = SOURCE.read_text(encoding="utf-8")
+    # Capability URLs must not leak through Referer headers when a reviewer opens external evidence.
+    source = source.replace(
+        '"X-Robots-Tag": "noindex, nofollow"',
+        '"X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY"',
+    )
     compile(source, str(MODULE), "exec")
     MODULE.write_text(source, encoding="utf-8")
     patch_academic_portal()
     patch_evidence_portfolio()
     compile(MODULE.read_text(encoding="utf-8"), str(MODULE), "exec")
     compile(EVIDENCE_MODULE.read_text(encoding="utf-8"), str(EVIDENCE_MODULE), "exec")
-    print("NUVEDRA External Accreditation Review Portal v1 installed: expiring hashed review links, frozen evidence packages, protected evidence access, reviewer comments, additional-evidence requests, revocation, response workflow, audit logging, and portfolio navigation.", flush=True)
+    print("NUVEDRA External Accreditation Review Portal v1 installed: expiring hashed review links, frozen evidence packages, protected evidence access, no-referrer/no-store external review responses, reviewer comments, additional-evidence requests, revocation, response workflow, audit logging, and portfolio navigation.", flush=True)
 
 
 if __name__ == "__main__":
