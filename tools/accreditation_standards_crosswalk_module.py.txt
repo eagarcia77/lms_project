@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import csv
+import io
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+import app.program_outcomes_accreditation as program_outcomes
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+LINK_TYPES = {"program_outcome", "assessment_cycle", "evidence_asset", "improvement_action"}
+COVERAGE_STATES = ("Covered", "Partial", "No evidence", "Gap")
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    return program_outcomes._user(request, return_to)
+
+
+def _platform_role(request: Request) -> str:
+    admin = admin_console.session_user(request)
+    return str(admin.get("role") or "") if admin else ""
+
+
+def ensure_standards_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_frameworks (
+            id {pk}, code TEXT NOT NULL, name TEXT NOT NULL, version TEXT,
+            description TEXT, source_url TEXT, status TEXT NOT NULL DEFAULT 'active',
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_standards (
+            id {pk}, framework_id INTEGER NOT NULL, code TEXT NOT NULL, title TEXT NOT NULL,
+            description TEXT, position INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(framework_id,code)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_criteria (
+            id {pk}, standard_id INTEGER NOT NULL, code TEXT NOT NULL, title TEXT NOT NULL,
+            description TEXT, position INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(standard_id,code)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_program_frameworks (
+            id {pk}, program_id INTEGER NOT NULL, framework_id INTEGER NOT NULL,
+            review_period TEXT, status TEXT NOT NULL DEFAULT 'active',
+            added_by TEXT NOT NULL, added_at TEXT NOT NULL,
+            UNIQUE(program_id,framework_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_crosswalk_links (
+            id {pk}, program_id INTEGER NOT NULL, criterion_id INTEGER NOT NULL,
+            link_type TEXT NOT NULL, entity_id INTEGER NOT NULL, narrative TEXT,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(program_id,criterion_id,link_type,entity_id)
+        )""")
+
+
+def _framework(conn: Any, framework_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_frameworks WHERE id=? AND status='active'", (framework_id,)))
+    if not found:
+        raise HTTPException(404, "Accreditation framework not found.")
+    return found[0]
+
+
+def _criterion(conn: Any, criterion_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT c.*,s.framework_id,s.code AS standard_code,s.title AS standard_title,
+        f.code AS framework_code,f.name AS framework_name
+        FROM nuvedra_accreditation_criteria c
+        JOIN nuvedra_accreditation_standards s ON s.id=c.standard_id
+        JOIN nuvedra_accreditation_frameworks f ON f.id=s.framework_id
+        WHERE c.id=? AND c.status='active' AND s.status='active' AND f.status='active'""", (criterion_id,)))
+    if not found:
+        raise HTTPException(404, "Accreditation criterion not found.")
+    return found[0]
+
+
+def _program_framework_ids(conn: Any, program_id: int) -> set[int]:
+    data = rows(execute(conn, "SELECT framework_id FROM nuvedra_program_frameworks WHERE program_id=? AND status='active'", (program_id,)))
+    return {int(x["framework_id"]) for x in data}
+
+
+def _entity_label(conn: Any, program_id: int, link_type: str, entity_id: int) -> str:
+    if link_type == "program_outcome":
+        found = rows(execute(conn, "SELECT code,title FROM nuvedra_program_outcomes WHERE id=? AND program_id=? AND status='active'", (entity_id, program_id)))
+        if not found:
+            raise HTTPException(400, "Program Outcome does not belong to this program.")
+        return f"{found[0].get('code')}: {found[0].get('title')}"
+    if link_type == "assessment_cycle":
+        found = rows(execute(conn, "SELECT label FROM nuvedra_assessment_cycles WHERE id=? AND program_id=?", (entity_id, program_id)))
+        if not found:
+            raise HTTPException(400, "Assessment cycle does not belong to this program.")
+        return str(found[0].get("label") or "")
+    if link_type == "evidence_asset":
+        found = rows(execute(conn, """SELECT a.title FROM nuvedra_evidence_assets a
+            JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+            WHERE a.id=? AND l.program_id=? AND a.status='active'""", (entity_id, program_id)))
+        if not found:
+            raise HTTPException(400, "Evidence item does not belong to this program.")
+        return str(found[0].get("title") or "")
+    if link_type == "improvement_action":
+        found = rows(execute(conn, """SELECT a.title FROM nuvedra_improvement_actions a
+            JOIN nuvedra_assessment_cycles c ON c.id=a.cycle_id
+            WHERE a.id=? AND c.program_id=?""", (entity_id, program_id)))
+        if not found:
+            raise HTTPException(400, "Improvement action does not belong to this program.")
+        return str(found[0].get("title") or "")
+    raise HTTPException(400, "Unsupported crosswalk link type.")
+
+
+def _criterion_links(conn: Any, program_id: int, criterion_id: int) -> list[dict[str, Any]]:
+    links = rows(execute(conn, """SELECT * FROM nuvedra_accreditation_crosswalk_links
+        WHERE program_id=? AND criterion_id=? ORDER BY link_type,id""", (program_id, criterion_id)))
+    for link in links:
+        link["entity_label"] = _entity_label(conn, program_id, str(link["link_type"]), int(link["entity_id"]))
+    return links
+
+
+def _coverage(links: list[dict[str, Any]]) -> str:
+    if not links:
+        return "Gap"
+    has_evidence = any(str(x.get("link_type")) == "evidence_asset" for x in links)
+    has_context = any(str(x.get("link_type")) in {"program_outcome", "assessment_cycle", "improvement_action"} for x in links)
+    if has_evidence and has_context:
+        return "Covered"
+    if has_evidence:
+        return "Partial"
+    return "No evidence"
+
+
+def _program_crosswalk(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    data = rows(execute(conn, """SELECT c.id AS criterion_id,c.code AS criterion_code,c.title AS criterion_title,c.description AS criterion_description,
+        s.code AS standard_code,s.title AS standard_title,s.position AS standard_position,
+        f.id AS framework_id,f.code AS framework_code,f.name AS framework_name,f.version,pf.review_period
+        FROM nuvedra_program_frameworks pf
+        JOIN nuvedra_accreditation_frameworks f ON f.id=pf.framework_id AND f.status='active'
+        JOIN nuvedra_accreditation_standards s ON s.framework_id=f.id AND s.status='active'
+        JOIN nuvedra_accreditation_criteria c ON c.standard_id=s.id AND c.status='active'
+        WHERE pf.program_id=? AND pf.status='active'
+        ORDER BY f.code,s.position,s.code,c.position,c.code""", (program_id,)))
+    for row in data:
+        links = _criterion_links(conn, program_id, int(row["criterion_id"]))
+        row["links"] = links
+        row["coverage"] = _coverage(links)
+        row["evidence_count"] = sum(1 for x in links if str(x.get("link_type")) == "evidence_asset")
+        row["context_count"] = len(links) - int(row["evidence_count"])
+    return data
+
+
+def _link_options(conn: Any, program_id: int) -> dict[str, list[dict[str, Any]]]:
+    return {
+        "program_outcome": rows(execute(conn, "SELECT id,code,title FROM nuvedra_program_outcomes WHERE program_id=? AND status='active' ORDER BY code,title,id", (program_id,))),
+        "assessment_cycle": rows(execute(conn, "SELECT id,label,status FROM nuvedra_assessment_cycles WHERE program_id=? ORDER BY id DESC", (program_id,))),
+        "evidence_asset": rows(execute(conn, """SELECT a.id,a.title,l.standard_code,l.criterion_code FROM nuvedra_evidence_assets a
+            JOIN nuvedra_evidence_links l ON l.asset_id=a.id WHERE l.program_id=? AND a.status='active' ORDER BY a.title,a.id""", (program_id,))),
+        "improvement_action": rows(execute(conn, """SELECT a.id,a.title,a.status,c.label AS cycle_label FROM nuvedra_improvement_actions a
+            JOIN nuvedra_assessment_cycles c ON c.id=a.cycle_id WHERE c.program_id=? ORDER BY a.id DESC""", (program_id,))),
+    }
+
+
+def _catalog_html(expanded: list[dict[str, Any]], can_manage: bool) -> str:
+    result = []
+    for framework in expanded:
+        standard_html = []
+        for standard in framework["standards"]:
+            criteria = "".join(
+                f'<li><strong>{academic_access.esc(c.get("code"))}</strong> · {academic_access.esc(c.get("title"))}</li>'
+                for c in standard["criteria"]
+            ) or "<li>No criteria yet.</li>"
+            add_criterion = ""
+            if can_manage:
+                add_criterion = f'''<form method="post" action="/faculty/accreditation/standards/standards/{int(standard['id'])}/criteria" class="studio-form"><label>Criterion code<input name="code" required maxlength="80"></label><label>Criterion title<input name="title" required maxlength="180"></label><label>Description<textarea name="description" rows="2"></textarea></label><button class="studio-button studio-button--quiet">Add criterion</button></form>'''
+            standard_html.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(standard.get('code'))}</p><h4>{academic_access.esc(standard.get('title'))}</h4><p>{academic_access.esc(standard.get('description'))}</p><ul>{criteria}</ul>{add_criterion}</article>''')
+        add_standard = ""
+        if can_manage:
+            add_standard = f'''<form method="post" action="/faculty/accreditation/standards/frameworks/{int(framework['id'])}/standards" class="studio-form"><label>Standard code<input name="code" required maxlength="80"></label><label>Standard title<input name="title" required maxlength="180"></label><label>Description<textarea name="description" rows="2"></textarea></label><button class="studio-button">Add standard</button></form>'''
+        standard_grid = "".join(standard_html) or '<section class="studio-empty">No standards yet.</section>'
+        result.append(f'''<section class="studio-section"><header><p class="studio-eyebrow">{academic_access.esc(framework.get('code'))} · {academic_access.esc(framework.get('version') or '')}</p><h3>{academic_access.esc(framework.get('name'))}</h3><p>{academic_access.esc(framework.get('description'))}</p></header>{add_standard}<div class="studio-grid">{standard_grid}</div></section>''')
+    return "".join(result)
+
+
+def register_accreditation_standards_crosswalk(app: FastAPI) -> None:
+    ensure_standards_schema()
+
+    @app.get("/faculty/accreditation/standards", response_class=HTMLResponse, response_model=None)
+    async def standards_catalog(request: Request):
+        user = _user(request, "/faculty/accreditation/standards")
+        if isinstance(user, RedirectResponse): return user
+        platform_role = _platform_role(request)
+        with db() as conn:
+            frameworks = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_frameworks WHERE status='active' ORDER BY code,name,id"))
+            expanded = []
+            for framework in frameworks:
+                standards = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_standards WHERE framework_id=? AND status='active' ORDER BY position,code,id", (int(framework["id"]),)))
+                for standard in standards:
+                    standard["criteria"] = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_criteria WHERE standard_id=? AND status='active' ORDER BY position,code,id", (int(standard["id"]),)))
+                framework["standards"] = standards
+                expanded.append(framework)
+        can_manage = platform_role in {"superadmin", "course_admin"}
+        create = ""
+        if can_manage:
+            create = '''<section class="studio-panel"><h3>Create accreditation framework</h3><form method="post" action="/faculty/accreditation/standards/frameworks" class="studio-form"><label>Framework code<input name="code" required maxlength="80" placeholder="MSCHE"></label><label>Name<input name="name" required maxlength="180"></label><label>Version<input name="version" maxlength="80" placeholder="Current institutional edition"></label><label>Description<textarea name="description" rows="3"></textarea></label><label>Official source URL<input type="url" name="source_url"></label><button class="studio-button">Create framework</button></form></section>'''
+        catalog_html = _catalog_html(expanded, can_manage) or '<section class="studio-empty">No accreditation frameworks have been configured.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="accreditation-standards-catalog-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs">Programs</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Accreditation Standards Catalog</p><h2>Institutional standards and criteria library</h2><p>Maintain framework metadata and use it to build program-level accreditation crosswalks.</p></div></header>{create}{catalog_html}<section class="studio-panel"><p><strong>Scope:</strong> NUVEDRA stores institution-configured framework metadata. It does not claim that a framework entry is authoritative, current, or that a program is accredited.</p></section></main>'''
+        return academic_access.portal_page("Accreditation Standards Catalog", body, user)
+
+    @app.post("/faculty/accreditation/standards/frameworks", response_model=None)
+    async def create_framework(request: Request, code: str = Form(...), name: str = Form(...), version: str = Form(""), description: str = Form(""), source_url: str = Form("")):
+        user = _user(request, "/faculty/accreditation/standards")
+        if isinstance(user, RedirectResponse): return user
+        if _platform_role(request) not in {"superadmin", "course_admin"}:
+            raise HTTPException(403, "Platform administration permission is required to maintain the standards catalog.")
+        clean_code, clean_name = code.strip().upper(), name.strip()
+        if not clean_code or not clean_name:
+            raise HTTPException(400, "Framework code and name are required.")
+        now = utcnow()
+        with db() as conn:
+            if rows(execute(conn, "SELECT id FROM nuvedra_accreditation_frameworks WHERE upper(code)=upper(?) AND status='active'", (clean_code,))):
+                raise HTTPException(409, "An active framework already uses this code.")
+            framework_id = _insert_id(conn, "INSERT INTO nuvedra_accreditation_frameworks (code,name,version,description,source_url,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'active',?,?,?)", (clean_code, clean_name, version.strip(), description.strip(), source_url.strip(), user["email"], now, now))
+            audit(conn, user["email"], "accreditation_framework_created", "accreditation_framework", str(framework_id), clean_code, request.client.host if request.client else "")
+        return RedirectResponse("/faculty/accreditation/standards", status_code=303)
+
+    @app.post("/faculty/accreditation/standards/frameworks/{framework_id}/standards", response_model=None)
+    async def create_standard(framework_id: int, request: Request, code: str = Form(...), title: str = Form(...), description: str = Form("")):
+        user = _user(request, "/faculty/accreditation/standards")
+        if isinstance(user, RedirectResponse): return user
+        if _platform_role(request) not in {"superadmin", "course_admin"}:
+            raise HTTPException(403, "Platform administration permission is required.")
+        clean_code, clean_title = code.strip(), title.strip()
+        if not clean_code or not clean_title:
+            raise HTTPException(400, "Standard code and title are required.")
+        with db() as conn:
+            _framework(conn, framework_id)
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS value FROM nuvedra_accreditation_standards WHERE framework_id=?", (framework_id,)))[0]["value"])
+            now = utcnow()
+            try:
+                standard_id = _insert_id(conn, "INSERT INTO nuvedra_accreditation_standards (framework_id,code,title,description,position,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'active',?,?,?)", (framework_id, clean_code, clean_title, description.strip(), pos, user["email"], now, now))
+            except Exception as exc:
+                raise HTTPException(409, "This framework already contains that standard code.") from exc
+            audit(conn, user["email"], "accreditation_standard_created", "accreditation_standard", str(standard_id), clean_code, request.client.host if request.client else "")
+        return RedirectResponse("/faculty/accreditation/standards", status_code=303)
+
+    @app.post("/faculty/accreditation/standards/standards/{standard_id}/criteria", response_model=None)
+    async def create_criterion(standard_id: int, request: Request, code: str = Form(...), title: str = Form(...), description: str = Form("")):
+        user = _user(request, "/faculty/accreditation/standards")
+        if isinstance(user, RedirectResponse): return user
+        if _platform_role(request) not in {"superadmin", "course_admin"}:
+            raise HTTPException(403, "Platform administration permission is required.")
+        clean_code, clean_title = code.strip(), title.strip()
+        if not clean_code or not clean_title:
+            raise HTTPException(400, "Criterion code and title are required.")
+        with db() as conn:
+            found = rows(execute(conn, "SELECT id FROM nuvedra_accreditation_standards WHERE id=? AND status='active'", (standard_id,)))
+            if not found:
+                raise HTTPException(404, "Accreditation standard not found.")
+            pos = int(rows(execute(conn, "SELECT COALESCE(MAX(position),0)+1 AS value FROM nuvedra_accreditation_criteria WHERE standard_id=?", (standard_id,)))[0]["value"])
+            now = utcnow()
+            try:
+                criterion_id = _insert_id(conn, "INSERT INTO nuvedra_accreditation_criteria (standard_id,code,title,description,position,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'active',?,?,?)", (standard_id, clean_code, clean_title, description.strip(), pos, user["email"], now, now))
+            except Exception as exc:
+                raise HTTPException(409, "This standard already contains that criterion code.") from exc
+            audit(conn, user["email"], "accreditation_criterion_created", "accreditation_criterion", str(criterion_id), clean_code, request.client.host if request.client else "")
+        return RedirectResponse("/faculty/accreditation/standards", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/standards", response_class=HTMLResponse, response_model=None)
+    async def program_standards(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/standards")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            attached = _program_framework_ids(conn, program_id)
+            frameworks = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_frameworks WHERE status='active' ORDER BY code,name,id"))
+            crosswalk = _program_crosswalk(conn, program_id)
+            options = _link_options(conn, program_id)
+        can_manage = str(access.get("program_role")) == "coordinator"
+        framework_options = "".join(f'<option value="{int(f["id"])}">{academic_access.esc(f.get("code"))} · {academic_access.esc(f.get("name"))}</option>' for f in frameworks if int(f["id"]) not in attached)
+        attach = ""
+        if can_manage:
+            attach = f'''<section class="studio-panel"><h3>Add framework to program</h3><form method="post" action="/faculty/programs/{program_id}/standards/frameworks" class="studio-form"><label>Framework<select name="framework_id" required>{framework_options}</select></label><label>Review period<input name="review_period" maxlength="120" placeholder="2026–2027"></label><button class="studio-button">Add framework</button></form><p><a href="/faculty/accreditation/standards">Open standards catalog</a></p></section>'''
+        counts = {state: sum(1 for row in crosswalk if row["coverage"] == state) for state in COVERAGE_STATES}
+        po_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("code"))}: {academic_access.esc(x.get("title"))}</option>' for x in options["program_outcome"])
+        cycle_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("label"))}</option>' for x in options["assessment_cycle"])
+        evidence_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("title"))}</option>' for x in options["evidence_asset"])
+        action_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("title"))}</option>' for x in options["improvement_action"])
+        criterion_rows = []
+        for row in crosswalk:
+            link_items = []
+            for link in row["links"]:
+                label = str(link.get("link_type") or "").replace("_", " ").title()
+                narrative = f" — {academic_access.esc(link.get('narrative'))}" if link.get("narrative") else ""
+                link_items.append(f'<li><strong>{academic_access.esc(label)}</strong>: {academic_access.esc(link.get("entity_label"))}{narrative}</li>')
+            links_html = "".join(link_items) or "<li>No mappings yet.</li>"
+            manage = ""
+            if can_manage:
+                manage = f'''<details><summary>Add mapping</summary><form method="post" action="/faculty/programs/{program_id}/standards/links" class="studio-form"><input type="hidden" name="criterion_id" value="{int(row['criterion_id'])}"><label>Mapping type<select name="link_type" required><option value="program_outcome">Program Outcome</option><option value="assessment_cycle">Assessment cycle</option><option value="evidence_asset">Institutional evidence</option><option value="improvement_action">Improvement action</option></select></label><label>Program Outcome<select name="program_outcome_id"><option value="">—</option>{po_options}</select></label><label>Assessment cycle<select name="assessment_cycle_id"><option value="">—</option>{cycle_options}</select></label><label>Evidence item<select name="evidence_asset_id"><option value="">—</option>{evidence_options}</select></label><label>Improvement action<select name="improvement_action_id"><option value="">—</option>{action_options}</select></label><label>Crosswalk narrative<textarea name="narrative" rows="2"></textarea></label><button class="studio-button studio-button--quiet">Add mapping</button></form></details>'''
+            criterion_rows.append(f'''<tr><td>{academic_access.esc(row.get('framework_code'))}</td><td><strong>{academic_access.esc(row.get('standard_code'))}</strong><br>{academic_access.esc(row.get('standard_title'))}</td><td><strong>{academic_access.esc(row.get('criterion_code'))}</strong><br>{academic_access.esc(row.get('criterion_title'))}</td><td><strong>{academic_access.esc(row.get('coverage'))}</strong><br><small>{int(row.get('evidence_count') or 0)} evidence · {int(row.get('context_count') or 0)} context</small></td><td><ul>{links_html}</ul>{manage}</td></tr>''')
+        matrix_rows = "".join(criterion_rows) or '<tr><td colspan="5">Add an accreditation framework to begin the crosswalk.</td></tr>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="accreditation-standards-crosswalk-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}">Program Outcomes & Accreditation</a><span>/</span><a href="/faculty/programs/{program_id}/evidence">Evidence Repository</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Accreditation Standards Crosswalk</p><h2>{academic_access.esc(program.get('program_code'))}: {academic_access.esc(program.get('title'))}</h2><p>Connect institutional standards to program outcomes, assessment cycles, improvement actions, and documented evidence.</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/standards.csv">Crosswalk CSV</a></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{counts['Covered']}</strong><span>Covered</span></article><article class="studio-panel"><strong>{counts['Partial']}</strong><span>Partial</span></article><article class="studio-panel"><strong>{counts['No evidence']}</strong><span>No evidence</span></article><article class="studio-panel"><strong>{counts['Gap']}</strong><span>Gap</span></article></section>{attach}<section class="studio-panel"><h3>Coverage rules</h3><p><strong>Covered</strong> = at least one institutional evidence item plus at least one program/assessment/improvement context link. <strong>Partial</strong> = evidence exists without context alignment. <strong>No evidence</strong> = context alignment exists but no institutional evidence item is linked. <strong>Gap</strong> = no mapping exists.</p></section><section class="studio-panel"><h3>Standards crosswalk matrix</h3><div style="overflow:auto"><table><thead><tr><th>Framework</th><th>Standard</th><th>Criterion</th><th>Coverage</th><th>Mapped evidence and context</th></tr></thead><tbody>{matrix_rows}</tbody></table></div></section><section class="studio-panel"><p><strong>Interpretation:</strong> coverage states are deterministic inventory signals. They do not determine accreditation compliance or substitute for institutional judgment.</p></section></main>'''
+        return academic_access.portal_page("Accreditation Standards Crosswalk", body, user)
+
+    @app.post("/faculty/programs/{program_id}/standards/frameworks", response_model=None)
+    async def attach_framework(program_id: int, request: Request, framework_id: int = Form(...), review_period: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/standards")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _framework(conn, framework_id)
+            now = utcnow()
+            existing = rows(execute(conn, "SELECT id FROM nuvedra_program_frameworks WHERE program_id=? AND framework_id=?", (program_id, framework_id)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_program_frameworks SET review_period=?,status='active',added_by=?,added_at=? WHERE id=?", (review_period.strip(), user["email"], now, int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_program_frameworks (program_id,framework_id,review_period,status,added_by,added_at) VALUES (?,?,?,'active',?,?)", (program_id, framework_id, review_period.strip(), user["email"], now))
+            audit(conn, user["email"], "program_accreditation_framework_attached", "program", str(program_id), str(framework_id), request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/standards", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/standards/links", response_model=None)
+    async def add_crosswalk_link(program_id: int, request: Request, criterion_id: int = Form(...), link_type: str = Form(...), program_outcome_id: str = Form(""), assessment_cycle_id: str = Form(""), evidence_asset_id: str = Form(""), improvement_action_id: str = Form(""), narrative: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/standards")
+        if isinstance(user, RedirectResponse): return user
+        clean_type = link_type.strip()
+        if clean_type not in LINK_TYPES:
+            raise HTTPException(400, "Unsupported crosswalk link type.")
+        supplied = {
+            "program_outcome": program_outcome_id,
+            "assessment_cycle": assessment_cycle_id,
+            "evidence_asset": evidence_asset_id,
+            "improvement_action": improvement_action_id,
+        }[clean_type].strip()
+        if not supplied.isdigit():
+            raise HTTPException(400, "Select an entity for the chosen mapping type.")
+        entity_id = int(supplied)
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            criterion = _criterion(conn, criterion_id)
+            if int(criterion["framework_id"]) not in _program_framework_ids(conn, program_id):
+                raise HTTPException(400, "This criterion belongs to a framework that is not attached to the program.")
+            _entity_label(conn, program_id, clean_type, entity_id)
+            try:
+                link_id = _insert_id(conn, "INSERT INTO nuvedra_accreditation_crosswalk_links (program_id,criterion_id,link_type,entity_id,narrative,created_by,created_at) VALUES (?,?,?,?,?,?,?)", (program_id, criterion_id, clean_type, entity_id, narrative.strip(), user["email"], utcnow()))
+            except Exception as exc:
+                raise HTTPException(409, "This criterion already contains that mapping.") from exc
+            audit(conn, user["email"], "accreditation_crosswalk_link_created", "accreditation_crosswalk_link", str(link_id), f"{clean_type}:{entity_id}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/standards", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/standards.csv", response_model=None)
+    async def standards_csv(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/standards")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            crosswalk = _program_crosswalk(conn, program_id)
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["Framework", "Framework version", "Standard", "Criterion", "Coverage", "Evidence count", "Context count", "Mapped entities"])
+        for row in crosswalk:
+            mapped = " | ".join(f"{str(x.get('link_type')).replace('_',' ')}: {x.get('entity_label')}" for x in row["links"])
+            writer.writerow([row.get("framework_code"), row.get("version"), f"{row.get('standard_code')}: {row.get('standard_title')}", f"{row.get('criterion_code')}: {row.get('criterion_title')}", row.get("coverage"), row.get("evidence_count"), row.get("context_count"), mapped])
+        filename = f"{str(program.get('program_code') or 'program').replace(' ', '_')}-accreditation-crosswalk.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    print("NUVEDRA Accreditation Standards Catalog & Crosswalk v1 registered: institution-managed frameworks, program attachment, criterion-level crosswalks, deterministic Covered/Partial/No evidence/Gap signals, CSV export, and protected program access.", flush=True)
