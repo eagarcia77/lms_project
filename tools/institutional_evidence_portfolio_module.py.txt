@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+from pathlib import PurePath
+from typing import Any
+from urllib.parse import quote, urlparse
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
+
+import app.academic_access as academic_access
+import app.program_outcomes_accreditation as program_outcomes
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+EVIDENCE_TYPES = {"report", "policy", "rubric", "minutes", "survey", "dataset", "curriculum", "faculty", "student_work_sample", "assessment", "improvement", "other"}
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".zip"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _blob_type() -> str:
+    return "BYTEA" if database_url().startswith("postgres") else "BLOB"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    cursor = execute(conn, sql, params)
+    return int(cursor.lastrowid)
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    return program_outcomes._user(request, return_to)
+
+
+def ensure_evidence_portfolio_schema() -> None:
+    pk = _pk()
+    blob = _blob_type()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_evidence_assets (
+            id {pk}, title TEXT NOT NULL, description TEXT, evidence_type TEXT NOT NULL,
+            tags TEXT, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_evidence_versions (
+            id {pk}, asset_id INTEGER NOT NULL, version_no INTEGER NOT NULL,
+            file_name TEXT, mime_type TEXT, file_size INTEGER NOT NULL DEFAULT 0,
+            file_bytes {blob}, source_url TEXT, change_note TEXT,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(asset_id,version_no)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_evidence_links (
+            id {pk}, asset_id INTEGER NOT NULL, program_id INTEGER NOT NULL,
+            cycle_id INTEGER, program_outcome_id INTEGER, improvement_action_id INTEGER,
+            standard_code TEXT, criterion_code TEXT, linked_by TEXT NOT NULL, linked_at TEXT NOT NULL,
+            UNIQUE(asset_id,program_id)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_portfolios (
+            id {pk}, program_id INTEGER NOT NULL, title TEXT NOT NULL,
+            accreditor TEXT, review_period TEXT, description TEXT,
+            status TEXT NOT NULL DEFAULT 'draft', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            frozen_at TEXT, frozen_by TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_accreditation_portfolio_items (
+            id {pk}, portfolio_id INTEGER NOT NULL, asset_id INTEGER NOT NULL,
+            evidence_version_id INTEGER NOT NULL, narrative TEXT,
+            position INTEGER NOT NULL DEFAULT 1, added_by TEXT NOT NULL, added_at TEXT NOT NULL,
+            UNIQUE(portfolio_id,asset_id)
+        )""")
+
+
+def _safe_url(value: str) -> str:
+    clean = value.strip()
+    if not clean:
+        return ""
+    parsed = urlparse(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(400, "Evidence URL must use http or https.")
+    return clean
+
+
+def _program_asset(conn: Any, program_id: int, asset_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT a.*,l.standard_code,l.criterion_code,l.cycle_id,l.program_outcome_id,l.improvement_action_id
+        FROM nuvedra_evidence_assets a JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+        WHERE a.id=? AND l.program_id=? AND a.status='active'""", (asset_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Evidence item not found in this program repository.")
+    return found[0]
+
+
+def _version(conn: Any, program_id: int, version_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, """SELECT v.*,a.title,a.evidence_type
+        FROM nuvedra_evidence_versions v
+        JOIN nuvedra_evidence_assets a ON a.id=v.asset_id
+        JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+        WHERE v.id=? AND l.program_id=? AND a.status='active'""", (version_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Evidence version not found.")
+    return found[0]
+
+
+def _latest_version(conn: Any, asset_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_evidence_versions WHERE asset_id=? ORDER BY version_no DESC,id DESC LIMIT 1", (asset_id,)))
+    if not found:
+        raise HTTPException(409, "Evidence item has no stored version.")
+    return found[0]
+
+
+def _portfolio(conn: Any, program_id: int, portfolio_id: int) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_portfolios WHERE id=? AND program_id=?", (portfolio_id, program_id)))
+    if not found:
+        raise HTTPException(404, "Accreditation portfolio not found.")
+    return found[0]
+
+
+def _require_draft(portfolio: dict[str, Any]) -> None:
+    if str(portfolio.get("status")) != "draft":
+        raise HTTPException(409, "This accreditation portfolio is frozen and read-only.")
+
+
+def _validate_context(conn: Any, program_id: int, cycle_id: int | None, outcome_id: int | None, action_id: int | None) -> None:
+    if cycle_id is not None:
+        if not rows(execute(conn, "SELECT id FROM nuvedra_assessment_cycles WHERE id=? AND program_id=?", (cycle_id, program_id))):
+            raise HTTPException(400, "Assessment cycle does not belong to this program.")
+    if outcome_id is not None:
+        if not rows(execute(conn, "SELECT id FROM nuvedra_program_outcomes WHERE id=? AND program_id=?", (outcome_id, program_id))):
+            raise HTTPException(400, "Program outcome does not belong to this program.")
+    if action_id is not None:
+        if not rows(execute(conn, """SELECT a.id FROM nuvedra_improvement_actions a
+            JOIN nuvedra_assessment_cycles c ON c.id=a.cycle_id
+            WHERE a.id=? AND c.program_id=?""", (action_id, program_id))):
+            raise HTTPException(400, "Improvement action does not belong to this program.")
+
+
+def _context_options(conn: Any, program_id: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    cycles = rows(execute(conn, "SELECT id,label,status FROM nuvedra_assessment_cycles WHERE program_id=? ORDER BY id DESC", (program_id,)))
+    outcomes = rows(execute(conn, "SELECT id,code,title FROM nuvedra_program_outcomes WHERE program_id=? AND status='active' ORDER BY code,title,id", (program_id,)))
+    actions = rows(execute(conn, """SELECT a.id,a.title,a.status,c.label AS cycle_label FROM nuvedra_improvement_actions a
+        JOIN nuvedra_assessment_cycles c ON c.id=a.cycle_id WHERE c.program_id=? ORDER BY a.id DESC""", (program_id,)))
+    return cycles, outcomes, actions
+
+
+def _program_assets(conn: Any, program_id: int) -> list[dict[str, Any]]:
+    assets = rows(execute(conn, """SELECT a.*,l.standard_code,l.criterion_code,l.cycle_id,l.program_outcome_id,l.improvement_action_id
+        FROM nuvedra_evidence_assets a JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+        WHERE l.program_id=? AND a.status='active' ORDER BY COALESCE(l.standard_code,''),COALESCE(l.criterion_code,''),a.title,a.id""", (program_id,)))
+    for asset in assets:
+        latest = _latest_version(conn, int(asset["id"]))
+        asset["latest_version_id"] = int(latest["id"])
+        asset["latest_version_no"] = int(latest["version_no"])
+        asset["latest_file_name"] = latest.get("file_name")
+        asset["latest_source_url"] = latest.get("source_url")
+    return assets
+
+
+def _portfolio_items(conn: Any, portfolio_id: int) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT pi.*,a.title,a.description,a.evidence_type,a.tags,
+        v.version_no,v.file_name,v.mime_type,v.file_size,v.source_url,
+        l.standard_code,l.criterion_code,l.cycle_id,l.program_outcome_id,l.improvement_action_id
+        FROM nuvedra_accreditation_portfolio_items pi
+        JOIN nuvedra_evidence_assets a ON a.id=pi.asset_id
+        JOIN nuvedra_evidence_versions v ON v.id=pi.evidence_version_id
+        JOIN nuvedra_evidence_links l ON l.asset_id=a.id
+        JOIN nuvedra_accreditation_portfolios p ON p.id=pi.portfolio_id AND p.program_id=l.program_id
+        WHERE pi.portfolio_id=? ORDER BY COALESCE(l.standard_code,''),COALESCE(l.criterion_code,''),pi.position,pi.id""", (portfolio_id,)))
+
+
+def _ref_label(conn: Any, asset: dict[str, Any]) -> str:
+    parts = []
+    if asset.get("cycle_id"):
+        found = rows(execute(conn, "SELECT label FROM nuvedra_assessment_cycles WHERE id=?", (int(asset["cycle_id"]),)))
+        if found: parts.append(f"Cycle: {found[0].get('label')}")
+    if asset.get("program_outcome_id"):
+        found = rows(execute(conn, "SELECT code,title FROM nuvedra_program_outcomes WHERE id=?", (int(asset["program_outcome_id"]),)))
+        if found: parts.append(f"Outcome: {found[0].get('code')} {found[0].get('title')}")
+    if asset.get("improvement_action_id"):
+        found = rows(execute(conn, "SELECT title FROM nuvedra_improvement_actions WHERE id=?", (int(asset["improvement_action_id"]),)))
+        if found: parts.append(f"Action: {found[0].get('title')}")
+    return " · ".join(parts) or "Program-level evidence"
+
+
+def register_institutional_evidence_portfolio(app: FastAPI) -> None:
+    ensure_evidence_portfolio_schema()
+
+    @app.get("/faculty/programs/{program_id}/evidence", response_class=HTMLResponse, response_model=None)
+    async def evidence_repository(program_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id)
+            assets = _program_assets(conn, program_id)
+            cycles, outcomes, actions = _context_options(conn, program_id)
+            portfolios = rows(execute(conn, "SELECT * FROM nuvedra_accreditation_portfolios WHERE program_id=? ORDER BY id DESC", (program_id,)))
+        can_manage = str(access.get("program_role")) == "coordinator"
+        cycle_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("label"))} · {academic_access.esc(x.get("status"))}</option>' for x in cycles)
+        outcome_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("code"))}: {academic_access.esc(x.get("title"))}</option>' for x in outcomes)
+        action_options = "".join(f'<option value="{int(x["id"])}">{academic_access.esc(x.get("title"))} · {academic_access.esc(x.get("status"))}</option>' for x in actions)
+        manage = ""
+        if can_manage:
+            type_options = "".join(f'<option value="{kind}">{kind.replace("_", " ").title()}</option>' for kind in sorted(EVIDENCE_TYPES))
+            manage = f'''<section class="studio-grid"><article class="studio-panel"><h3>Add institutional evidence</h3><form method="post" action="/faculty/programs/{program_id}/evidence/assets" enctype="multipart/form-data" class="studio-form"><label>Title<input name="title" required maxlength="180"></label><label>Evidence type<select name="evidence_type">{type_options}</select></label><label>Description<textarea name="description" rows="3"></textarea></label><label>Tags<input name="tags" maxlength="300" placeholder="assessment, faculty, policy"></label><div class="studio-grid"><label>Standard / Estándar<input name="standard_code" maxlength="80" placeholder="MSCHE V"></label><label>Criterion / Criterio<input name="criterion_code" maxlength="80" placeholder="5.2"></label></div><label>Assessment cycle<select name="cycle_id"><option value="">None</option>{cycle_options}</select></label><label>Program outcome<select name="program_outcome_id"><option value="">None</option>{outcome_options}</select></label><label>Improvement action<select name="improvement_action_id"><option value="">None</option>{action_options}</select></label><label>External URL (optional)<input type="url" name="source_url"></label><label>Or upload file (max 25 MB)<input type="file" name="upload" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.png,.jpg,.jpeg,.webp,.zip"></label><label>Version note<input name="change_note" maxlength="300" value="Initial evidence version"></label><button class="studio-button">Save evidence</button></form></article><article class="studio-panel"><h3>Create accreditation portfolio</h3><form method="post" action="/faculty/programs/{program_id}/evidence/portfolios" class="studio-form"><label>Portfolio title<input name="title" required maxlength="180"></label><label>Accreditor / Review body<input name="accreditor" maxlength="180"></label><label>Review period<input name="review_period" maxlength="120" placeholder="2026–2027"></label><label>Description<textarea name="description" rows="3"></textarea></label><button class="studio-button">Create portfolio</button></form></article></section>'''
+        cards = []
+        with db() as conn:
+            for asset in assets:
+                ref = _ref_label(conn, asset)
+                cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(asset.get('standard_code') or 'Unmapped standard')} · {academic_access.esc(asset.get('criterion_code') or 'No criterion')}</p><h3>{academic_access.esc(asset.get('title'))}</h3><p>{academic_access.esc(asset.get('description'))}</p><p><strong>{academic_access.esc(asset.get('evidence_type'))}</strong> · v{int(asset.get('latest_version_no') or 1)} · {academic_access.esc(ref)}</p><p><small>{academic_access.esc(asset.get('tags'))}</small></p><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/assets/{int(asset['id'])}">Version history</a><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/versions/{int(asset['latest_version_id'])}/download">Open latest</a></article>''')
+        portfolio_cards = "".join(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(p.get('status'))}</p><h3>{academic_access.esc(p.get('title'))}</h3><p>{academic_access.esc(p.get('accreditor'))} · {academic_access.esc(p.get('review_period'))}</p><a class="studio-button" href="/faculty/programs/{program_id}/evidence/portfolios/{int(p['id'])}">Open portfolio</a></article>''' for p in portfolios) or '<section class="studio-empty">No accreditation portfolios yet.</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="institutional-evidence-repository-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}">Program Outcomes & Accreditation</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Institutional Evidence Repository & Accreditation Portfolio</p><h2>{academic_access.esc(program.get('program_code'))}: {academic_access.esc(program.get('title'))}</h2><p>Preserve versioned institutional evidence, map it to standards and assessment work, and assemble review-ready accreditation portfolios without exposing learner records.</p></div></header>{manage}<section class="studio-section"><h2>Evidence repository</h2><div class="studio-grid">{''.join(cards) or '<section class="studio-empty">No evidence has been stored for this program.</section>'}</div></section><section class="studio-section"><h2>Accreditation portfolios</h2><div class="studio-grid">{portfolio_cards}</div></section><section class="studio-panel"><p><strong>Privacy:</strong> this repository is restricted to authorized program personnel and platform reviewers. Evidence packages should be de-identified before upload whenever learner work or other sensitive records are involved.</p><p><strong>Scope:</strong> NUVEDRA organizes evidence for institutional review; it does not determine or certify accreditation status.</p></section></main>'''
+        return academic_access.portal_page("Institutional Evidence Repository", body, user)
+
+    @app.post("/faculty/programs/{program_id}/evidence/assets", response_model=None)
+    async def create_evidence(program_id: int, request: Request, title: str = Form(...), evidence_type: str = Form(...), description: str = Form(""), tags: str = Form(""), standard_code: str = Form(""), criterion_code: str = Form(""), cycle_id: str = Form(""), program_outcome_id: str = Form(""), improvement_action_id: str = Form(""), source_url: str = Form(""), change_note: str = Form("Initial evidence version"), upload: UploadFile | None = File(None)):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence")
+        if isinstance(user, RedirectResponse): return user
+        clean_title = title.strip(); kind = evidence_type.strip().lower()
+        if not clean_title: raise HTTPException(400, "Evidence title is required.")
+        if kind not in EVIDENCE_TYPES: raise HTTPException(400, "Unsupported evidence type.")
+        url = _safe_url(source_url)
+        data: bytes | None = None; file_name = ""; mime_type = ""
+        if upload and upload.filename:
+            file_name = PurePath(upload.filename).name
+            if PurePath(file_name).suffix.lower() not in ALLOWED_EXTENSIONS:
+                raise HTTPException(400, "This file extension is not allowed in the institutional evidence repository.")
+            data = await upload.read(MAX_UPLOAD_BYTES + 1)
+            if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(413, "The uploaded evidence exceeds the 25 MB limit.")
+            mime_type = str(upload.content_type or "application/octet-stream")
+        if data is None and not url: raise HTTPException(400, "Upload an evidence file or provide an external URL.")
+        cycle = int(cycle_id) if cycle_id.isdigit() else None
+        outcome = int(program_outcome_id) if program_outcome_id.isdigit() else None
+        action = int(improvement_action_id) if improvement_action_id.isdigit() else None
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _validate_context(conn, program_id, cycle, outcome, action)
+            now = utcnow()
+            asset_id = _insert_id(conn, "INSERT INTO nuvedra_evidence_assets (title,description,evidence_type,tags,status,created_by,created_at,updated_at) VALUES (?,?,?,?,'active',?,?,?)", (clean_title, description.strip(), kind, tags.strip(), user["email"], now, now))
+            _insert_id(conn, "INSERT INTO nuvedra_evidence_versions (asset_id,version_no,file_name,mime_type,file_size,file_bytes,source_url,change_note,created_by,created_at) VALUES (?,1,?,?,?,?,?,?,?,?)", (asset_id, file_name or None, mime_type or None, len(data or b""), data, url or None, change_note.strip(), user["email"], now))
+            execute(conn, "INSERT INTO nuvedra_evidence_links (asset_id,program_id,cycle_id,program_outcome_id,improvement_action_id,standard_code,criterion_code,linked_by,linked_at) VALUES (?,?,?,?,?,?,?,?,?)", (asset_id, program_id, cycle, outcome, action, standard_code.strip(), criterion_code.strip(), user["email"], now))
+            audit(conn, user["email"], "institutional_evidence_created", "evidence_asset", str(asset_id), f"program={program_id}; type={kind}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/assets/{asset_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/evidence/assets/{asset_id}", response_class=HTMLResponse, response_model=None)
+    async def evidence_detail(program_id: int, asset_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/assets/{asset_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            asset = _program_asset(conn, program_id, asset_id)
+            versions = rows(execute(conn, "SELECT * FROM nuvedra_evidence_versions WHERE asset_id=? ORDER BY version_no DESC,id DESC", (asset_id,)))
+            ref = _ref_label(conn, asset)
+        can_manage = str(access.get("program_role")) == "coordinator"
+        version_rows = "".join(f'''<tr><td>v{int(v.get('version_no') or 1)}</td><td>{academic_access.esc(v.get('file_name') or v.get('source_url') or 'Evidence resource')}</td><td>{academic_access.esc(v.get('change_note'))}</td><td>{academic_access.esc(v.get('created_by'))}</td><td>{academic_access.esc(v.get('created_at'))}</td><td><a href="/faculty/programs/{program_id}/evidence/versions/{int(v['id'])}/download">Open</a></td></tr>''' for v in versions)
+        add_version = ""
+        if can_manage:
+            add_version = f'''<section class="studio-panel"><h3>Add new version</h3><form method="post" action="/faculty/programs/{program_id}/evidence/assets/{asset_id}/versions" enctype="multipart/form-data" class="studio-form"><label>External URL (optional)<input type="url" name="source_url"></label><label>Or upload file (max 25 MB)<input type="file" name="upload" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.png,.jpg,.jpeg,.webp,.zip"></label><label>Change note<input name="change_note" maxlength="300" required placeholder="Updated policy approved by faculty"></label><button class="studio-button">Store new version</button></form></section>'''
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="institutional-evidence-version-history-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}/evidence">Evidence Repository</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(asset.get('standard_code') or 'Unmapped')} · {academic_access.esc(asset.get('criterion_code') or 'No criterion')}</p><h2>{academic_access.esc(asset.get('title'))}</h2><p>{academic_access.esc(asset.get('description'))}</p><p>{academic_access.esc(ref)}</p></div></header>{add_version}<section class="studio-panel"><h3>Version history</h3><div style="overflow:auto"><table><thead><tr><th>Version</th><th>Resource</th><th>Change note</th><th>Stored by</th><th>Date</th><th>Access</th></tr></thead><tbody>{version_rows}</tbody></table></div></section><section class="studio-panel"><p>Existing accreditation portfolios pin a specific evidence version. Uploading a newer version does not rewrite historical or frozen portfolio evidence.</p></section></main>'''
+        return academic_access.portal_page("Evidence version history", body, user)
+
+    @app.post("/faculty/programs/{program_id}/evidence/assets/{asset_id}/versions", response_model=None)
+    async def add_evidence_version(program_id: int, asset_id: int, request: Request, source_url: str = Form(""), change_note: str = Form(...), upload: UploadFile | None = File(None)):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/assets/{asset_id}")
+        if isinstance(user, RedirectResponse): return user
+        url = _safe_url(source_url); data: bytes | None = None; file_name = ""; mime_type = ""
+        if upload and upload.filename:
+            file_name = PurePath(upload.filename).name
+            if PurePath(file_name).suffix.lower() not in ALLOWED_EXTENSIONS: raise HTTPException(400, "This file extension is not allowed in the institutional evidence repository.")
+            data = await upload.read(MAX_UPLOAD_BYTES + 1)
+            if len(data) > MAX_UPLOAD_BYTES: raise HTTPException(413, "The uploaded evidence exceeds the 25 MB limit.")
+            mime_type = str(upload.content_type or "application/octet-stream")
+        if data is None and not url: raise HTTPException(400, "Upload an evidence file or provide an external URL.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            _program_asset(conn, program_id, asset_id)
+            latest = _latest_version(conn, asset_id); version_no = int(latest["version_no"]) + 1; now = utcnow()
+            _insert_id(conn, "INSERT INTO nuvedra_evidence_versions (asset_id,version_no,file_name,mime_type,file_size,file_bytes,source_url,change_note,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (asset_id, version_no, file_name or None, mime_type or None, len(data or b""), data, url or None, change_note.strip(), user["email"], now))
+            execute(conn, "UPDATE nuvedra_evidence_assets SET updated_at=? WHERE id=?", (now, asset_id))
+            audit(conn, user["email"], "institutional_evidence_version_added", "evidence_asset", str(asset_id), f"v{version_no}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/assets/{asset_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/evidence/versions/{version_id}/download", response_model=None)
+    async def download_evidence(program_id: int, version_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/versions/{version_id}/download")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._program_access(conn, request, program_id, user["email"])
+            version = _version(conn, program_id, version_id)
+        if version.get("file_bytes") is not None:
+            filename = str(version.get("file_name") or f"evidence-v{version.get('version_no')}")
+            return Response(content=bytes(version["file_bytes"]), media_type=str(version.get("mime_type") or "application/octet-stream"), headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"})
+        url = str(version.get("source_url") or "")
+        if not url: raise HTTPException(404, "Evidence version has no file or URL.")
+        return RedirectResponse(url, status_code=307)
+
+    @app.post("/faculty/programs/{program_id}/evidence/portfolios", response_model=None)
+    async def create_portfolio(program_id: int, request: Request, title: str = Form(...), accreditor: str = Form(""), review_period: str = Form(""), description: str = Form("")):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence")
+        if isinstance(user, RedirectResponse): return user
+        clean = title.strip()
+        if not clean: raise HTTPException(400, "Portfolio title is required.")
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            now = utcnow(); portfolio_id = _insert_id(conn, "INSERT INTO nuvedra_accreditation_portfolios (program_id,title,accreditor,review_period,description,status,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'draft',?,?,?)", (program_id, clean, accreditor.strip(), review_period.strip(), description.strip(), user["email"], now, now))
+            audit(conn, user["email"], "accreditation_portfolio_created", "accreditation_portfolio", str(portfolio_id), clean, request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}", response_class=HTMLResponse, response_model=None)
+    async def portfolio_detail(program_id: int, portfolio_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = program_outcomes._program_access(conn, request, program_id, user["email"])
+            program = program_outcomes._program(conn, program_id); portfolio = _portfolio(conn, program_id, portfolio_id)
+            items = _portfolio_items(conn, portfolio_id); assets = _program_assets(conn, program_id)
+        can_manage = str(access.get("program_role")) == "coordinator" and str(portfolio.get("status")) == "draft"
+        asset_options = "".join(f'<option value="{int(a["id"])}">{academic_access.esc(a.get("standard_code") or "Unmapped")} · {academic_access.esc(a.get("criterion_code") or "—")} · {academic_access.esc(a.get("title"))} · latest v{int(a.get("latest_version_no") or 1)}</option>' for a in assets)
+        manage = ""
+        if can_manage:
+            manage = f'''<section class="studio-grid"><article class="studio-panel"><h3>Add or refresh portfolio evidence</h3><form method="post" action="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/items" class="studio-form"><label>Evidence<select name="asset_id" required>{asset_options}</select></label><label>Narrative / Reviewer note<textarea name="narrative" rows="3"></textarea></label><label>Position<input name="position" type="number" min="1" value="1"></label><button class="studio-button">Pin latest version</button></form><p><small>Submitting an item already in this draft portfolio refreshes its pinned version to the latest stored evidence version.</small></p></article><article class="studio-panel"><h3>Freeze review package</h3><form method="post" action="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/freeze"><p>Freezing makes the portfolio read-only and preserves all pinned evidence versions for institutional review.</p><button class="studio-button">Freeze portfolio</button></form></article></section>'''
+        item_rows = "".join(f'''<tr><td>{academic_access.esc(x.get('standard_code') or '—')}</td><td>{academic_access.esc(x.get('criterion_code') or '—')}</td><td><strong>{academic_access.esc(x.get('title'))}</strong><br><small>{academic_access.esc(x.get('evidence_type'))}</small></td><td>v{int(x.get('version_no') or 1)}</td><td>{academic_access.esc(x.get('narrative') or '—')}</td><td><a href="/faculty/programs/{program_id}/evidence/versions/{int(x['evidence_version_id'])}/download">Open evidence</a></td></tr>''' for x in items) or '<tr><td colspan="6">No evidence has been added to this portfolio.</td></tr>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="accreditation-evidence-portfolio-v1"><nav class="studio-breadcrumbs"><a href="/faculty/programs/{program_id}/evidence">Evidence Repository</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">{academic_access.esc(portfolio.get('status'))} accreditation evidence portfolio</p><h2>{academic_access.esc(portfolio.get('title'))}</h2><p>{academic_access.esc(program.get('program_code'))}: {academic_access.esc(program.get('title'))}</p><p>{academic_access.esc(portfolio.get('accreditor'))} · {academic_access.esc(portfolio.get('review_period'))}</p><p>{academic_access.esc(portfolio.get('description'))}</p></div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv">Portfolio CSV</a><button type="button" class="studio-button studio-button--quiet" onclick="window.print()">Print / Save PDF</button></div></header>{manage}<section class="studio-panel"><h3>Evidence package</h3><div style="overflow:auto"><table><thead><tr><th>Standard</th><th>Criterion</th><th>Evidence</th><th>Pinned version</th><th>Narrative</th><th>Access</th></tr></thead><tbody>{item_rows}</tbody></table></div></section><section class="studio-panel"><p><strong>Version integrity:</strong> each portfolio row points to a specific evidence version. Newer repository versions do not silently replace evidence already pinned here.</p><p><strong>Privacy:</strong> the portfolio contains institutional evidence selected by authorized personnel and does not automatically export learner records from NUVEDRA.</p></section></main>'''
+        return academic_access.portal_page("Accreditation Evidence Portfolio", body, user)
+
+    @app.post("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/items", response_model=None)
+    async def add_portfolio_item(program_id: int, portfolio_id: int, request: Request, asset_id: int = Form(...), narrative: str = Form(""), position: int = Form(1)):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            portfolio = _portfolio(conn, program_id, portfolio_id); _require_draft(portfolio); _program_asset(conn, program_id, asset_id)
+            latest = _latest_version(conn, asset_id); existing = rows(execute(conn, "SELECT id FROM nuvedra_accreditation_portfolio_items WHERE portfolio_id=? AND asset_id=?", (portfolio_id, asset_id)))
+            if existing:
+                execute(conn, "UPDATE nuvedra_accreditation_portfolio_items SET evidence_version_id=?,narrative=?,position=?,added_by=?,added_at=? WHERE id=?", (int(latest["id"]), narrative.strip(), max(1, position), user["email"], utcnow(), int(existing[0]["id"])))
+            else:
+                execute(conn, "INSERT INTO nuvedra_accreditation_portfolio_items (portfolio_id,asset_id,evidence_version_id,narrative,position,added_by,added_at) VALUES (?,?,?,?,?,?,?)", (portfolio_id, asset_id, int(latest["id"]), narrative.strip(), max(1, position), user["email"], utcnow()))
+            audit(conn, user["email"], "accreditation_portfolio_evidence_pinned", "accreditation_portfolio", str(portfolio_id), f"asset={asset_id}; version={latest['version_no']}", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}", status_code=303)
+
+    @app.post("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/freeze", response_model=None)
+    async def freeze_portfolio(program_id: int, portfolio_id: int, request: Request):
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._require_manage(conn, request, program_id, user["email"])
+            portfolio = _portfolio(conn, program_id, portfolio_id); _require_draft(portfolio)
+            if not rows(execute(conn, "SELECT id FROM nuvedra_accreditation_portfolio_items WHERE portfolio_id=? LIMIT 1", (portfolio_id,))):
+                raise HTTPException(409, "Add at least one evidence item before freezing the portfolio.")
+            now = utcnow(); execute(conn, "UPDATE nuvedra_accreditation_portfolios SET status='frozen',frozen_at=?,frozen_by=?,updated_at=? WHERE id=?", (now, user["email"], now, portfolio_id))
+            audit(conn, user["email"], "accreditation_portfolio_frozen", "accreditation_portfolio", str(portfolio_id), "review package frozen", request.client.host if request.client else "")
+        return RedirectResponse(f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}", status_code=303)
+
+    @app.get("/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv", response_model=None)
+    async def portfolio_csv(program_id: int, portfolio_id: int, request: Request):
+        import csv
+        import io
+        user = _user(request, f"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            program_outcomes._program_access(conn, request, program_id, user["email"])
+            portfolio = _portfolio(conn, program_id, portfolio_id); items = _portfolio_items(conn, portfolio_id)
+        stream = io.StringIO(); writer = csv.writer(stream)
+        writer.writerow(["Standard", "Criterion", "Evidence title", "Evidence type", "Pinned version", "Narrative", "File or URL"])
+        for item in items:
+            writer.writerow([item.get("standard_code"), item.get("criterion_code"), item.get("title"), item.get("evidence_type"), item.get("version_no"), item.get("narrative"), item.get("file_name") or item.get("source_url") or ""])
+        filename = f"{str(portfolio.get('title') or 'accreditation-portfolio').replace(' ', '_')}.csv"
+        return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    print("NUVEDRA Institutional Evidence Repository & Accreditation Portfolio v1 registered: protected versioned evidence, standards mapping, assessment context, pinned review portfolios, freeze controls, and CSV/print review packages.", flush=True)
