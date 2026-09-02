@@ -1,0 +1,339 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+from urllib.parse import quote
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+import app.microsoft365_integration as m365
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+TEAM_ID_RE = re.compile(r"^[A-Za-z0-9._-]{8,160}$")
+REQUIRED_EDUCATION_SCOPES = {
+    "User.ReadBasic.All",
+    "Team.ReadBasic.All",
+    "TeamMember.ReadWrite.All",
+    "Channel.ReadBasic.All",
+    "Channel.Create",
+}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _insert_id(conn: Any, sql: str, params: tuple[Any, ...]) -> int:
+    if database_url().startswith("postgres"):
+        row = execute(conn, sql + " RETURNING id", params).fetchone()
+        return int(row[0])
+    return int(execute(conn, sql, params).lastrowid)
+
+
+def ensure_microsoft365_education_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_course_teams (
+            id {pk}, course_id INTEGER NOT NULL UNIQUE, team_id TEXT NOT NULL,
+            display_name TEXT NOT NULL, web_url TEXT, status TEXT NOT NULL DEFAULT 'active',
+            linked_by TEXT NOT NULL, linked_at TEXT NOT NULL,
+            last_synced_at TEXT, last_sync_json TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_team_sync_log (
+            id {pk}, course_id INTEGER NOT NULL, team_id TEXT NOT NULL,
+            actor_email TEXT NOT NULL, action TEXT NOT NULL,
+            summary_json TEXT, created_at TEXT NOT NULL
+        )""")
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _admin(request: Request) -> dict[str, Any]:
+    user = admin_console.session_user(request)
+    if not user or str(user.get("role") or "") not in {"superadmin", "course_admin"}:
+        raise HTTPException(403, "Platform administration permission is required.")
+    return user
+
+
+def _team_id(value: str) -> str:
+    clean = str(value or "").strip()
+    if not TEAM_ID_RE.fullmatch(clean):
+        raise HTTPException(400, "Microsoft Team identifier is invalid.")
+    return clean
+
+
+def _team_link(conn: Any, course_id: int) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_course_teams WHERE course_id=? AND status='active'", (course_id,)))
+    return found[0] if found else None
+
+
+def _configured_scopes() -> set[str]:
+    raw = str(os.getenv("MICROSOFT_SCOPES", m365.DEFAULT_SCOPES) or "")
+    return {part.strip() for part in raw.split() if part.strip()}
+
+
+def _scope_report() -> tuple[list[str], list[str]]:
+    configured = _configured_scopes()
+    present = sorted(REQUIRED_EDUCATION_SCOPES.intersection(configured))
+    missing = sorted(REQUIRED_EDUCATION_SCOPES.difference(configured))
+    return present, missing
+
+
+def _course_members(conn: Any, course_id: int) -> list[dict[str, Any]]:
+    allowed = set(academic_access.AUTHOR_ROLES) | {"student"}
+    data = rows(execute(conn, """SELECT lower(user_email) AS email,course_role
+        FROM nexus_admin_enrollments WHERE course_id=? AND status='active'
+        ORDER BY course_role,lower(user_email)""", (course_id,)))
+    return [row for row in data if str(row.get("course_role") or "") in allowed]
+
+
+def _member_email(member: dict[str, Any]) -> str:
+    return str(member.get("email") or member.get("userPrincipalName") or "").strip().lower()
+
+
+def _target_owner(role: str) -> bool:
+    return role == "instructor"
+
+
+async def _team_members(email: str, team_id: str) -> list[dict[str, Any]]:
+    payload = await m365._graph_json(email, "GET", f"/teams/{_team_id(team_id)}/members", params={"$top": 200})
+    if payload.get("@odata.nextLink"):
+        raise HTTPException(409, "This Team has more than 200 members. Membership synchronization is paused until paginated Graph membership support is enabled.")
+    values = payload.get("value", [])
+    return values if isinstance(values, list) else []
+
+
+async def _resolve_graph_user(email: str, target_email: str) -> dict[str, Any]:
+    encoded = quote(target_email.strip().lower(), safe="")
+    return await m365._graph_json(email, "GET", f"/users/{encoded}", params={"$select": "id,displayName,mail,userPrincipalName"})
+
+
+def _member_payload(user_id: str, owner: bool) -> dict[str, Any]:
+    return {
+        "@odata.type": "#microsoft.graph.aadUserConversationMember",
+        "roles": ["owner"] if owner else [],
+        "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{user_id}')",
+    }
+
+
+async def _membership_plan(conn: Any, actor_email: str, course_id: int, team: dict[str, Any]) -> dict[str, Any]:
+    target = _course_members(conn, course_id)
+    current = await _team_members(actor_email, str(team["team_id"]))
+    by_email = {_member_email(member): member for member in current if _member_email(member)}
+    missing: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
+    role_mismatches: list[dict[str, Any]] = []
+    for row in target:
+        email = str(row["email"]).lower()
+        role = str(row["course_role"])
+        member = by_email.get(email)
+        if not member:
+            missing.append({"email": email, "course_role": role, "teams_role": "owner" if _target_owner(role) else "member"})
+            continue
+        roles = {str(x).lower() for x in (member.get("roles") or [])}
+        matched.append({"email": email, "course_role": role, "teams_roles": sorted(roles)})
+        if _target_owner(role) and "owner" not in roles:
+            role_mismatches.append({"email": email, "expected": "owner", "actual": sorted(roles) or ["member"]})
+    unmanaged = [
+        {"email": _member_email(member) or "(no email exposed)", "display_name": member.get("displayName")}
+        for member in current
+        if not _member_email(member) or _member_email(member) not in {str(x["email"]).lower() for x in target}
+    ]
+    return {
+        "target_count": len(target),
+        "team_member_count": len(current),
+        "missing": missing,
+        "matched": matched,
+        "role_mismatches": role_mismatches,
+        "unmanaged": unmanaged,
+        "sync_mode": "additive",
+    }
+
+
+def _record_sync(conn: Any, course_id: int, team_id: str, actor_email: str, action: str, summary: dict[str, Any]) -> None:
+    now = utcnow()
+    encoded = json.dumps(summary, ensure_ascii=False)
+    execute(conn, "INSERT INTO nuvedra_microsoft_team_sync_log (course_id,team_id,actor_email,action,summary_json,created_at) VALUES (?,?,?,?,?,?)",
+            (course_id, team_id, actor_email.lower(), action, encoded, now))
+    execute(conn, "UPDATE nuvedra_microsoft_course_teams SET last_synced_at=?,last_sync_json=? WHERE course_id=? AND status='active'",
+            (now, encoded, course_id))
+
+
+def register_microsoft365_education_v2(app: FastAPI) -> None:
+    ensure_microsoft365_education_schema()
+
+    @app.get("/admin/microsoft365", response_class=HTMLResponse, response_model=None)
+    async def microsoft365_admin(request: Request):
+        admin = _admin(request)
+        cfg = m365._config()
+        present, missing = _scope_report()
+        with db() as conn:
+            connections = rows(execute(conn, "SELECT user_email,tenant_id,display_name,expires_at,updated_at FROM nuvedra_microsoft_connections ORDER BY user_email"))
+            teams = rows(execute(conn, """SELECT t.*,c.course_code,c.title FROM nuvedra_microsoft_course_teams t
+                JOIN nexus_admin_courses c ON c.id=t.course_id WHERE t.status='active' ORDER BY c.course_code,c.id"""))
+        config_rows = [
+            ("MICROSOFT_CLIENT_ID", bool(cfg.get("client_id"))),
+            ("MICROSOFT_CLIENT_SECRET", bool(cfg.get("client_secret"))),
+            ("MICROSOFT_TENANT_ID", bool(cfg.get("tenant"))),
+            ("MICROSOFT_REDIRECT_URI", bool(cfg.get("redirect_uri"))),
+            ("MICROSOFT_TOKEN_ENCRYPTION_KEY", bool(os.getenv("MICROSOFT_TOKEN_ENCRYPTION_KEY", "").strip())),
+        ]
+        config_html = "".join(f'<tr><td>{academic_access.esc(name)}</td><td>{"Configured" if ready else "Missing"}</td></tr>' for name, ready in config_rows)
+        team_html = "".join(f'<tr><td>{academic_access.esc(x.get("course_code"))}</td><td>{academic_access.esc(x.get("display_name"))}</td><td>{academic_access.esc(x.get("team_id"))}</td><td>{academic_access.esc(x.get("last_synced_at") or "Never")}</td></tr>' for x in teams) or '<tr><td colspan="4">No Teams are linked to NUVEDRA courses.</td></tr>'
+        connection_html = "".join(f'<tr><td>{academic_access.esc(x.get("user_email"))}</td><td>{academic_access.esc(x.get("tenant_id"))}</td><td>{academic_access.esc(x.get("expires_at"))}</td></tr>' for x in connections) or '<tr><td colspan="3">No Microsoft accounts are connected.</td></tr>'
+        scope_html = "".join(f'<li>{academic_access.esc(scope)} — configured</li>' for scope in present) + "".join(f'<li><strong>{academic_access.esc(scope)} — add for Teams Education v2</strong></li>' for scope in missing)
+        tenant_warning = '<p class="studio-notice"><strong>Production recommendation:</strong> replace the generic organizations tenant with the institution tenant GUID before institutional rollout.</p>' if str(cfg.get("tenant")) == "organizations" else ""
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-institutional-admin-v2"><nav class="studio-breadcrumbs"><a href="/admin">Admin</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Institutional Setup</p><h2>Entra ID, Graph and Teams readiness</h2><p>Review server configuration and the additional delegated Graph permissions used by course-level Microsoft Teams synchronization. Secret values are never rendered here.</p></div></header>{tenant_warning}<section class="studio-grid"><article class="studio-panel"><h3>Environment readiness</h3><table><tbody>{config_html}</tbody></table><p><strong>Tenant:</strong> {academic_access.esc(cfg.get('tenant'))}</p><p><strong>Redirect URI:</strong> {academic_access.esc(cfg.get('redirect_uri'))}</p></article><article class="studio-panel"><h3>Teams Education v2 delegated permissions</h3><ul>{scope_html}</ul><p><small>These permissions can require Microsoft tenant administrator consent. NUVEDRA cannot grant tenant consent itself.</small></p></article></section><section class="studio-panel"><h3>Connected Microsoft identities</h3><table><thead><tr><th>User</th><th>Tenant</th><th>Access token expiry</th></tr></thead><tbody>{connection_html}</tbody></table></section><section class="studio-panel"><h3>Linked course Teams</h3><table><thead><tr><th>Course</th><th>Team</th><th>Team ID</th><th>Last sync</th></tr></thead><tbody>{team_html}</tbody></table></section><section class="studio-panel"><p><strong>Security model:</strong> v2 links an existing institutional Team to a course. Membership synchronization is additive by default: NUVEDRA adds missing enrolled users but does not delete external Team members or silently change existing Team roles.</p></section></main>'''
+        return admin_console.page("Microsoft 365 Institutional Setup", body, admin)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education", response_class=HTMLResponse, response_model=None)
+    async def course_teams_workspace(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            team = _team_link(conn, course_id)
+            connection = m365._connection(conn, user["email"])
+            logs = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_team_sync_log WHERE course_id=? ORDER BY id DESC LIMIT 8", (course_id,)))
+        present, missing = _scope_report()
+        connection_html = m365._connection_panel(connection, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education")
+        link_form = f'''<article class="studio-panel"><h3>Link an existing Microsoft Team</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/team"><label>Microsoft Team ID<input name="team_id" required maxlength="160" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></label><button class="studio-button">Verify and link Team</button></form><p><small>NUVEDRA v2 intentionally links an existing institutional Team rather than creating tenant resources automatically.</small></p></article>'''
+        team_html = link_form
+        if team:
+            log_html = "".join(f'<li>{academic_access.esc(x.get("created_at"))} · {academic_access.esc(x.get("action"))} · {academic_access.esc(x.get("actor_email"))}</li>' for x in logs) or '<li>No synchronization has been run.</li>'
+            team_html = f'''<section class="studio-grid"><article class="studio-panel"><p class="studio-eyebrow">Linked Team</p><h3>{academic_access.esc(team.get('display_name'))}</h3><p><code>{academic_access.esc(team.get('team_id'))}</code></p>{f'<p><a class="studio-button" href="{academic_access.esc(team.get("web_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open Microsoft Teams</a></p>' if team.get('web_url') else ''}<form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/team"><label>Replace linked Team ID<input name="team_id" required value="{academic_access.esc(team.get('team_id'), attr=True)}"></label><button class="studio-button studio-button--quiet">Verify / update link</button></form></article><article class="studio-panel"><h3>Additive membership sync</h3><p>Preview compares active NUVEDRA instructors/authors/students with Microsoft Team membership. Observers are not provisioned. Existing external Team members are never removed.</p><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/plan">Preview sync</a><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/sync"><button class="studio-button">Add missing NUVEDRA members</button></form></article></section><section class="studio-panel"><h3>Create standard Team channel</h3><form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/channels"><label>Channel name<input name="display_name" required maxlength="50"></label><label>Description<textarea name="description" rows="2" maxlength="500"></textarea></label><button class="studio-button">Create channel</button></form></section><section class="studio-panel"><h3>Recent synchronization activity</h3><ul>{log_html}</ul></section>'''
+        permission_note = '<p class="studio-notice"><strong>Additional Graph scopes still missing from MICROSOFT_SCOPES:</strong> '+academic_access.esc(", ".join(missing))+'</p>' if missing else '<p class="studio-notice"><strong>Scope configuration:</strong> all v2 Teams scopes are listed in MICROSOFT_SCOPES. Tenant administrator consent may still be required.</p>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-education-v2"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365">Microsoft 365</a><span> / </span><a href="{STUDIO_PREFIX}/courses/{course_id}">Course Studio</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Institutional Teams</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p>Connect the NUVEDRA course to an existing institutional Microsoft Team, preview roster differences, add missing members safely, and create standard course channels.</p></div></header>{permission_note}<section class="studio-grid">{connection_html}</section>{team_html}<section class="studio-panel"><p><strong>Role mapping:</strong> NUVEDRA instructor → Teams owner when newly added; other author roles and students → Teams member; observer → not provisioned. Existing Teams roles are reported but are not silently changed.</p></section></main>'''
+        return academic_access.portal_page("Microsoft 365 Institutional Teams", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education/team", response_model=None)
+    async def link_team(course_id: int, request: Request, team_id: str = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education")
+        if isinstance(user, RedirectResponse): return user
+        clean_id = _team_id(team_id)
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+        team = await m365._graph_json(user["email"], "GET", f"/teams/{clean_id}", params={"$select": "id,displayName,webUrl"})
+        name = str(team.get("displayName") or "Microsoft Team").strip()
+        web_url = str(team.get("webUrl") or "").strip()
+        now = utcnow()
+        with db() as conn:
+            existing = _team_link(conn, course_id)
+            if existing:
+                execute(conn, "UPDATE nuvedra_microsoft_course_teams SET team_id=?,display_name=?,web_url=?,linked_by=?,linked_at=?,last_synced_at=NULL,last_sync_json=NULL WHERE course_id=?",
+                        (clean_id, name, web_url or None, user["email"], now, course_id))
+            else:
+                execute(conn, "INSERT INTO nuvedra_microsoft_course_teams (course_id,team_id,display_name,web_url,status,linked_by,linked_at,last_synced_at,last_sync_json) VALUES (?,?,?,?,'active',?,?,NULL,NULL)",
+                        (course_id, clean_id, name, web_url or None, user["email"], now))
+            audit(conn, user["email"], "microsoft365_team_linked", "course", str(course_id), clean_id, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education/plan", response_class=HTMLResponse, response_model=None)
+    async def membership_plan(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education/plan")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            team = _team_link(conn, course_id)
+            if not team: raise HTTPException(409, "Link a Microsoft Team before previewing membership.")
+            plan = await _membership_plan(conn, user["email"], course_id, team)
+        missing_html = "".join(f'<li>{academic_access.esc(x["email"])} · {academic_access.esc(x["course_role"])} → {academic_access.esc(x["teams_role"])}</li>' for x in plan["missing"]) or '<li>No missing NUVEDRA members.</li>'
+        mismatch_html = "".join(f'<li>{academic_access.esc(x["email"])} · expected owner; existing Team role is preserved</li>' for x in plan["role_mismatches"]) or '<li>No owner-role mismatches detected.</li>'
+        unmanaged_html = "".join(f'<li>{academic_access.esc(x["email"])} · {academic_access.esc(x.get("display_name"))}</li>' for x in plan["unmanaged"]) or '<li>No external/unmanaged Team members detected.</li>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-membership-plan-v2"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education">Institutional Teams</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Additive roster preview</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(team.get('display_name'))}</h2><p>Target NUVEDRA roster: {plan['target_count']} · Microsoft Team members inspected: {plan['team_member_count']}</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>Missing — will be added</h3><ul>{missing_html}</ul></article><article class="studio-panel"><h3>Existing role differences — informational</h3><ul>{mismatch_html}</ul></article><article class="studio-panel"><h3>External/unmanaged — preserved</h3><ul>{unmanaged_html}</ul></article></section><section class="studio-panel"><p><strong>No destructive sync:</strong> this v2 plan does not remove Microsoft Team members and does not demote or promote existing members automatically.</p></section></main>'''
+        return academic_access.portal_page("Microsoft Teams roster preview", body, user)
+
+    @app.get(f"/api/microsoft365/courses/{{course_id}}/team-membership-plan", response_class=JSONResponse)
+    async def membership_plan_json(course_id: int, request: Request):
+        user = _user(request, "/portal")
+        if isinstance(user, RedirectResponse): raise HTTPException(401, "Academic sign-in required.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            team = _team_link(conn, course_id)
+            if not team: raise HTTPException(409, "Link a Microsoft Team first.")
+            plan = await _membership_plan(conn, user["email"], course_id, team)
+        return plan
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education/sync", response_model=None)
+    async def sync_members(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            team = _team_link(conn, course_id)
+            if not team: raise HTTPException(409, "Link a Microsoft Team before synchronizing membership.")
+            plan = await _membership_plan(conn, user["email"], course_id, team)
+        added: list[dict[str, Any]] = []
+        unresolved: list[dict[str, Any]] = []
+        for target in plan["missing"]:
+            target_email = str(target["email"])
+            try:
+                graph_user = await _resolve_graph_user(user["email"], target_email)
+                user_id = str(graph_user.get("id") or "").strip()
+                if not user_id:
+                    raise HTTPException(404, "Microsoft user ID was not returned.")
+                await m365._graph_json(user["email"], "POST", f"/teams/{_team_id(str(team['team_id']))}/members", json_body=_member_payload(user_id, target["teams_role"] == "owner"))
+                added.append({"email": target_email, "teams_role": target["teams_role"], "user_id": user_id})
+            except HTTPException as exc:
+                unresolved.append({"email": target_email, "status": exc.status_code, "detail": str(exc.detail)[:300]})
+        summary = {
+            "mode": "additive",
+            "target_count": plan["target_count"],
+            "added": added,
+            "unresolved": unresolved,
+            "role_mismatches_preserved": plan["role_mismatches"],
+            "unmanaged_preserved": len(plan["unmanaged"]),
+        }
+        with db() as conn:
+            _record_sync(conn, course_id, str(team["team_id"]), user["email"], "membership_additive_sync", summary)
+            audit(conn, user["email"], "microsoft365_team_membership_synced", "course", str(course_id), json.dumps({"added": len(added), "unresolved": len(unresolved)}), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education/channels", response_model=None)
+    async def create_channel(course_id: int, request: Request, display_name: str = Form(...), description: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education")
+        if isinstance(user, RedirectResponse): return user
+        name = display_name.strip()
+        if not name or len(name) > 50: raise HTTPException(400, "Channel name is required and must be 50 characters or fewer.")
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            team = _team_link(conn, course_id)
+            if not team: raise HTTPException(409, "Link a Microsoft Team before creating channels.")
+        channel = await m365._graph_json(user["email"], "POST", f"/teams/{_team_id(str(team['team_id']))}/channels", json_body={"displayName": name, "description": description.strip()[:500], "membershipType": "standard"})
+        summary = {"channel_id": channel.get("id"), "display_name": channel.get("displayName") or name}
+        with db() as conn:
+            _record_sync(conn, course_id, str(team["team_id"]), user["email"], "channel_created", summary)
+            audit(conn, user["email"], "microsoft365_team_channel_created", "course", str(course_id), name, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education", status_code=303)
+
+    @app.get("/learn/courses/{course_id}/microsoft365", response_class=HTMLResponse, response_model=None)
+    async def student_microsoft365(course_id: int, request: Request):
+        user = _user(request, f"/learn/courses/{course_id}/microsoft365")
+        if isinstance(user, RedirectResponse): return user
+        with db() as conn:
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active": raise HTTPException(403, "This course is not active.")
+            team = _team_link(conn, course_id)
+        team_html = '<section class="studio-empty">This course does not have an institutional Microsoft Team linked yet.</section>'
+        if team:
+            open_link = f'<a class="studio-button" href="{academic_access.esc(team.get("web_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open Microsoft Teams</a>' if team.get("web_url") else '<p>The Team is linked, but Microsoft did not provide a web URL.</p>'
+            team_html = f'<section class="studio-panel"><p class="studio-eyebrow">Microsoft Teams</p><h3>{academic_access.esc(team.get("display_name"))}</h3><p>Your access inside Microsoft Teams is controlled by the institution Microsoft 365 tenant.</p>{open_link}</section>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="student-microsoft365-v2"><nav class="studio-breadcrumbs"><a href="/learn/courses/{course_id}">Back to course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Microsoft 365</p><h2>Institutional course collaboration</h2><p>Open the Microsoft Team linked to this NUVEDRA course when your institution has provisioned access.</p></div></header>{team_html}</main>'''
+        return academic_access.portal_page("Microsoft 365 course collaboration", body, user)
+
+    print("NUVEDRA Microsoft 365 Institutional Setup & Teams Education v2 registered: admin readiness diagnostics, existing-Team linking, additive roster previews/synchronization, standard channel creation, student Team access, and non-destructive audit logging.", flush=True)
