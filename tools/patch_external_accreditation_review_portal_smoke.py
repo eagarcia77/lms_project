@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("External Accreditation Review Portal v1 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install the Microsoft 365 layer after the full academic/program stack exists.
+    from patch_microsoft365_integration_v1 import main as patch_microsoft365_integration_v1
+    patch_microsoft365_integration_v1()
+
+    from patch_microsoft365_integration_smoke import main as patch_microsoft365_integration_smoke
+    patch_microsoft365_integration_smoke()
+
 
 if __name__ == "__main__":
     main()
