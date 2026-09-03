@@ -78,13 +78,7 @@ def patch_team_creation_gate() -> None:
     if not PRODUCTION_V3.is_file():
         raise RuntimeError("Microsoft 365 Go-Live Governance v8 requires generated Production v3.")
     text = PRODUCTION_V3.read_text(encoding="utf-8")
-    import_line = "import app.microsoft365_go_live_governance_v8 as go_live\n"
-    if import_line not in text:
-        anchor = "import app.microsoft365_integration as m365\n"
-        if anchor not in text:
-            raise RuntimeError("Go-Live v8 could not locate the Production v3 import anchor.")
-        text = text.replace(anchor, anchor + import_line, 1)
-    route_anchor = '@app.post(f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/production/team", response_model=None)'
+    route_anchor = '@app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/production/team", response_model=None)'
     start = text.find(route_anchor)
     if start < 0:
         raise RuntimeError("Go-Live v8 could not locate the controlled Team creation route.")
@@ -92,10 +86,10 @@ def patch_team_creation_gate() -> None:
     role_index = text.find(role_anchor, start)
     if role_index < 0:
         raise RuntimeError("Go-Live v8 could not locate Team creation course authorization.")
-    gate = '            go_live.require_course_write_access(conn, course_id, "team_creation")\n'
+    import_gate = '            from app import microsoft365_go_live_governance_v8 as go_live\n            go_live.require_course_write_access(conn, course_id, "team_creation")\n'
     insert_at = role_index + len(role_anchor)
-    if gate not in text[start:start + 3000]:
-        text = text[:insert_at] + gate + text[insert_at:]
+    if import_gate not in text[start:start + 3000]:
+        text = text[:insert_at] + import_gate + text[insert_at:]
     PRODUCTION_V3.write_text(text, encoding="utf-8")
 
 
