@@ -29,6 +29,12 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Live Tenant Readiness & Education v5 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    from patch_microsoft365_education_sync_v6 import main as patch_microsoft365_education_sync_v6
+    patch_microsoft365_education_sync_v6()
+
+    from patch_microsoft365_education_sync_v6_smoke import main as patch_microsoft365_education_sync_v6_smoke
+    patch_microsoft365_education_sync_v6_smoke()
+
 
 if __name__ == "__main__":
     main()
