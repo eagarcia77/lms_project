@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+import app.microsoft365_consent_wizard_v7 as consent
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+ROLLOUT_MODES = {"read_only", "pilot", "production"}
+PILOT_STATES = {"approved", "validated", "revoked"}
+HIGH_IMPACT_OPERATIONS = {"team_creation", "education_assignment", "education_grade_export"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _admin(request: Request) -> dict[str, Any]:
+    user = admin_console.session_user(request)
+    if not user or str(user.get("role") or "") not in {"superadmin", "course_admin"}:
+        raise HTTPException(403, "Platform administration permission is required.")
+    return user
+
+
+def _academic_user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def ensure_microsoft365_go_live_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_go_live_profiles (
+            id {pk}, mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            acknowledgements_json TEXT NOT NULL, notes TEXT,
+            approved_by TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_pilot_courses (
+            id {pk}, course_id INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'approved', approved_by TEXT NOT NULL,
+            approved_at TEXT NOT NULL, reviewed_by TEXT, reviewed_at TEXT,
+            review_notes TEXT
+        )""")
+
+
+def _current_profile(conn: Any) -> dict[str, Any]:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_go_live_profiles WHERE status='active' ORDER BY id DESC LIMIT 1"))
+    return found[0] if found else {
+        "mode": "read_only",
+        "approved_by": "system-default",
+        "created_at": "",
+        "acknowledgements_json": "{}",
+        "notes": "No institutional rollout profile has been activated yet.",
+    }
+
+
+def _latest_consent_snapshot(conn: Any) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_consent_wizard_snapshots ORDER BY id DESC LIMIT 1"))
+    return found[0] if found else None
+
+
+def _pilot_courses(conn: Any) -> list[dict[str, Any]]:
+    return rows(execute(conn, """SELECT p.*,c.course_code,c.title,c.status AS course_status
+        FROM nuvedra_microsoft_pilot_courses p JOIN nexus_admin_courses c ON c.id=p.course_id
+        ORDER BY CASE p.status WHEN 'approved' THEN 1 WHEN 'validated' THEN 2 ELSE 3 END,c.course_code,p.course_id"""))
+
+
+def _pilot_counts(conn: Any) -> tuple[int, int]:
+    data = rows(execute(conn, """SELECT
+        SUM(CASE WHEN status IN ('approved','validated') THEN 1 ELSE 0 END) AS active_count,
+        SUM(CASE WHEN status='validated' THEN 1 ELSE 0 END) AS validated_count
+        FROM nuvedra_microsoft_pilot_courses"""))
+    row = data[0] if data else {}
+    return int(row.get("active_count") or 0), int(row.get("validated_count") or 0)
+
+
+def _readiness(conn: Any) -> dict[str, Any]:
+    config = consent._configuration()
+    snapshot = _latest_consent_snapshot(conn)
+    snapshot_status = str((snapshot or {}).get("readiness_status") or "no_snapshot")
+    active_pilots, validated_pilots = _pilot_counts(conn)
+    base_configuration = all([
+        bool(config.get("client_id_present")),
+        bool(config.get("client_secret_present")),
+        bool(config.get("specific_tenant")),
+        bool(config.get("redirect_https")),
+        bool(config.get("token_encryption_key_present")),
+    ])
+    pilot_ready = base_configuration and snapshot_status in {"ready_for_governed_enablement", "writes_enabled"}
+    production_ready = base_configuration and snapshot_status == "writes_enabled" and validated_pilots > 0
+    return {
+        "configuration": config,
+        "snapshot": snapshot,
+        "snapshot_status": snapshot_status,
+        "active_pilots": active_pilots,
+        "validated_pilots": validated_pilots,
+        "pilot_ready": pilot_ready,
+        "production_ready": production_ready,
+    }
+
+
+def rollout_status(conn: Any, course_id: int) -> dict[str, Any]:
+    profile = _current_profile(conn)
+    mode = str(profile.get("mode") or "read_only")
+    pilot = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_pilot_courses WHERE course_id=?", (course_id,)))
+    pilot_row = pilot[0] if pilot else None
+    pilot_state = str((pilot_row or {}).get("status") or "not_approved")
+    allowed = mode == "production" or (mode == "pilot" and pilot_state in {"approved", "validated"})
+    return {
+        "mode": mode,
+        "pilot_state": pilot_state,
+        "allowed": allowed,
+        "profile": profile,
+        "pilot": pilot_row,
+    }
+
+
+def require_course_write_access(conn: Any, course_id: int, operation: str) -> dict[str, Any]:
+    if operation not in HIGH_IMPACT_OPERATIONS:
+        raise HTTPException(400, "Unknown Microsoft 365 governed write operation.")
+    state = rollout_status(conn, course_id)
+    if state["allowed"]:
+        return state
+    if state["mode"] == "read_only":
+        raise HTTPException(403, "Microsoft 365 high-impact writes are in NUVEDRA read-only rollout mode. An administrator must explicitly activate a governed pilot or production rollout.")
+    raise HTTPException(403, "This course is not approved for the current Microsoft 365 pilot rollout.")
+
+
+def _acknowledged(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mode_label(mode: str) -> str:
+    return {
+        "read_only": "Read-only",
+        "pilot": "Controlled pilot",
+        "production": "Production",
+    }.get(mode, mode)
+
+
+def register_microsoft365_go_live_governance_v8(app: FastAPI) -> None:
+    ensure_microsoft365_go_live_schema()
+
+    @app.get("/admin/microsoft365/go-live", response_class=HTMLResponse, response_model=None)
+    async def microsoft365_go_live_admin(request: Request):
+        admin = _admin(request)
+        with db() as conn:
+            profile = _current_profile(conn)
+            readiness = _readiness(conn)
+            pilots = _pilot_courses(conn)
+            courses = rows(execute(conn, "SELECT id,course_code,title,status FROM nexus_admin_courses WHERE status='active' ORDER BY course_code,id"))
+        snapshot = readiness.get("snapshot") or {}
+        config = readiness["configuration"]
+        pilot_rows = "".join(
+            f'''<tr><td>{academic_access.esc(row.get('course_code'))}</td><td>{academic_access.esc(row.get('title'))}</td><td>{academic_access.esc(row.get('status'))}</td><td>{academic_access.esc(row.get('approved_by'))}</td><td>{academic_access.esc(row.get('review_notes') or '—')}</td><td><form method="post" action="/admin/microsoft365/go-live/pilots/{int(row['course_id'])}/validate" style="display:inline"><input name="review_notes" value="Pilot validation confirmed" maxlength="500"><button class="studio-button studio-button--quiet">Validate</button></form> <form method="post" action="/admin/microsoft365/go-live/pilots/{int(row['course_id'])}/revoke" style="display:inline"><button class="studio-button studio-button--quiet">Revoke</button></form></td></tr>'''
+            for row in pilots
+        ) or '<tr><td colspan="6">No pilot courses configured.</td></tr>'
+        course_options = "".join(f'<option value="{int(row["id"])}">{academic_access.esc(row.get("course_code"))} · {academic_access.esc(row.get("title"))}</option>' for row in courses)
+        acknowledgements = json.loads(str(profile.get("acknowledgements_json") or "{}")) if str(profile.get("acknowledgements_json") or "").strip() else {}
+        readiness_cards = "".join([
+            f'<article class="studio-panel"><p class="studio-eyebrow">Tenant</p><h3>{academic_access.esc(config.get("tenant") or "Not configured")}</h3><p>{"Specific institution tenant" if config.get("specific_tenant") else "Needs institution tenant"}</p></article>',
+            f'<article class="studio-panel"><p class="studio-eyebrow">Consent snapshot</p><h3>{academic_access.esc(readiness.get("snapshot_status"))}</h3><p>{academic_access.esc(snapshot.get("created_at") or "Run Consent Wizard v7 verification first.")}</p></article>',
+            f'<article class="studio-panel"><p class="studio-eyebrow">Pilot readiness</p><h3>{"Ready" if readiness.get("pilot_ready") else "Blocked"}</h3><p>{int(readiness.get("active_pilots") or 0)} active pilot course(s)</p></article>',
+            f'<article class="studio-panel"><p class="studio-eyebrow">Production readiness</p><h3>{"Ready" if readiness.get("production_ready") else "Blocked"}</h3><p>{int(readiness.get("validated_pilots") or 0)} validated pilot course(s)</p></article>',
+        ])
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-go-live-v8">
+        <nav class="studio-breadcrumbs"><a href="/admin/microsoft365/consent-wizard">Consent Wizard v7</a><span> / </span><a href="/admin/microsoft365/tenant-readiness">Tenant Readiness v5</a></nav>
+        <header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Go-Live Governance v8</p><h2>Controlled institutional rollout</h2><p>Keep high-impact Microsoft writes read-only by default, approve a limited pilot, validate operational readiness, and promote to production only after explicit institutional acknowledgement.</p></div></header>
+        <section class="studio-summary-grid">{readiness_cards}</section>
+        <section class="studio-panel"><h3>Current rollout mode: {academic_access.esc(_mode_label(str(profile.get('mode') or 'read_only')))}</h3><p><strong>Approved by:</strong> {academic_access.esc(profile.get('approved_by'))} · {academic_access.esc(profile.get('created_at'))}</p><p>{academic_access.esc(profile.get('notes'))}</p><p><small>Consent acknowledged: {academic_access.esc(acknowledgements.get('tenant_consent', False))} · Governance reviewed: {academic_access.esc(acknowledgements.get('data_governance', False))} · Support ready: {academic_access.esc(acknowledgements.get('support_readiness', False))}</small></p></section>
+        <section class="studio-panel"><h3>Change rollout mode</h3><form method="post" action="/admin/microsoft365/go-live/mode"><label>Mode<select name="mode"><option value="read_only">Read-only</option><option value="pilot">Controlled pilot</option><option value="production">Production</option></select></label><label><input type="checkbox" name="acknowledge_consent" value="yes"> I confirm Microsoft tenant/admin consent has been reviewed.</label><label><input type="checkbox" name="acknowledge_governance" value="yes"> I confirm institutional data/privacy governance has been reviewed.</label><label><input type="checkbox" name="acknowledge_support" value="yes"> I confirm operational support and rollback ownership are assigned.</label><label>Approval notes<textarea name="notes" maxlength="1200"></textarea></label><button class="studio-button">Activate rollout mode</button></form><p><small>Pilot requires a current Consent Wizard v7 readiness snapshot. Production additionally requires v7 to report writes enabled and at least one validated pilot course.</small></p></section>
+        <section class="studio-panel"><h3>Pilot courses</h3><form method="post" action="/admin/microsoft365/go-live/pilots"><label>Active course<select name="course_id">{course_options}</select></label><button class="studio-button">Approve for pilot</button></form><div style="overflow:auto"><table><thead><tr><th>Course</th><th>Title</th><th>Status</th><th>Approved by</th><th>Review notes</th><th>Actions</th></tr></thead><tbody>{pilot_rows}</tbody></table></div></section>
+        <section class="studio-panel"><p><strong>Governed operations:</strong> controlled Team creation, Microsoft Education assignment writes/publication, and Microsoft Education grade export/return. Existing Microsoft environment write switches remain mandatory; v8 adds a second NUVEDRA rollout gate rather than replacing them.</p></section>
+        </main>'''
+        return admin_console.page("Microsoft 365 Go-Live Governance v8", body, admin)
+
+    @app.post("/admin/microsoft365/go-live/mode", response_model=None)
+    async def microsoft365_go_live_mode(
+        request: Request,
+        mode: str = Form(...),
+        acknowledge_consent: str = Form(""),
+        acknowledge_governance: str = Form(""),
+        acknowledge_support: str = Form(""),
+        notes: str = Form(""),
+    ):
+        admin = _admin(request)
+        clean_mode = mode.strip().lower()
+        if clean_mode not in ROLLOUT_MODES:
+            raise HTTPException(400, "Unsupported Microsoft 365 rollout mode.")
+        acks = {
+            "tenant_consent": _acknowledged(acknowledge_consent),
+            "data_governance": _acknowledged(acknowledge_governance),
+            "support_readiness": _acknowledged(acknowledge_support),
+        }
+        with db() as conn:
+            readiness = _readiness(conn)
+            if clean_mode in {"pilot", "production"} and not all(acks.values()):
+                raise HTTPException(409, "All institutional rollout acknowledgements are required before enabling Microsoft 365 writes.")
+            if clean_mode == "pilot" and not readiness["pilot_ready"]:
+                raise HTTPException(409, "Pilot rollout is blocked until Consent Wizard v7 records a ready governed-enablement or writes-enabled snapshot.")
+            if clean_mode == "production" and not readiness["production_ready"]:
+                raise HTTPException(409, "Production rollout requires a current writes-enabled Consent Wizard v7 snapshot and at least one validated pilot course.")
+            execute(conn, "UPDATE nuvedra_microsoft_go_live_profiles SET status='superseded' WHERE status='active'")
+            execute(conn, "INSERT INTO nuvedra_microsoft_go_live_profiles (mode,status,acknowledgements_json,notes,approved_by,created_at) VALUES (?,'active',?,?,?,?)", (
+                clean_mode, json.dumps(acks, sort_keys=True), notes.strip()[:1200] or None, str(admin.get("email") or "").lower(), utcnow(),
+            ))
+            audit(conn, str(admin.get("email") or ""), "microsoft365_rollout_mode_changed", "platform", "microsoft365", clean_mode, request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/go-live", status_code=303)
+
+    @app.post("/admin/microsoft365/go-live/pilots", response_model=None)
+    async def microsoft365_add_pilot(request: Request, course_id: int = Form(...)):
+        admin = _admin(request)
+        with db() as conn:
+            course = rows(execute(conn, "SELECT id,status FROM nexus_admin_courses WHERE id=?", (course_id,)))
+            if not course or str(course[0].get("status") or "") != "active":
+                raise HTTPException(404, "Select an active NUVEDRA course for the Microsoft 365 pilot.")
+            now = utcnow()
+            execute(conn, """INSERT INTO nuvedra_microsoft_pilot_courses
+                (course_id,status,approved_by,approved_at,reviewed_by,reviewed_at,review_notes)
+                VALUES (?,'approved',?,?,NULL,NULL,NULL)
+                ON CONFLICT(course_id) DO UPDATE SET status='approved',approved_by=excluded.approved_by,
+                approved_at=excluded.approved_at,reviewed_by=NULL,reviewed_at=NULL,review_notes=NULL""", (
+                course_id, str(admin.get("email") or "").lower(), now,
+            ))
+            audit(conn, str(admin.get("email") or ""), "microsoft365_pilot_course_approved", "course", str(course_id), "approved", request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/go-live", status_code=303)
+
+    @app.post("/admin/microsoft365/go-live/pilots/{course_id}/validate", response_model=None)
+    async def microsoft365_validate_pilot(course_id: int, request: Request, review_notes: str = Form("Pilot validation confirmed")):
+        admin = _admin(request)
+        with db() as conn:
+            found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_pilot_courses WHERE course_id=? AND status IN ('approved','validated')", (course_id,)))
+            if not found:
+                raise HTTPException(404, "Pilot course approval not found.")
+            execute(conn, "UPDATE nuvedra_microsoft_pilot_courses SET status='validated',reviewed_by=?,reviewed_at=?,review_notes=? WHERE course_id=?", (
+                str(admin.get("email") or "").lower(), utcnow(), review_notes.strip()[:500] or "Pilot validation confirmed", course_id,
+            ))
+            audit(conn, str(admin.get("email") or ""), "microsoft365_pilot_course_validated", "course", str(course_id), "validated", request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/go-live", status_code=303)
+
+    @app.post("/admin/microsoft365/go-live/pilots/{course_id}/revoke", response_model=None)
+    async def microsoft365_revoke_pilot(course_id: int, request: Request):
+        admin = _admin(request)
+        with db() as conn:
+            found = rows(execute(conn, "SELECT id FROM nuvedra_microsoft_pilot_courses WHERE course_id=?", (course_id,)))
+            if not found:
+                raise HTTPException(404, "Pilot course approval not found.")
+            execute(conn, "UPDATE nuvedra_microsoft_pilot_courses SET status='revoked',reviewed_by=?,reviewed_at=?,review_notes='Pilot access revoked by administrator.' WHERE course_id=?", (
+                str(admin.get("email") or "").lower(), utcnow(), course_id,
+            ))
+            audit(conn, str(admin.get("email") or ""), "microsoft365_pilot_course_revoked", "course", str(course_id), "revoked", request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/go-live", status_code=303)
+
+    @app.get("/faculty/studio/courses/{course_id}/microsoft365/go-live", response_class=HTMLResponse, response_model=None)
+    async def microsoft365_course_go_live(course_id: int, request: Request):
+        user = _academic_user(request, f"/faculty/studio/courses/{course_id}/microsoft365/go-live")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            state = rollout_status(conn, course_id)
+        allowed = "Approved" if state["allowed"] else "Blocked"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-course-go-live-v8"><nav class="studio-breadcrumbs"><a href="/faculty/studio/courses/{course_id}/microsoft365/production">Microsoft 365 Production v3</a><span> / </span><a href="/faculty/studio/courses/{course_id}/microsoft365/education-sync">Education Sync v6</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Go-Live v8</p><h2>{academic_access.esc(course.get('course_code'))}: {academic_access.esc(course.get('title'))}</h2><p>Institutional rollout status for high-impact Microsoft 365 writes.</p></div></header><section class="studio-summary-grid"><article class="studio-panel"><strong>{academic_access.esc(_mode_label(state['mode']))}</strong><span>Institution rollout mode</span></article><article class="studio-panel"><strong>{academic_access.esc(state['pilot_state'])}</strong><span>Pilot course state</span></article><article class="studio-panel"><strong>{academic_access.esc(allowed)}</strong><span>High-impact Microsoft writes</span></article></section><section class="studio-panel"><p>Environment-level Microsoft write switches and delegated Graph permissions are still required. This page reports the additional NUVEDRA institutional rollout gate; faculty cannot override it.</p></section></main>'''
+        return academic_access.portal_page("Microsoft 365 Go-Live v8", body, user)
+
+    print("NUVEDRA Microsoft 365 Go-Live Governance & Pilot v8 registered: read-only default, consent-backed pilot activation, validated pilot promotion, immutable rollout profiles, course allowlisting, and high-impact write governance.", flush=True)
