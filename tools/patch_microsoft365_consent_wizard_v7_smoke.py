@@ -29,6 +29,12 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Production Configuration & Consent Wizard v7 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    from patch_microsoft365_go_live_governance_v8 import main as patch_microsoft365_go_live_governance_v8
+    patch_microsoft365_go_live_governance_v8()
+
+    from patch_microsoft365_go_live_governance_v8_smoke import main as patch_microsoft365_go_live_governance_v8_smoke
+    patch_microsoft365_go_live_governance_v8_smoke()
+
 
 if __name__ == "__main__":
     main()
