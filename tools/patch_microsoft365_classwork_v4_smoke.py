@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 PATH = Path("tools/smoke_test_course_editor_access.py")
-TAG = "NUVEDRA_MICROSOFT365_PRODUCTION_V3_SMOKE"
+TAG = "NUVEDRA_MICROSOFT365_CLASSWORK_V4_SMOKE"
 
 
 def main() -> None:
@@ -16,10 +16,10 @@ def main() -> None:
         anchor = "    print(\n        'Visual Course Studio validated:"
         index = text.find(anchor)
         if index < 0:
-            raise RuntimeError("Could not attach Microsoft 365 Production & Tenant Provisioning v3 smoke test to the Course Studio validation flow.")
-        block = """    # NUVEDRA_MICROSOFT365_PRODUCTION_V3_SMOKE
+            raise RuntimeError("Could not attach Microsoft 365 Classwork & Assignments v4 smoke test to the Course Studio validation flow.")
+        block = """    # NUVEDRA_MICROSOFT365_CLASSWORK_V4_SMOKE
     subprocess.run(
-        [sys.executable, 'tools/smoke_test_microsoft365_production_v3.py'],
+        [sys.executable, 'tools/smoke_test_microsoft365_classwork_v4.py'],
         check=True,
         env={**os.environ, 'PYTHONPATH': '.'},
     )
@@ -27,13 +27,7 @@ def main() -> None:
 """
         text = text[:index] + block + text[index:]
     PATH.write_text(text, encoding="utf-8")
-    print("Microsoft 365 Production & Tenant Provisioning v3 functional validation attached to Course Studio smoke tests.", flush=True)
-
-    from patch_microsoft365_classwork_v4 import main as patch_microsoft365_classwork_v4
-    patch_microsoft365_classwork_v4()
-
-    from patch_microsoft365_classwork_v4_smoke import main as patch_microsoft365_classwork_v4_smoke
-    patch_microsoft365_classwork_v4_smoke()
+    print("Microsoft 365 Classwork & Assignments v4 functional validation attached to Course Studio smoke tests.", flush=True)
 
 
 if __name__ == "__main__":
