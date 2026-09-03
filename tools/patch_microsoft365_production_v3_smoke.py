@@ -29,6 +29,12 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Production & Tenant Provisioning v3 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    from patch_microsoft365_classwork_v4 import main as patch_microsoft365_classwork_v4
+    patch_microsoft365_classwork_v4()
+
+    from patch_microsoft365_classwork_v4_smoke import main as patch_microsoft365_classwork_v4_smoke
+    patch_microsoft365_classwork_v4_smoke()
+
 
 if __name__ == "__main__":
     main()
