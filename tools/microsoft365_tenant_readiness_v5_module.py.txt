@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+import app.microsoft365_integration as m365
+import app.microsoft365_production_v3 as production
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+GENERIC_TENANTS = {"", "common", "organizations", "consumers"}
+EDUCATION_SCOPES = {"EduRoster.ReadBasic", "EduAssignments.ReadBasic"}
+ADMIN_CONSENT_SCOPES = {
+    "EduRoster.ReadBasic",
+    "EduAssignments.ReadBasic",
+    "Team.Create",
+    "Team.ReadBasic.All",
+    "TeamMember.ReadWrite.All",
+    "Channel.Create",
+}
+CLASS_ID_RE = re.compile(r"^[A-Za-z0-9._-]{6,180}$")
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _truthy(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allowed_domains() -> set[str]:
+    raw = str(os.getenv("MICROSOFT_ALLOWED_DOMAINS", "") or "").replace(",", " ")
+    return {part.strip().lower() for part in raw.split() if part.strip()}
+
+
+def _configured_tenant() -> str:
+    return str(m365._config().get("tenant") or "").strip()
+
+
+def _is_specific_tenant(value: str) -> bool:
+    return str(value or "").strip().lower() not in GENERIC_TENANTS
+
+
+def _connection_scopes(conn: Any, email: str) -> set[str]:
+    connection = m365._connection(conn, email)
+    if not connection:
+        return set()
+    return {scope.strip() for scope in str(connection.get("scopes") or "").split() if scope.strip()}
+
+
+def _admin(request: Request) -> dict[str, Any]:
+    user = admin_console.session_user(request)
+    if not user or str(user.get("role") or "") not in {"superadmin", "course_admin"}:
+        raise HTTPException(403, "Platform administration permission is required.")
+    return user
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _class_id(value: str) -> str:
+    clean = str(value or "").strip()
+    if not CLASS_ID_RE.fullmatch(clean):
+        raise HTTPException(400, "Microsoft Education class identifier is invalid.")
+    return clean
+
+
+def ensure_microsoft365_tenant_readiness_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_tenant_readiness_snapshots (
+            id {pk}, user_email TEXT NOT NULL, configured_tenant TEXT,
+            organization_id TEXT, organization_name TEXT, verified_domains_json TEXT,
+            granted_scopes TEXT, missing_education_scopes TEXT,
+            checks_json TEXT NOT NULL, readiness_status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_education_class_links (
+            id {pk}, course_id INTEGER NOT NULL UNIQUE, class_id TEXT NOT NULL,
+            display_name TEXT NOT NULL, external_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active', linked_by TEXT NOT NULL,
+            linked_at TEXT NOT NULL, verified_at TEXT NOT NULL
+        )""")
+
+
+def _organization_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    values = payload.get("value", []) if isinstance(payload.get("value"), list) else []
+    organization = values[0] if values and isinstance(values[0], dict) else {}
+    domains = []
+    for entry in organization.get("verifiedDomains", []) if isinstance(organization.get("verifiedDomains"), list) else []:
+        if isinstance(entry, dict) and entry.get("name"):
+            domains.append(str(entry["name"]).lower())
+    return {
+        "id": str(organization.get("id") or ""),
+        "display_name": str(organization.get("displayName") or ""),
+        "verified_domains": sorted(set(domains)),
+    }
+
+
+async def _taught_classes(email: str) -> tuple[list[dict[str, Any]], int]:
+    values, pages = await production._graph_collection(
+        email,
+        "/education/me/taughtClasses",
+        params={"$top": 100, "$select": "id,displayName,externalId,mailNickname,classCode,createdBy"},
+    )
+    return values, pages
+
+
+async def _class_assignments(email: str, class_id: str) -> tuple[list[dict[str, Any]], int]:
+    return await production._graph_collection(
+        email,
+        f"/education/classes/{_class_id(class_id)}/assignments",
+        params={"$top": 100, "$select": "id,displayName,status,dueDateTime,assignedDateTime"},
+    )
+
+
+def _readiness_status(configured_tenant: str, organization_id: str, scopes: set[str], checks: dict[str, Any]) -> str:
+    if _truthy("MICROSOFT_REQUIRE_INSTITUTION_TENANT") and not _is_specific_tenant(configured_tenant):
+        return "blocked"
+    if not _is_specific_tenant(configured_tenant):
+        return "attention"
+    if organization_id and configured_tenant.lower() != organization_id.lower():
+        return "attention"
+    if not checks.get("organization", {}).get("ok"):
+        return "attention"
+    if EDUCATION_SCOPES.issubset(scopes) and checks.get("education_roster", {}).get("ok") and checks.get("education_assignments", {}).get("ok"):
+        return "ready_education"
+    return "ready_core"
+
+
+def _status_label(value: str) -> str:
+    return {
+        "blocked": "Blocked by production policy",
+        "attention": "Needs attention",
+        "ready_core": "Core Microsoft 365 ready",
+        "ready_education": "Microsoft Education read-only ready",
+    }.get(value, value)
+
+
+def _save_snapshot(conn: Any, *, email: str, organization: dict[str, Any], scopes: set[str], checks: dict[str, Any], status: str) -> None:
+    missing = sorted(EDUCATION_SCOPES.difference(scopes))
+    execute(conn, """INSERT INTO nuvedra_microsoft_tenant_readiness_snapshots
+        (user_email,configured_tenant,organization_id,organization_name,verified_domains_json,
+         granted_scopes,missing_education_scopes,checks_json,readiness_status,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            email.lower(),
+            _configured_tenant(),
+            organization.get("id") or None,
+            organization.get("display_name") or None,
+            json.dumps(organization.get("verified_domains") or [], ensure_ascii=False),
+            " ".join(sorted(scopes)),
+            " ".join(missing),
+            json.dumps(checks, ensure_ascii=False),
+            status,
+            utcnow(),
+        ),
+    )
+
+
+def _class_link(conn: Any, course_id: int) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_education_class_links WHERE course_id=? AND status='active'", (course_id,)))
+    return found[0] if found else None
+
+
+def register_microsoft365_tenant_readiness_v5(app: FastAPI) -> None:
+    ensure_microsoft365_tenant_readiness_schema()
+
+    @app.get("/admin/microsoft365/tenant-readiness", response_class=HTMLResponse, response_model=None)
+    async def tenant_readiness_admin(request: Request):
+        admin = _admin(request)
+        email = str(admin.get("email") or "").lower()
+        cfg = m365._config()
+        allowed = sorted(_allowed_domains())
+        with db() as conn:
+            connection = m365._connection(conn, email)
+            snapshots = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_tenant_readiness_snapshots ORDER BY id DESC LIMIT 12"))
+        scopes = {x.strip() for x in str((connection or {}).get("scopes") or "").split() if x.strip()}
+        rows_html = "".join(
+            f'<tr><td>{academic_access.esc(x.get("created_at"))}</td><td>{academic_access.esc(x.get("user_email"))}</td><td>{academic_access.esc(x.get("organization_name") or x.get("organization_id") or "—")}</td><td>{academic_access.esc(_status_label(str(x.get("readiness_status") or "")))}</td><td>{academic_access.esc(x.get("missing_education_scopes") or "None")}</td></tr>'
+            for x in snapshots
+        ) or '<tr><td colspan="5">No tenant-readiness snapshot has been recorded.</td></tr>'
+        scope_html = "".join(
+            f'<li><strong>{academic_access.esc(scope)}</strong> — {"granted to this connected identity" if scope in scopes else "not present in this identity token"} — {"admin consent required by Microsoft" if scope in ADMIN_CONSENT_SCOPES else "consent model varies"}</li>'
+            for scope in sorted(EDUCATION_SCOPES | {"User.Read", "Team.ReadBasic.All", "TeamMember.ReadWrite.All", "Team.Create"})
+        )
+        tenant = str(cfg.get("tenant") or "")
+        tenant_status = "Specific institution tenant" if _is_specific_tenant(tenant) else "Generic tenant authority — not recommended for institutional production"
+        policy = "Required" if _truthy("MICROSOFT_REQUIRE_INSTITUTION_TENANT") else "Advisory"
+        domain_text = ", ".join(allowed) if allowed else "No domain allowlist configured"
+        probe = '<form method="post" action="/admin/microsoft365/tenant-readiness/probe"><button class="studio-button">Run live read-only tenant probe</button></form>' if connection else '<p class="studio-notice">Connect Microsoft 365 using the same administrator email before running a live tenant probe.</p>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-tenant-readiness-v5"><nav class="studio-breadcrumbs"><a href="/admin/microsoft365/production">Production v3</a><span> / </span><a href="/admin/microsoft365">Microsoft 365 setup</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Live Tenant Readiness & Education v5</p><h2>Institution tenant, consent and Education API readiness</h2><p>Validate the configured Entra tenant against live Microsoft Graph, inspect scopes actually returned for the connected identity, and test the least-privilege Microsoft Education read-only APIs without granting consent or changing tenant resources.</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>Tenant binding</h3><p><strong>{academic_access.esc(tenant or "Not configured")}</strong></p><p>{academic_access.esc(tenant_status)}</p><p><strong>Institution-tenant enforcement:</strong> {policy}</p><p><strong>Allowed domains:</strong> {academic_access.esc(domain_text)}</p></article><article class="studio-panel"><h3>Live readiness probe</h3>{probe}<p><small>The organization, education roster, and assignment probes are read-only. NUVEDRA does not attempt to grant Microsoft admin consent.</small></p></article></section><section class="studio-panel"><h3>Effective delegated scope evidence</h3><ul>{scope_html}</ul><p><small>A scope returned in the OAuth token is evidence that the connected identity can present that delegated permission. This page does not claim tenant-wide consent solely from configuration text.</small></p></section><section class="studio-panel"><h3>Recent readiness snapshots</h3><table><thead><tr><th>Time</th><th>Identity</th><th>Organization</th><th>Status</th><th>Missing Education scopes</th></tr></thead><tbody>{rows_html}</tbody></table></section></main>'''
+        return admin_console.page("Microsoft 365 Tenant Readiness v5", body, admin)
+
+    @app.post("/admin/microsoft365/tenant-readiness/probe", response_model=None)
+    async def tenant_readiness_probe(request: Request):
+        admin = _admin(request)
+        email = str(admin.get("email") or "").lower()
+        with db() as conn:
+            connection = m365._connection(conn, email)
+            if not connection:
+                raise HTTPException(409, "Connect Microsoft 365 using the same administrator email before probing the tenant.")
+            scopes = _connection_scopes(conn, email)
+        checks: dict[str, Any] = {}
+        organization: dict[str, Any] = {"id": "", "display_name": "", "verified_domains": []}
+        try:
+            organization = _organization_summary(await m365._graph_json(email, "GET", "/organization", params={"$select": "id,displayName,verifiedDomains"}))
+            checks["organization"] = {"ok": bool(organization.get("id")), "organization_id": organization.get("id")}
+        except HTTPException as exc:
+            checks["organization"] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:300]}
+        taught: list[dict[str, Any]] = []
+        if "EduRoster.ReadBasic" in scopes:
+            try:
+                taught, pages = await _taught_classes(email)
+                checks["education_roster"] = {"ok": True, "classes": len(taught), "pages": pages}
+            except HTTPException as exc:
+                checks["education_roster"] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:300]}
+        else:
+            checks["education_roster"] = {"ok": False, "skipped": True, "reason": "EduRoster.ReadBasic is not present in the granted token scopes."}
+        if "EduAssignments.ReadBasic" in scopes:
+            if taught:
+                try:
+                    assignments, pages = await _class_assignments(email, str(taught[0].get("id") or ""))
+                    checks["education_assignments"] = {"ok": True, "sample_class": taught[0].get("displayName"), "assignments": len(assignments), "pages": pages}
+                except HTTPException as exc:
+                    checks["education_assignments"] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:300]}
+            else:
+                checks["education_assignments"] = {"ok": True, "classes": 0, "note": "No taught class was returned for the connected identity."}
+        else:
+            checks["education_assignments"] = {"ok": False, "skipped": True, "reason": "EduAssignments.ReadBasic is not present in the granted token scopes."}
+        status = _readiness_status(_configured_tenant(), str(organization.get("id") or ""), scopes, checks)
+        with db() as conn:
+            _save_snapshot(conn, email=email, organization=organization, scopes=scopes, checks=checks, status=status)
+            audit(conn, email, "microsoft365_tenant_readiness_probe", "tenant", str(organization.get("id") or _configured_tenant()), status, request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/tenant-readiness", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education-readiness", response_class=HTMLResponse, response_model=None)
+    async def course_education_readiness(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            connection = m365._connection(conn, user["email"])
+            scopes = _connection_scopes(conn, user["email"])
+            link = _class_link(conn, course_id)
+        classes: list[dict[str, Any]] = []
+        pages = 0
+        roster_error = ""
+        if connection and "EduRoster.ReadBasic" in scopes:
+            try:
+                classes, pages = await _taught_classes(user["email"])
+            except HTTPException as exc:
+                roster_error = str(exc.detail)
+        elif connection:
+            roster_error = "EduRoster.ReadBasic is not granted. Microsoft tenant administrator consent is required for this delegated education permission."
+        assignments: list[dict[str, Any]] = []
+        assignment_error = ""
+        if link and connection and "EduAssignments.ReadBasic" in scopes:
+            try:
+                assignments, _assignment_pages = await _class_assignments(user["email"], str(link["class_id"]))
+            except HTTPException as exc:
+                assignment_error = str(exc.detail)
+        class_options = "".join(f'<option value="{academic_access.esc(x.get("id"), attr=True)}">{academic_access.esc(x.get("displayName") or x.get("id"))}</option>' for x in classes)
+        class_cards = "".join(f'<article class="studio-panel"><p class="studio-eyebrow">Microsoft Education class</p><h3>{academic_access.esc(x.get("displayName") or "Class")}</h3><p><code>{academic_access.esc(x.get("id"))}</code></p></article>' for x in classes) or '<section class="studio-empty">No taught Microsoft Education classes are available to this identity.</section>'
+        link_html = '<p>No Microsoft Education class is linked to this NUVEDRA course.</p>'
+        if link:
+            link_html = f'<p><strong>{academic_access.esc(link.get("display_name"))}</strong><br><code>{academic_access.esc(link.get("class_id"))}</code><br>Verified {academic_access.esc(link.get("verified_at"))}</p>'
+        assignment_html = "".join(f'<li>{academic_access.esc(x.get("displayName") or x.get("id"))} · {academic_access.esc(x.get("status") or "")}</li>' for x in assignments) or '<li>No assignment metadata returned.</li>'
+        connect_panel = m365._connection_panel(connection, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness")
+        form = f'''<form method="post" action="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness/link"><label>Taught Microsoft Education class<select name="class_id" required>{class_options}</select></label><button class="studio-button">Link class read-only</button></form>''' if classes else f'<p class="studio-notice">{academic_access.esc(roster_error or "No taught class is available for linking.")}</p>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-education-readiness-v5"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Classwork v4</a><span> / </span><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/production">Production v3</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft Education Readiness v5</p><h2>{academic_access.esc(course.get("course_code"))}: {academic_access.esc(course.get("title"))}</h2><p>Discover only the classes taught by the connected instructor, link one existing Microsoft Education class to this NUVEDRA course, and validate read-only assignment metadata before any future write integration is considered.</p></div></header><section class="studio-grid">{connect_panel}<article class="studio-panel"><h3>Linked education class</h3>{link_html}{form}</article></section><section class="studio-panel"><h3>Effective education scopes</h3><p><strong>EduRoster.ReadBasic:</strong> {"granted" if "EduRoster.ReadBasic" in scopes else "missing"} · <strong>EduAssignments.ReadBasic:</strong> {"granted" if "EduAssignments.ReadBasic" in scopes else "missing"}</p><p><small>Both delegated permissions require Microsoft administrator consent. NUVEDRA v5 uses them only for read-only discovery.</small></p></section><section class="studio-panel"><h3>Taught classes</h3><p>{len(classes)} class(es) across {pages} Graph page(s).</p><div class="studio-grid">{class_cards}</div></section><section class="studio-panel"><h3>Linked-class assignment metadata</h3>{f'<p class="studio-notice">{academic_access.esc(assignment_error)}</p>' if assignment_error else ''}<ul>{assignment_html}</ul><p><small>No grades, submissions, or Microsoft assignment records are modified by this v5 readiness layer.</small></p></section></main>'''
+        return academic_access.portal_page("Microsoft Education Readiness v5", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education-readiness/link", response_model=None)
+    async def link_education_class(course_id: int, request: Request, class_id: str = Form(...)):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_id = _class_id(class_id)
+        with db() as conn:
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            if not m365._connection(conn, user["email"]):
+                raise HTTPException(409, "Connect Microsoft 365 before linking an Education class.")
+            if "EduRoster.ReadBasic" not in _connection_scopes(conn, user["email"]):
+                raise HTTPException(403, "EduRoster.ReadBasic has not been granted to this connected Microsoft identity.")
+        classes, _pages = await _taught_classes(user["email"])
+        selected = next((x for x in classes if str(x.get("id") or "") == clean_id), None)
+        if not selected:
+            raise HTTPException(403, "The selected Microsoft Education class is not in the connected instructor's taught-class list.")
+        now = utcnow()
+        with db() as conn:
+            execute(conn, """INSERT INTO nuvedra_microsoft_education_class_links
+                (course_id,class_id,display_name,external_id,status,linked_by,linked_at,verified_at)
+                VALUES (?,?,?,?,'active',?,?,?)
+                ON CONFLICT(course_id) DO UPDATE SET class_id=excluded.class_id,display_name=excluded.display_name,
+                external_id=excluded.external_id,status='active',linked_by=excluded.linked_by,verified_at=excluded.verified_at""",
+                (course_id, clean_id, str(selected.get("displayName") or clean_id), str(selected.get("externalId") or "") or None, user["email"].lower(), now, now))
+            audit(conn, user["email"], "microsoft365_education_class_linked", "course", str(course_id), clean_id, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness", status_code=303)
+
+    print("NUVEDRA Microsoft 365 Live Tenant Readiness & Education v5 registered: institution-tenant policy, live organization validation, effective-scope evidence, least-privilege Education API probes, taught-class discovery, and read-only course-to-educationClass linking.", flush=True)
