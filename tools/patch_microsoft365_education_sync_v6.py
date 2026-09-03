@@ -33,20 +33,15 @@ def patch_v5_navigation() -> None:
     text = TENANT_V5.read_text(encoding="utf-8")
     if TAG in text:
         return
-    anchor = 'Read-only Microsoft Education readiness'
-    if anchor not in text:
-        raise RuntimeError("Microsoft Education Sync v6 could not locate the Tenant Readiness v5 course heading anchor.")
-    # Add navigation only to the detailed course readiness page; v6 continues to rely on v5 for class linkage.
-    hero = 'Link one of your own taught Microsoft education classes to this NUVEDRA course and inspect assignment metadata without writing to Microsoft Education.'</p></div></header>'
-    if hero in text:
-        replacement = 'Link one of your own taught Microsoft education classes to this NUVEDRA course and inspect assignment metadata without writing to Microsoft Education.</p></div><div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-sync">Education Sync v6</a></div></header><!-- NUVEDRA_MICROSOFT365_EDUCATION_SYNC_V6 -->'
-        text = text.replace(hero, replacement, 1)
-    else:
-        # Fallback for small wording changes in the generated v5 template.
-        marker = 'data-testid="microsoft365-education-readiness-v5"'
-        if marker not in text:
-            raise RuntimeError("Microsoft Education Sync v6 could not locate the v5 Education Readiness page.")
-        text = text.replace(marker, marker + ' data-education-sync-v6="available"', 1)
+    route_anchor = '@app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education-readiness"'
+    start = text.find(route_anchor)
+    if start < 0:
+        raise RuntimeError("Microsoft Education Sync v6 could not locate the Tenant Readiness v5 course route.")
+    header_end = text.find("</header>", start)
+    if header_end < 0:
+        raise RuntimeError("Microsoft Education Sync v6 could not locate the Tenant Readiness v5 course header.")
+    action = '<div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-sync">Education Sync v6</a></div><!-- NUVEDRA_MICROSOFT365_EDUCATION_SYNC_V6 -->'
+    text = text[:header_end] + action + text[header_end:]
     TENANT_V5.write_text(text, encoding="utf-8")
 
 
