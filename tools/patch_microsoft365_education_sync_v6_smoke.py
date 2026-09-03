@@ -29,6 +29,12 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft Education Assignments & Grade Integration v6 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    from patch_microsoft365_consent_wizard_v7 import main as patch_microsoft365_consent_wizard_v7
+    patch_microsoft365_consent_wizard_v7()
+
+    from patch_microsoft365_consent_wizard_v7_smoke import main as patch_microsoft365_consent_wizard_v7_smoke
+    patch_microsoft365_consent_wizard_v7_smoke()
+
 
 if __name__ == "__main__":
     main()
