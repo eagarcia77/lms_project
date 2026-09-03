@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+import base64
+import json
+from typing import Any
+from urllib.parse import urlparse
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.assignments_submissions as assignments
+import app.microsoft365_integration as m365
+import app.microsoft365_production_v3 as production
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+DISTRIBUTION_MODES = {"reference", "personal_copy_required"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def ensure_microsoft365_classwork_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_assignment_templates (
+            id {pk}, item_id INTEGER NOT NULL UNIQUE, course_id INTEGER NOT NULL,
+            source_url TEXT NOT NULL, template_name TEXT, distribution_mode TEXT NOT NULL DEFAULT 'personal_copy_required',
+            instructions TEXT, source_drive_id TEXT, source_item_id TEXT, source_mime_type TEXT,
+            validation_status TEXT NOT NULL DEFAULT 'unverified', validated_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_student_work (
+            id {pk}, item_id INTEGER NOT NULL, course_id INTEGER NOT NULL,
+            student_email TEXT NOT NULL, work_url TEXT NOT NULL,
+            microsoft_drive_id TEXT, microsoft_item_id TEXT, file_name TEXT, mime_type TEXT,
+            size_bytes INTEGER, etag TEXT, last_modified_at TEXT,
+            validation_status TEXT NOT NULL DEFAULT 'verified', validation_json TEXT,
+            status TEXT NOT NULL DEFAULT 'linked', linked_at TEXT NOT NULL,
+            submitted_at TEXT, updated_at TEXT NOT NULL,
+            UNIQUE(item_id,student_email)
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_work_attempts (
+            id {pk}, work_id INTEGER NOT NULL, submission_id INTEGER NOT NULL,
+            attempt_no INTEGER NOT NULL, work_url TEXT NOT NULL,
+            microsoft_item_id TEXT, etag TEXT, size_bytes INTEGER, last_modified_at TEXT,
+            submitted_at TEXT NOT NULL, UNIQUE(submission_id,attempt_no)
+        )""")
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _bundle(conn: Any, item_id: int) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    return assignments._bundle(conn, item_id)
+
+
+def _template(conn: Any, item_id: int) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_assignment_templates WHERE item_id=? AND status='active'", (item_id,)))
+    return found[0] if found else None
+
+
+def _work(conn: Any, item_id: int, email: str) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_student_work WHERE item_id=? AND lower(student_email)=?", (item_id, email.lower())))
+    return found[0] if found else None
+
+
+def _https_url(value: str, label: str) -> str:
+    clean = str(value or "").strip()
+    parsed = urlparse(clean)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise HTTPException(400, f"{label} must be a valid HTTPS URL.")
+    return clean
+
+
+def _share_id(url: str) -> str:
+    token = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
+    return "u!" + token
+
+
+def _metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    file_info = payload.get("file") if isinstance(payload.get("file"), dict) else {}
+    parent = payload.get("parentReference") if isinstance(payload.get("parentReference"), dict) else {}
+    return {
+        "drive_id": str(parent.get("driveId") or ""),
+        "item_id": str(payload.get("id") or ""),
+        "name": str(payload.get("name") or ""),
+        "mime_type": str(file_info.get("mimeType") or ""),
+        "size": int(payload.get("size") or 0),
+        "etag": str(payload.get("eTag") or ""),
+        "last_modified": str(payload.get("lastModifiedDateTime") or ""),
+        "web_url": str(payload.get("webUrl") or ""),
+    }
+
+
+async def _resolve_shared_item(email: str, url: str) -> dict[str, Any]:
+    clean = _https_url(url, "Microsoft 365 link")
+    share = _share_id(clean)
+    payload = await m365._graph_json(
+        email,
+        "GET",
+        f"/shares/{share}/driveItem",
+        params={"$select": "id,name,webUrl,size,eTag,lastModifiedDateTime,file,folder,parentReference,createdBy,lastModifiedBy"},
+    )
+    if payload.get("folder"):
+        raise HTTPException(400, "Microsoft 365 classwork must point to a file, not a folder.")
+    info = _metadata(payload)
+    if not info["item_id"]:
+        raise HTTPException(400, "Microsoft Graph could not resolve this Microsoft 365 file.")
+    if not info["web_url"]:
+        info["web_url"] = clean
+    return info
+
+
+def _connection(conn: Any, email: str) -> dict[str, Any] | None:
+    return m365._connection(conn, email)
+
+
+def _require_connected(conn: Any, email: str) -> None:
+    if not _connection(conn, email):
+        raise HTTPException(401, "Connect Microsoft 365 before validating classwork links.")
+
+
+def _template_summary(template: dict[str, Any] | None) -> str:
+    if not template:
+        return '<span class="studio-status">Not configured</span>'
+    status = academic_access.esc(template.get("validation_status") or "unverified")
+    mode = "Personal copy required" if template.get("distribution_mode") == "personal_copy_required" else "Reference only"
+    return f'<span class="studio-status">{academic_access.esc(mode)} · {status}</span>'
+
+
+def _upsert_template(
+    conn: Any,
+    *,
+    item_id: int,
+    course_id: int,
+    source_url: str,
+    template_name: str,
+    distribution_mode: str,
+    instructions: str,
+    info: dict[str, Any] | None,
+    actor: str,
+) -> None:
+    now = utcnow()
+    validated = bool(info)
+    execute(conn, """INSERT INTO nuvedra_microsoft_assignment_templates
+        (item_id,course_id,source_url,template_name,distribution_mode,instructions,source_drive_id,source_item_id,
+         source_mime_type,validation_status,validated_at,status,created_by,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?)
+        ON CONFLICT(item_id) DO UPDATE SET course_id=excluded.course_id,source_url=excluded.source_url,
+        template_name=excluded.template_name,distribution_mode=excluded.distribution_mode,instructions=excluded.instructions,
+        source_drive_id=excluded.source_drive_id,source_item_id=excluded.source_item_id,
+        source_mime_type=excluded.source_mime_type,validation_status=excluded.validation_status,
+        validated_at=excluded.validated_at,status='active',updated_at=excluded.updated_at""",
+        (
+            item_id,
+            course_id,
+            source_url,
+            template_name or (info or {}).get("name") or "Microsoft 365 template",
+            distribution_mode,
+            instructions,
+            (info or {}).get("drive_id") or None,
+            (info or {}).get("item_id") or None,
+            (info or {}).get("mime_type") or None,
+            "verified" if validated else "unverified",
+            now if validated else None,
+            actor.lower(),
+            now,
+            now,
+        ))
+
+
+def _upsert_work(conn: Any, *, item_id: int, course_id: int, email: str, url: str, info: dict[str, Any]) -> int:
+    now = utcnow()
+    execute(conn, """INSERT INTO nuvedra_microsoft_student_work
+        (item_id,course_id,student_email,work_url,microsoft_drive_id,microsoft_item_id,file_name,mime_type,
+         size_bytes,etag,last_modified_at,validation_status,validation_json,status,linked_at,submitted_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,'verified',?,'linked',?,NULL,?)
+        ON CONFLICT(item_id,student_email) DO UPDATE SET work_url=excluded.work_url,
+        microsoft_drive_id=excluded.microsoft_drive_id,microsoft_item_id=excluded.microsoft_item_id,
+        file_name=excluded.file_name,mime_type=excluded.mime_type,size_bytes=excluded.size_bytes,
+        etag=excluded.etag,last_modified_at=excluded.last_modified_at,validation_status='verified',
+        validation_json=excluded.validation_json,status='linked',updated_at=excluded.updated_at""",
+        (
+            item_id,
+            course_id,
+            email.lower(),
+            url,
+            info.get("drive_id") or None,
+            info.get("item_id") or None,
+            info.get("name") or None,
+            info.get("mime_type") or None,
+            int(info.get("size") or 0),
+            info.get("etag") or None,
+            info.get("last_modified") or None,
+            json.dumps(info, ensure_ascii=False),
+            now,
+            now,
+        ))
+    found = _work(conn, item_id, email)
+    if not found:
+        raise HTTPException(500, "Microsoft 365 work could not be stored.")
+    return int(found["id"])
+
+
+def register_microsoft365_classwork_v4(app: FastAPI) -> None:
+    ensure_microsoft365_classwork_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/classwork", response_class=HTMLResponse, response_model=None)
+    async def faculty_classwork(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            data = rows(execute(conn, """SELECT i.id,i.title,i.item_type,i.points,i.status,m.title AS module_title,
+                t.template_name,t.distribution_mode,t.validation_status,t.source_url,
+                (SELECT COUNT(*) FROM nuvedra_microsoft_student_work w WHERE w.item_id=i.id) AS linked_count,
+                (SELECT COUNT(*) FROM nuvedra_submissions s WHERE s.item_id=i.id AND s.status='submitted') AS submitted_count
+                FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+                LEFT JOIN nuvedra_microsoft_assignment_templates t ON t.item_id=i.id AND t.status='active'
+                WHERE m.course_id=? AND i.item_type IN ('assignment','project','presentation')
+                ORDER BY m.position,i.position,i.id""", (course_id,)))
+        cards = []
+        for row in data:
+            template = None
+            if row.get("source_url"):
+                template = {
+                    "validation_status": row.get("validation_status"),
+                    "distribution_mode": row.get("distribution_mode"),
+                }
+            cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(row.get("module_title"))} · {academic_access.esc(row.get("item_type"))}</p><h3>{academic_access.esc(row.get("title"))}</h3><p>{_template_summary(template)}</p><p>{int(row.get("linked_count") or 0)} Microsoft work link(s) · {int(row.get("submitted_count") or 0)} canonical submission(s)</p><div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/assignments/{int(row["id"])}/microsoft365">Configure</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/assignments/{int(row["id"])}">Submission inbox</a></div></article>''')
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-classwork-v4"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365">Microsoft 365</a><span> / </span><a href="{STUDIO_PREFIX}/courses/{course_id}/assignments">Assignments</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Classwork & Assignments v4</p><h2>{academic_access.esc(course.get("course_code"))}: {academic_access.esc(course.get("title"))}</h2><p>Attach Word, Excel, PowerPoint, PDF, or other OneDrive/SharePoint files to NUVEDRA assignments and collect validated Microsoft 365 work links while keeping NUVEDRA Gradebook canonical.</p></div></header><section class="studio-panel"><p><strong>Privacy model:</strong> NUVEDRA stores Microsoft file metadata and links, not the Office document bytes. Microsoft-side sharing permissions continue to control who can open the file.</p></section><section class="studio-grid">{''.join(cards) or '<section class="studio-empty">No assignments have been created yet.</section>'}</section></main>'''
+        return academic_access.portal_page("Microsoft 365 Classwork", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365", response_class=HTMLResponse, response_model=None)
+    async def faculty_assignment_classwork(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _bundle(conn, item_id)
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            template = _template(conn, item_id)
+            connection = _connection(conn, user["email"])
+            work_rows = rows(execute(conn, """SELECT w.*,s.id AS submission_id,s.status AS submission_status,g.points_awarded
+                FROM nuvedra_microsoft_student_work w
+                LEFT JOIN nuvedra_submissions s ON s.item_id=w.item_id AND lower(s.student_email)=lower(w.student_email)
+                LEFT JOIN nuvedra_grades g ON g.submission_id=s.id
+                WHERE w.item_id=? ORDER BY lower(w.student_email)""", (item_id,)))
+        source = academic_access.esc((template or {}).get("source_url") or "", attr=True)
+        name = academic_access.esc((template or {}).get("template_name") or "", attr=True)
+        instructions = academic_access.esc((template or {}).get("instructions") or "")
+        mode = (template or {}).get("distribution_mode") or "personal_copy_required"
+        connected_note = "Connected to Microsoft 365; saving will validate the shared template through Microsoft Graph." if connection else "Microsoft 365 is not connected for this instructor. The link can be saved as unverified and validated later."
+        work_cards = []
+        for row in work_rows:
+            open_link = f'<a class="studio-button studio-button--quiet" href="{academic_access.esc(row.get("work_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open Microsoft work</a>' if row.get("work_url") else ""
+            grade = "Pending" if row.get("points_awarded") is None else f'{float(row.get("points_awarded") or 0):g} / {float(item.get("points") or 0):g}'
+            work_cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(row.get("student_email"))}</p><h3>{academic_access.esc(row.get("file_name") or "Microsoft 365 work")}</h3><p>{academic_access.esc(row.get("status"))} · {academic_access.esc(row.get("validation_status"))}</p><p><small>Last modified: {academic_access.esc(row.get("last_modified_at") or "—")} · {int(row.get("size_bytes") or 0)} bytes</small></p><p>NUVEDRA submission: {academic_access.esc(row.get("submission_status") or "Not submitted")} · Grade: {academic_access.esc(grade)}</p>{open_link}</article>''')
+        remove_button = f'''<form method="post" action="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/archive"><button class="studio-button studio-button--quiet">Archive Microsoft template</button></form>''' if template else ""
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-assignment-classwork-v4"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Classwork</a><span> / </span><a href="{STUDIO_PREFIX}/assignments/{item_id}">Submission inbox</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">{academic_access.esc(module.get("title"))}</p><h2>{academic_access.esc(item.get("title"))}</h2><p>{academic_access.esc(course.get("course_code"))} · Microsoft 365 assignment configuration</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>Microsoft 365 template / reference</h3><p>{academic_access.esc(connected_note)}</p><form method="post" action="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/template"><label>Template or reference HTTPS URL<input type="url" name="source_url" required value="{source}"></label><label>Display name<input name="template_name" maxlength="180" value="{name}"></label><label>Distribution mode<select name="distribution_mode"><option value="personal_copy_required" {'selected' if mode == 'personal_copy_required' else ''}>Student creates a personal copy and submits its link</option><option value="reference" {'selected' if mode == 'reference' else ''}>Reference only</option></select></label><label>Student instructions<textarea name="instructions" rows="5" maxlength="3000">{instructions}</textarea></label><button class="studio-button">Save Microsoft classwork</button></form>{remove_button}</article><article class="studio-panel"><h3>Submission model</h3><p>Students open the Microsoft template, create or edit their own file in Microsoft 365, paste the personal OneDrive/SharePoint link into NUVEDRA, and validate it through their connected Microsoft identity before turn-in.</p><p>Turn-in writes the Microsoft URL into the canonical NUVEDRA submission and assignment-attempt history, so Gradebook, analytics, completion, rubrics, and outcomes continue to use the same academic record.</p></article></section><section class="studio-section"><h2>Microsoft 365 student work</h2><div class="studio-grid">{''.join(work_cards) or '<section class="studio-empty">No Microsoft 365 work links have been registered yet.</section>'}</div></section></main>'''
+        return academic_access.portal_page("Microsoft 365 assignment", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/template", response_model=None)
+    async def save_template(item_id: int, request: Request, source_url: str = Form(...), template_name: str = Form(""), distribution_mode: str = Form("personal_copy_required"), instructions: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_url = _https_url(source_url, "Microsoft 365 template")
+        if distribution_mode not in DISTRIBUTION_MODES:
+            raise HTTPException(400, "Unsupported Microsoft 365 distribution mode.")
+        info = None
+        with db() as conn:
+            course_id, _item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            connection = _connection(conn, user["email"])
+        if connection:
+            info = await _resolve_shared_item(user["email"], clean_url)
+        with db() as conn:
+            _upsert_template(
+                conn,
+                item_id=item_id,
+                course_id=course_id,
+                source_url=clean_url,
+                template_name=template_name.strip()[:180],
+                distribution_mode=distribution_mode,
+                instructions=instructions.strip()[:3000],
+                info=info,
+                actor=user["email"],
+            )
+            audit(conn, user["email"], "microsoft365_assignment_template_saved", "item", str(item_id), distribution_mode, request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/archive", response_model=None)
+    async def archive_template(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, _item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            execute(conn, "UPDATE nuvedra_microsoft_assignment_templates SET status='archived',updated_at=? WHERE item_id=?", (utcnow(), item_id))
+            audit(conn, user["email"], "microsoft365_assignment_template_archived", "item", str(item_id), "", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365", status_code=303)
+
+    @app.get("/learn/assignments/{item_id}/microsoft365", response_class=HTMLResponse, response_model=None)
+    async def student_classwork(item_id: int, request: Request):
+        user = _user(request, f"/learn/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], academic_access.STUDENT_ROLES)
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This assignment is not available.")
+            template = _template(conn, item_id)
+            if not template:
+                raise HTTPException(404, "This assignment does not have Microsoft 365 classwork configured.")
+            work = _work(conn, item_id, user["email"])
+            connection = _connection(conn, user["email"])
+        role = str(access.get("course_role") or "")
+        template_link = f'<a class="studio-button" href="{academic_access.esc(template.get("source_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open Microsoft 365 template</a>'
+        work_link = f'<a class="studio-button studio-button--quiet" href="{academic_access.esc(work.get("work_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open my Microsoft work</a>' if work else ""
+        connection_html = '<p class="studio-notice"><strong>Microsoft 365 connected.</strong> NUVEDRA can validate a OneDrive/SharePoint file that this identity is allowed to access.</p>' if connection else f'<p class="studio-notice"><strong>Microsoft 365 connection required.</strong> Connect your Microsoft account before registering or submitting a work link.</p><a class="studio-button" href="/portal/microsoft-connect?next=/learn/assignments/{item_id}/microsoft365">Connect Microsoft 365</a>'
+        if role == "student":
+            form = f'''<section class="studio-panel"><h3>Register my Microsoft 365 work</h3>{connection_html}<p>Open the template, use Microsoft 365 to create your own working copy when required, then paste the HTTPS link to your personal file below. Make sure the instructor can access the file according to your institution's Microsoft sharing rules.</p><form method="post" action="/learn/assignments/{item_id}/microsoft365/link"><label>My OneDrive / SharePoint file URL<input type="url" name="work_url" required value="{academic_access.esc((work or {}).get("work_url") or "", attr=True)}"></label><button class="studio-button studio-button--quiet">Validate and save link</button></form>{work_link}</section>'''
+            if work and work.get("validation_status") == "verified":
+                form += f'''<section class="studio-panel"><h3>Turn in Microsoft 365 work</h3><p><strong>{academic_access.esc(work.get("file_name") or "Microsoft 365 file")}</strong> · {int(work.get("size_bytes") or 0)} bytes</p><p><small>Last modified in Microsoft 365: {academic_access.esc(work.get("last_modified_at") or "—")}</small></p><form method="post" action="/learn/assignments/{item_id}/microsoft365/submit"><button class="studio-button">Turn in to NUVEDRA</button></form><p><small>NUVEDRA will revalidate the Microsoft link at turn-in and create a canonical assignment attempt. Your Office file remains stored in Microsoft 365.</small></p></section>'''
+        else:
+            form = '<section class="studio-panel"><p>Observers can view the Microsoft 365 template/reference but cannot register or submit student work.</p></section>'
+        instructions = academic_access.esc(template.get("instructions") or "Follow the assignment instructions in NUVEDRA and Microsoft 365.")
+        mode_label = "Personal copy required" if template.get("distribution_mode") == "personal_copy_required" else "Reference only"
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-student-classwork-v4"><nav class="studio-breadcrumbs"><a href="/learn/assignments/{item_id}">Assignment</a><span> / </span><a href="/learn/courses/{course_id}">Course</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Microsoft 365 Classwork</p><h2>{academic_access.esc(item.get("title"))}</h2><p>{academic_access.esc(module.get("title"))} · {academic_access.esc(mode_label)}</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>{academic_access.esc(template.get("template_name") or "Microsoft 365 template")}</h3><p>{instructions}</p>{template_link}<p><small>Template validation: {academic_access.esc(template.get("validation_status"))}</small></p></article><article class="studio-panel"><h3>How submission works</h3><p>Your Microsoft file remains in OneDrive or SharePoint. NUVEDRA stores the validated link and file metadata, then records the turn-in as the normal NUVEDRA assignment submission used by Gradebook.</p></article></section>{form}</main>'''
+        return academic_access.portal_page("Microsoft 365 Classwork", body, user)
+
+    @app.post("/learn/assignments/{item_id}/microsoft365/link", response_model=None)
+    async def link_student_work(item_id: int, request: Request, work_url: str = Form(...)):
+        user = _user(request, f"/learn/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        clean_url = _https_url(work_url, "Microsoft 365 work link")
+        with db() as conn:
+            course_id, item, module = _bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This assignment is not available.")
+            template = _template(conn, item_id)
+            if not template:
+                raise HTTPException(404, "Microsoft 365 classwork is not configured for this assignment.")
+            _require_connected(conn, user["email"])
+            if template.get("distribution_mode") == "personal_copy_required" and clean_url == str(template.get("source_url") or ""):
+                raise HTTPException(409, "Submit your personal Microsoft 365 work link, not the instructor template link.")
+        info = await _resolve_shared_item(user["email"], clean_url)
+        if template.get("distribution_mode") == "personal_copy_required" and template.get("source_item_id") and info.get("item_id") == template.get("source_item_id"):
+            raise HTTPException(409, "The linked file is the instructor template. Create and link your personal Microsoft 365 copy.")
+        with db() as conn:
+            _upsert_work(conn, item_id=item_id, course_id=course_id, email=user["email"], url=clean_url, info=info)
+            audit(conn, user["email"], "microsoft365_student_work_linked", "item", str(item_id), str(info.get("item_id") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/assignments/{item_id}/microsoft365", status_code=303)
+
+    @app.post("/learn/assignments/{item_id}/microsoft365/submit", response_model=None)
+    async def submit_student_work(item_id: int, request: Request):
+        user = _user(request, f"/learn/assignments/{item_id}/microsoft365")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _bundle(conn, item_id)
+            access = academic_access.require_course_role(conn, course_id, user["email"], {"student"})
+            if str(access.get("course_status")) != "active" or str(module.get("status")) != "published" or str(item.get("status")) != "published":
+                raise HTTPException(403, "This assignment is not available.")
+            template = _template(conn, item_id)
+            work = _work(conn, item_id, user["email"])
+            if not template or not work:
+                raise HTTPException(409, "Link and validate your Microsoft 365 work before submitting.")
+            _require_connected(conn, user["email"])
+            work_url = str(work.get("work_url") or "")
+        info = await _resolve_shared_item(user["email"], work_url)
+        if template.get("distribution_mode") == "personal_copy_required" and template.get("source_item_id") and info.get("item_id") == template.get("source_item_id"):
+            raise HTTPException(409, "The instructor template cannot be submitted as personal work.")
+        with db() as conn:
+            work_id = _upsert_work(conn, item_id=item_id, course_id=course_id, email=user["email"], url=work_url, info=info)
+            submission_id = assignments._upsert_submission(
+                conn,
+                item_id,
+                user["email"],
+                f"Microsoft 365 submission: {info.get('name') or 'linked file'}",
+                work_url,
+                "submitted",
+            )
+            attempts = rows(execute(conn, "SELECT COUNT(*) AS total FROM nuvedra_assignment_attempts WHERE submission_id=?", (submission_id,)))
+            attempt_no = int(attempts[0].get("total") or 0) + 1
+            now = utcnow()
+            execute(conn, """INSERT INTO nuvedra_assignment_attempts
+                (submission_id,attempt_no,response_text,response_url,file_id,status,is_late,submitted_at)
+                VALUES (?,?,?,?,NULL,'submitted',?,?)""",
+                (
+                    submission_id,
+                    attempt_no,
+                    f"Microsoft 365 submission: {info.get('name') or 'linked file'}",
+                    work_url,
+                    1 if assignments._is_late(item) else 0,
+                    now,
+                ))
+            execute(conn, """INSERT INTO nuvedra_microsoft_work_attempts
+                (work_id,submission_id,attempt_no,work_url,microsoft_item_id,etag,size_bytes,last_modified_at,submitted_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    work_id,
+                    submission_id,
+                    attempt_no,
+                    work_url,
+                    info.get("item_id") or None,
+                    info.get("etag") or None,
+                    int(info.get("size") or 0),
+                    info.get("last_modified") or None,
+                    now,
+                ))
+            execute(conn, "UPDATE nuvedra_microsoft_student_work SET status='submitted',submitted_at=?,updated_at=? WHERE id=?", (now, now, work_id))
+            assignments._notify_instructors(conn, course_id, user["email"], item)
+            audit(conn, user["email"], "microsoft365_assignment_submitted", "item", str(item_id), f"attempt={attempt_no};item={info.get('item_id') or ''}", request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/assignments/{item_id}/microsoft365", status_code=303)
+
+    print("NUVEDRA Microsoft 365 Classwork & Assignments v4 registered: assignment templates, student Microsoft work validation, metadata-only evidence, canonical submissions, attempt history, and Gradebook linkage.", flush=True)
