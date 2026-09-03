@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+from urllib.parse import urlencode, urlparse
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.admin_console as admin_console
+import app.microsoft365_integration as m365
+import app.microsoft365_tenant_readiness_v5 as readiness
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+CORE_SCOPES = {"openid", "profile", "email", "offline_access", "User.Read"}
+CONTENT_SCOPES = {"Files.Read", "Sites.Read.All", "Calendars.ReadWrite"}
+COLLABORATION_SCOPES = {"User.ReadBasic.All", "Team.ReadBasic.All", "TeamMember.ReadWrite.All", "Channel.ReadBasic.All", "Channel.Create"}
+PROVISIONING_SCOPES = {"Team.Create", "Files.ReadWrite"}
+EDUCATION_READ_SCOPES = {"EduRoster.ReadBasic", "EduAssignments.ReadBasic"}
+EDUCATION_WRITE_SCOPES = {"EduAssignments.ReadWrite"}
+RECOMMENDED_SCOPES = CORE_SCOPES | CONTENT_SCOPES | COLLABORATION_SCOPES | PROVISIONING_SCOPES | EDUCATION_READ_SCOPES | EDUCATION_WRITE_SCOPES
+WRITE_POLICY_VARS = (
+    "MICROSOFT_ALLOW_TEAM_CREATION",
+    "MICROSOFT_ALLOW_EDUCATION_WRITES",
+    "MICROSOFT_ALLOW_EDUCATION_PUBLISH",
+    "MICROSOFT_ALLOW_GRADE_EXPORT",
+    "MICROSOFT_ALLOW_GRADE_RETURN",
+)
+GENERIC_TENANTS = {"", "common", "organizations", "consumers"}
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _truthy(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _admin(request: Request) -> dict[str, Any]:
+    user = admin_console.session_user(request)
+    if not user or str(user.get("role") or "") not in {"superadmin", "course_admin"}:
+        raise HTTPException(403, "Platform administration permission is required.")
+    return user
+
+
+def _specific_tenant(tenant: str) -> bool:
+    return str(tenant or "").strip().lower() not in GENERIC_TENANTS
+
+
+def _redirect_ok(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def _configured_scopes() -> set[str]:
+    return {part.strip() for part in str(m365._config().get("scopes") or "").split() if part.strip()}
+
+
+def _effective_scopes(conn: Any, email: str) -> set[str]:
+    connection = m365._connection(conn, email)
+    if not connection:
+        return set()
+    return {part.strip() for part in str(connection.get("scopes") or "").split() if part.strip()}
+
+
+def _allowed_domains() -> list[str]:
+    raw = str(os.getenv("MICROSOFT_ALLOWED_DOMAINS", "") or "").replace(",", " ")
+    return sorted({part.strip().lower() for part in raw.split() if part.strip()})
+
+
+def _configuration() -> dict[str, Any]:
+    cfg = m365._config()
+    tenant = str(cfg.get("tenant") or "").strip()
+    redirect = str(cfg.get("redirect_uri") or "").strip()
+    configured_scopes = _configured_scopes()
+    return {
+        "client_id_present": bool(str(cfg.get("client_id") or "").strip()),
+        "client_secret_present": bool(str(cfg.get("client_secret") or "").strip()),
+        "tenant": tenant,
+        "specific_tenant": _specific_tenant(tenant),
+        "redirect_uri": redirect,
+        "redirect_https": _redirect_ok(redirect),
+        "token_encryption_key_present": bool(str(os.getenv("MICROSOFT_TOKEN_ENCRYPTION_KEY", "")).strip()),
+        "institution_tenant_required": _truthy("MICROSOFT_REQUIRE_INSTITUTION_TENANT"),
+        "allowed_domains": _allowed_domains(),
+        "configured_scopes": sorted(configured_scopes),
+        "missing_recommended_scopes": sorted(RECOMMENDED_SCOPES.difference(configured_scopes)),
+        "write_policies": {name: _truthy(name) for name in WRITE_POLICY_VARS},
+    }
+
+
+def _admin_consent_url(config: dict[str, Any]) -> str:
+    cfg = m365._config()
+    tenant = str(config.get("tenant") or "")
+    client_id = str(cfg.get("client_id") or "").strip()
+    redirect = str(config.get("redirect_uri") or "")
+    if not client_id or not _specific_tenant(tenant) or not _redirect_ok(redirect):
+        return ""
+    return f"https://login.microsoftonline.com/{tenant}/adminconsent?" + urlencode({"client_id": client_id, "redirect_uri": redirect})
+
+
+def _status(config: dict[str, Any], effective_scopes: set[str], checks: dict[str, Any]) -> str:
+    base_ready = all([
+        config.get("client_id_present"),
+        config.get("client_secret_present"),
+        config.get("specific_tenant"),
+        config.get("redirect_https"),
+        config.get("token_encryption_key_present"),
+    ])
+    if config.get("institution_tenant_required") and not config.get("specific_tenant"):
+        return "blocked"
+    if not base_ready:
+        return "configuration_incomplete"
+    if not checks.get("identity", {}).get("ok") or not checks.get("organization", {}).get("ok"):
+        return "connected_probe_attention"
+    read_sets_ready = CORE_SCOPES.issubset(effective_scopes) and CONTENT_SCOPES.issubset(effective_scopes) and EDUCATION_READ_SCOPES.issubset(effective_scopes)
+    probes_ready = checks.get("onedrive", {}).get("ok") and checks.get("sharepoint", {}).get("ok") and checks.get("calendar", {}).get("ok") and checks.get("education", {}).get("ok")
+    if read_sets_ready and probes_ready and EDUCATION_WRITE_SCOPES.issubset(effective_scopes):
+        if all(bool(config.get("write_policies", {}).get(name)) for name in ("MICROSOFT_ALLOW_EDUCATION_WRITES", "MICROSOFT_ALLOW_EDUCATION_PUBLISH", "MICROSOFT_ALLOW_GRADE_EXPORT")):
+            return "writes_enabled"
+        return "ready_for_governed_enablement"
+    if CORE_SCOPES.issubset(effective_scopes):
+        return "core_ready"
+    return "attention"
+
+
+def _status_label(value: str) -> str:
+    return {
+        "blocked": "Blocked by tenant policy",
+        "configuration_incomplete": "Configuration incomplete",
+        "connected_probe_attention": "Connected, but live probe needs attention",
+        "core_ready": "Core sign-in ready",
+        "ready_for_governed_enablement": "Ready for governed Microsoft Education enablement",
+        "writes_enabled": "Microsoft Education writes enabled",
+        "attention": "Needs attention",
+    }.get(value, value)
+
+
+def ensure_microsoft365_consent_wizard_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_consent_wizard_snapshots (
+            id {pk}, user_email TEXT NOT NULL, tenant_id TEXT,
+            effective_scopes TEXT, missing_recommended_scopes TEXT,
+            configuration_json TEXT NOT NULL, checks_json TEXT NOT NULL,
+            readiness_status TEXT NOT NULL, created_at TEXT NOT NULL
+        )""")
+
+
+def _check_card(title: str, ok: bool, detail: str) -> str:
+    label = "Ready" if ok else "Attention"
+    return f'<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(label)}</p><h3>{academic_access.esc(title)}</h3><p>{academic_access.esc(detail)}</p></article>'
+
+
+def _env_template(config: dict[str, Any]) -> str:
+    tenant = str(config.get("tenant") or "<TENANT-ID>")
+    redirect = str(config.get("redirect_uri") or "https://YOUR-HOST/auth/microsoft/callback")
+    domains = " ".join(config.get("allowed_domains") or ["your-university.edu"])
+    scopes = " ".join(sorted(RECOMMENDED_SCOPES))
+    return "\n".join([
+        "MICROSOFT_CLIENT_ID=<APPLICATION-CLIENT-ID>",
+        "MICROSOFT_CLIENT_SECRET=<STORE-AS-RENDER-SECRET>",
+        f"MICROSOFT_TENANT_ID={tenant}",
+        f"MICROSOFT_REDIRECT_URI={redirect}",
+        "MICROSOFT_TOKEN_ENCRYPTION_KEY=<STRONG-RANDOM-SECRET>",
+        f"MICROSOFT_ALLOWED_DOMAINS={domains}",
+        "MICROSOFT_REQUIRE_INSTITUTION_TENANT=true",
+        f"MICROSOFT_SCOPES={scopes}",
+        "MICROSOFT_ALLOW_TEAM_CREATION=false",
+        "MICROSOFT_ALLOW_EDUCATION_WRITES=false",
+        "MICROSOFT_ALLOW_EDUCATION_PUBLISH=false",
+        "MICROSOFT_ALLOW_GRADE_EXPORT=false",
+        "MICROSOFT_ALLOW_GRADE_RETURN=false",
+    ])
+
+
+async def _probe(email: str, effective_scopes: set[str]) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+
+    async def graph_check(key: str, path: str, *, params: dict[str, Any] | None = None, required: set[str] | None = None) -> None:
+        missing = sorted((required or set()).difference(effective_scopes))
+        if missing:
+            checks[key] = {"ok": False, "skipped": True, "detail": "Missing effective scope(s): " + ", ".join(missing)}
+            return
+        try:
+            payload = await m365._graph_json(email, "GET", path, params=params)
+            checks[key] = {"ok": True, "detail": "Microsoft Graph read succeeded.", "sample_id": str(payload.get("id") or "")[:120]}
+        except HTTPException as exc:
+            checks[key] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:350]}
+
+    await graph_check("identity", "/me", params={"$select": "id,displayName,mail,userPrincipalName"}, required={"User.Read"})
+    try:
+        org_payload = await m365._graph_json(email, "GET", "/organization", params={"$select": "id,displayName,verifiedDomains"})
+        organization = readiness._organization_summary(org_payload)
+        configured = str(m365._config().get("tenant") or "").lower()
+        org_id = str(organization.get("id") or "").lower()
+        checks["organization"] = {
+            "ok": bool(org_id and configured == org_id),
+            "detail": "Configured tenant matches live organization." if org_id and configured == org_id else "Configured tenant does not match the live Microsoft organization ID.",
+            "organization_id": organization.get("id"),
+            "organization_name": organization.get("display_name"),
+        }
+    except HTTPException as exc:
+        checks["organization"] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:350]}
+    await graph_check("onedrive", "/me/drive/root", params={"$select": "id,name,webUrl"}, required={"Files.Read"})
+    await graph_check("sharepoint", "/sites/root", params={"$select": "id,displayName,webUrl"}, required={"Sites.Read.All"})
+    await graph_check("calendar", "/me/calendar", params={"$select": "id,name"}, required={"Calendars.ReadWrite"})
+    await graph_check("teams", "/me/joinedTeams", params={"$top": 1, "$select": "id,displayName"}, required={"Team.ReadBasic.All"})
+    if EDUCATION_READ_SCOPES.issubset(effective_scopes):
+        try:
+            classes, pages = await readiness._taught_classes(email)
+            checks["education"] = {"ok": True, "detail": f"Microsoft Education read succeeded: {len(classes)} taught class(es), {pages} page(s)."}
+        except HTTPException as exc:
+            checks["education"] = {"ok": False, "status": exc.status_code, "detail": str(exc.detail)[:350]}
+    else:
+        checks["education"] = {"ok": False, "skipped": True, "detail": "Missing effective Microsoft Education read scopes."}
+    return checks
+
+
+def register_microsoft365_consent_wizard_v7(app: FastAPI) -> None:
+    ensure_microsoft365_consent_wizard_schema()
+
+    @app.get("/admin/microsoft365/consent-wizard", response_class=HTMLResponse, response_model=None)
+    async def microsoft365_consent_wizard(request: Request):
+        admin = _admin(request)
+        email = str(admin.get("email") or "").lower()
+        config = _configuration()
+        with db() as conn:
+            connection = m365._connection(conn, email)
+            effective = _effective_scopes(conn, email)
+            history = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_consent_wizard_snapshots ORDER BY id DESC LIMIT 10"))
+        configured = set(config.get("configured_scopes") or [])
+        missing_effective = sorted(RECOMMENDED_SCOPES.difference(effective))
+        consent_url = _admin_consent_url(config)
+        basics = [
+            _check_card("Application client ID", bool(config.get("client_id_present")), "Configured" if config.get("client_id_present") else "Set MICROSOFT_CLIENT_ID."),
+            _check_card("Client secret", bool(config.get("client_secret_present")), "Stored in server environment" if config.get("client_secret_present") else "Set MICROSOFT_CLIENT_SECRET as a secret."),
+            _check_card("Institution tenant", bool(config.get("specific_tenant")), str(config.get("tenant") or "Configure a specific tenant ID.")),
+            _check_card("OAuth redirect", bool(config.get("redirect_https")), str(config.get("redirect_uri") or "Configure an HTTPS callback.")),
+            _check_card("Token encryption", bool(config.get("token_encryption_key_present")), "Encryption key configured" if config.get("token_encryption_key_present") else "Set MICROSOFT_TOKEN_ENCRYPTION_KEY."),
+            _check_card("Connected admin identity", bool(connection), str((connection or {}).get("display_name") or "Connect Microsoft 365 using this administrator email.")),
+        ]
+        scope_rows = []
+        for scope in sorted(RECOMMENDED_SCOPES):
+            scope_rows.append(f'<tr><td><code>{academic_access.esc(scope)}</code></td><td>{"Yes" if scope in configured else "No"}</td><td>{"Yes" if scope in effective else "No"}</td></tr>')
+        policy_rows = "".join(f'<tr><td><code>{name}</code></td><td>{"Enabled" if bool(config.get("write_policies", {}).get(name)) else "Disabled"}</td></tr>' for name in WRITE_POLICY_VARS)
+        history_rows = "".join(f'<tr><td>{academic_access.esc(row.get("created_at"))}</td><td>{academic_access.esc(_status_label(str(row.get("readiness_status") or "")))}</td><td>{academic_access.esc(row.get("missing_recommended_scopes") or "None")}</td></tr>' for row in history) or '<tr><td colspan="3">No wizard probe has been recorded.</td></tr>'
+        consent = f'<a class="studio-button" href="{academic_access.esc(consent_url, attr=True)}" target="_blank" rel="noopener noreferrer">Open Microsoft admin-consent page</a>' if consent_url else '<p class="studio-notice">A consent link can be generated after Client ID, specific Tenant ID, and HTTPS Redirect URI are configured.</p>'
+        probe = '<form method="post" action="/admin/microsoft365/consent-wizard/probe"><button class="studio-button">Run final read-only verification</button></form>' if connection else '<p class="studio-notice">Connect Microsoft 365 with this administrator identity before running the final verification.</p>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-consent-wizard-v7"><nav class="studio-breadcrumbs"><a href="/admin/microsoft365/tenant-readiness">Tenant Readiness v5</a><span> / </span><a href="/admin/microsoft365/production">Production v3</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft 365 Production Configuration & Consent Wizard v7</p><h2>Prepare Entra ID, Render and Microsoft Graph safely</h2><p>This wizard inventories configuration, distinguishes requested scopes from effective OAuth scopes, provides a tenant-specific Microsoft admin-consent handoff, and runs read-only service verification before academic write gates are enabled.</p></div></header><section class="studio-grid">{''.join(basics)}</section><section class="studio-panel"><h3>1. Entra application registration</h3><p>Register the configured HTTPS callback URI exactly as shown below. Client secrets and token-encryption material remain server-side and are never displayed by this wizard.</p><p><strong>Redirect URI:</strong> <code>{academic_access.esc(config.get("redirect_uri") or "Not configured")}</code></p><p><strong>Tenant:</strong> <code>{academic_access.esc(config.get("tenant") or "Not configured")}</code></p><p><strong>Allowed institutional domains:</strong> {academic_access.esc(', '.join(config.get('allowed_domains') or []) or 'Not restricted')}</p></section><section class="studio-panel"><h3>2. Delegated Microsoft Graph permissions</h3><table><thead><tr><th>Scope</th><th>Requested in MICROSOFT_SCOPES</th><th>Effective for connected admin</th></tr></thead><tbody>{''.join(scope_rows)}</tbody></table><p><strong>Missing from configured scope list:</strong> {academic_access.esc(', '.join(config.get('missing_recommended_scopes') or []) or 'None')}</p><p><strong>Missing from effective connected identity:</strong> {academic_access.esc(', '.join(missing_effective) or 'None')}</p><p><small>NUVEDRA does not infer Microsoft tenant-wide consent from environment configuration. Effective scope evidence comes from the OAuth connection actually returned by Microsoft.</small></p></section><section class="studio-panel"><h3>3. Microsoft administrator consent</h3><p>The control below opens Microsoft's tenant-specific consent endpoint. NUVEDRA does not grant consent itself and never receives an administrator password.</p>{consent}</section><section class="studio-panel"><h3>4. Render environment template</h3><p>Copy the variable names and replace placeholders in Render. Existing secret values are intentionally never rendered.</p><pre>{academic_access.esc(_env_template(config))}</pre></section><section class="studio-panel"><h3>5. Academic write gates</h3><table><thead><tr><th>Policy</th><th>Current state</th></tr></thead><tbody>{policy_rows}</tbody></table><p><small>Recommended rollout: leave write gates false until the read-only verification is healthy and institutional governance has approved assignment/grade synchronization.</small></p></section><section class="studio-panel"><h3>6. Final live verification</h3>{probe}<p><small>The verification uses GET/read-only Microsoft Graph calls for identity, organization, OneDrive, SharePoint, calendar, Teams discovery and Microsoft Education. It does not create or modify Microsoft resources.</small></p></section><section class="studio-panel"><h3>Recent verification snapshots</h3><table><thead><tr><th>Time</th><th>Status</th><th>Missing effective scopes</th></tr></thead><tbody>{history_rows}</tbody></table></section></main>'''
+        return admin_console.page("Microsoft 365 Consent Wizard v7", body, admin)
+
+    @app.post("/admin/microsoft365/consent-wizard/probe", response_model=None)
+    async def microsoft365_consent_wizard_probe(request: Request):
+        admin = _admin(request)
+        email = str(admin.get("email") or "").lower()
+        config = _configuration()
+        with db() as conn:
+            connection = m365._connection(conn, email)
+            if not connection:
+                raise HTTPException(409, "Connect Microsoft 365 using this administrator email before running the final verification.")
+            effective = _effective_scopes(conn, email)
+        checks = await _probe(email, effective)
+        status = _status(config, effective, checks)
+        missing = sorted(RECOMMENDED_SCOPES.difference(effective))
+        with db() as conn:
+            execute(conn, """INSERT INTO nuvedra_microsoft_consent_wizard_snapshots
+                (user_email,tenant_id,effective_scopes,missing_recommended_scopes,configuration_json,checks_json,readiness_status,created_at)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    email,
+                    str(config.get("tenant") or "") or None,
+                    " ".join(sorted(effective)),
+                    " ".join(missing),
+                    json.dumps(config, ensure_ascii=False),
+                    json.dumps(checks, ensure_ascii=False),
+                    status,
+                    utcnow(),
+                ),
+            )
+            audit(conn, email, "microsoft365_consent_wizard_probe", "tenant", str(config.get("tenant") or ""), status, request.client.host if request.client else "")
+        return RedirectResponse("/admin/microsoft365/consent-wizard", status_code=303)
+
+    print("NUVEDRA Microsoft 365 Production Configuration & Consent Wizard v7 registered: Entra/Render configuration inventory, tenant-specific admin-consent handoff, requested-vs-effective scope evidence, write-gate governance, and final read-only Microsoft Graph verification.", flush=True)
