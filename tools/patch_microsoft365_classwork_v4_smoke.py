@@ -29,6 +29,13 @@ def main() -> None:
     PATH.write_text(text, encoding="utf-8")
     print("Microsoft 365 Classwork & Assignments v4 functional validation attached to Course Studio smoke tests.", flush=True)
 
+    # Install v5 only after Microsoft 365 Classwork v4 exists.
+    from patch_microsoft365_tenant_readiness_v5 import main as patch_microsoft365_tenant_readiness_v5
+    patch_microsoft365_tenant_readiness_v5()
+
+    from patch_microsoft365_tenant_readiness_v5_smoke import main as patch_microsoft365_tenant_readiness_v5_smoke
+    patch_microsoft365_tenant_readiness_v5_smoke()
+
 
 if __name__ == "__main__":
     main()
