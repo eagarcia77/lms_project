@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+import app.academic_access as academic_access
+import app.assignments_submissions as assignments
+import app.microsoft365_integration as m365
+import app.microsoft365_production_v3 as production
+import app.microsoft365_tenant_readiness_v5 as readiness
+from app.admin_console import audit, database_url, db, execute, rows, utcnow
+
+STUDIO_PREFIX = "/faculty/studio"
+ASSIGNMENT_WRITE_SCOPES = {"EduAssignments.ReadWriteBasic", "EduAssignments.ReadWrite"}
+GRADE_WRITE_SCOPE = "EduAssignments.ReadWrite"
+MAX_GRADE_EXPORT_ROWS = 200
+
+
+def _pk() -> str:
+    return "INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY" if database_url().startswith("postgres") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+
+def _assets() -> str:
+    return '<link rel="stylesheet" href="/static/course-studio.css"><script src="/static/course-studio.js" defer></script>'
+
+
+def _truthy(name: str) -> bool:
+    return str(os.getenv(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def ensure_microsoft365_education_sync_schema() -> None:
+    pk = _pk()
+    with db() as conn:
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_education_assignments (
+            id {pk}, item_id INTEGER NOT NULL UNIQUE, course_id INTEGER NOT NULL,
+            class_id TEXT NOT NULL, microsoft_assignment_id TEXT NOT NULL,
+            web_url TEXT, microsoft_status TEXT NOT NULL DEFAULT 'draft',
+            max_points REAL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL, last_verified_at TEXT
+        )""")
+        execute(conn, f"""CREATE TABLE IF NOT EXISTS nuvedra_microsoft_grade_exports (
+            id {pk}, item_id INTEGER NOT NULL, submission_id INTEGER NOT NULL,
+            student_email TEXT NOT NULL, microsoft_assignment_id TEXT NOT NULL,
+            microsoft_submission_id TEXT, outcome_id TEXT,
+            nuvedra_points REAL, nuvedra_possible REAL,
+            microsoft_points REAL, microsoft_possible REAL,
+            action TEXT NOT NULL, status TEXT NOT NULL, details TEXT,
+            exported_by TEXT NOT NULL, exported_at TEXT NOT NULL
+        )""")
+
+
+def _user(request: Request, return_to: str) -> dict[str, Any] | RedirectResponse:
+    user = academic_access.google_user(request)
+    if not user:
+        return academic_access.login_redirect(return_to)
+    return user
+
+
+def _bundle(conn: Any, item_id: int) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    return assignments._bundle(conn, item_id)
+
+
+def _mapping(conn: Any, item_id: int) -> dict[str, Any] | None:
+    found = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_education_assignments WHERE item_id=?", (item_id,)))
+    return found[0] if found else None
+
+
+def _scopes(conn: Any, email: str) -> set[str]:
+    return readiness._connection_scopes(conn, email)
+
+
+def _require_connection(conn: Any, email: str) -> set[str]:
+    if not m365._connection(conn, email):
+        raise HTTPException(409, "Connect Microsoft 365 with the same instructor identity before using Education synchronization.")
+    return _scopes(conn, email)
+
+
+def _require_assignment_write(conn: Any, email: str) -> set[str]:
+    if not _truthy("MICROSOFT_ALLOW_EDUCATION_WRITES"):
+        raise HTTPException(403, "Microsoft Education assignment writes are disabled by platform policy. Set MICROSOFT_ALLOW_EDUCATION_WRITES=true only after institutional approval.")
+    scopes = _require_connection(conn, email)
+    if not ASSIGNMENT_WRITE_SCOPES.intersection(scopes):
+        raise HTTPException(403, "The connected Microsoft identity requires EduAssignments.ReadWriteBasic or EduAssignments.ReadWrite.")
+    return scopes
+
+
+def _require_grade_write(conn: Any, email: str) -> set[str]:
+    if not _truthy("MICROSOFT_ALLOW_GRADE_EXPORT"):
+        raise HTTPException(403, "Microsoft Education grade export is disabled by platform policy. Set MICROSOFT_ALLOW_GRADE_EXPORT=true only after institutional approval.")
+    scopes = _require_connection(conn, email)
+    if GRADE_WRITE_SCOPE not in scopes:
+        raise HTTPException(403, "The connected Microsoft identity requires EduAssignments.ReadWrite before NUVEDRA grades can be exported.")
+    return scopes
+
+
+def _plain_text(value: Any, limit: int = 3500) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = html.unescape(re.sub(r"\s+", " ", text)).strip()
+    return text[:limit]
+
+
+def _iso_due(value: Any) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        raise HTTPException(409, "Set a due date in NUVEDRA before creating the Microsoft Education assignment. NUVEDRA will not invent an academic due date.")
+    try:
+        parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(409, "The NUVEDRA due date cannot be converted to Microsoft Education format.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _assignment_payload(item: dict[str, Any]) -> dict[str, Any]:
+    points = float(item.get("points") or 0)
+    if points <= 0:
+        raise HTTPException(409, "Set a positive point value in NUVEDRA before creating a points-based Microsoft Education assignment.")
+    instructions = _plain_text(item.get("body_html") or "") or "Complete this assignment in NUVEDRA according to the published course instructions."
+    return {
+        "dueDateTime": _iso_due(item.get("due_at")),
+        "displayName": str(item.get("title") or "NUVEDRA assignment")[:180],
+        "languageTag": "es-PR",
+        "instructions": {"contentType": "text", "content": instructions},
+        "grading": {"@odata.type": "#microsoft.graph.educationAssignmentPointsGradeType", "maxPoints": points},
+        "assignTo": {"@odata.type": "#microsoft.graph.educationAssignmentClassRecipient"},
+        "status": "draft",
+        "allowStudentsToAddResourcesToSubmission": True,
+    }
+
+
+def _upsert_mapping(conn: Any, *, item_id: int, course_id: int, class_id: str, assignment: dict[str, Any], actor: str) -> None:
+    assignment_id = str(assignment.get("id") or "").strip()
+    if not assignment_id:
+        raise HTTPException(502, "Microsoft Graph did not return an assignment identifier.")
+    grading = assignment.get("grading") if isinstance(assignment.get("grading"), dict) else {}
+    max_points = float(grading.get("maxPoints") or 0) or None
+    now = utcnow()
+    execute(conn, """INSERT INTO nuvedra_microsoft_education_assignments
+        (item_id,course_id,class_id,microsoft_assignment_id,web_url,microsoft_status,max_points,created_by,created_at,updated_at,last_verified_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(item_id) DO UPDATE SET class_id=excluded.class_id,
+        microsoft_assignment_id=excluded.microsoft_assignment_id,web_url=excluded.web_url,
+        microsoft_status=excluded.microsoft_status,max_points=excluded.max_points,
+        updated_at=excluded.updated_at,last_verified_at=excluded.last_verified_at""",
+        (
+            item_id,
+            course_id,
+            class_id,
+            assignment_id,
+            str(assignment.get("webUrl") or "") or None,
+            str(assignment.get("status") or "draft"),
+            max_points,
+            actor.lower(),
+            now,
+            now,
+            now,
+        ),
+    )
+
+
+async def _live_assignment(email: str, mapping: dict[str, Any]) -> dict[str, Any]:
+    return await m365._graph_json(
+        email,
+        "GET",
+        f"/education/classes/{readiness._class_id(str(mapping['class_id']))}/assignments/{readiness._class_id(str(mapping['microsoft_assignment_id']))}",
+        params={"$select": "id,displayName,status,dueDateTime,webUrl,grading,lastModifiedDateTime"},
+    )
+
+
+def _member_email(member: dict[str, Any]) -> str:
+    for key in ("mail", "userPrincipalName", "email"):
+        value = str(member.get(key) or "").strip().lower()
+        if "@" in value:
+            return value
+    return ""
+
+
+async def _education_members(email: str, class_id: str) -> list[dict[str, Any]]:
+    values, _pages = await production._graph_collection(
+        email,
+        f"/education/classes/{readiness._class_id(class_id)}/members",
+        params={"$top": 100, "$select": "id,displayName,userPrincipalName,mail,primaryRole"},
+    )
+    return values
+
+
+async def _education_submissions(email: str, class_id: str, assignment_id: str) -> list[dict[str, Any]]:
+    values, _pages = await production._graph_collection(
+        email,
+        f"/education/classes/{readiness._class_id(class_id)}/assignments/{readiness._class_id(assignment_id)}/submissions",
+        params={"$top": 100, "$select": "id,status,recipient,submittedDateTime,returnedDateTime,webUrl"},
+    )
+    return values
+
+
+async def _points_outcome(email: str, class_id: str, assignment_id: str, submission_id: str) -> dict[str, Any] | None:
+    values, _pages = await production._graph_collection(
+        email,
+        f"/education/classes/{readiness._class_id(class_id)}/assignments/{readiness._class_id(assignment_id)}/submissions/{readiness._class_id(submission_id)}/outcomes",
+        params={"$top": 50},
+    )
+    for outcome in values:
+        odata = str(outcome.get("@odata.type") or "").lower()
+        if "educationpointsoutcome" in odata or isinstance(outcome.get("points"), dict):
+            return outcome
+    return None
+
+
+def _recipient_user_id(submission: dict[str, Any]) -> str:
+    recipient = submission.get("recipient") if isinstance(submission.get("recipient"), dict) else {}
+    return str(recipient.get("userId") or "")
+
+
+async def _grade_candidates(conn: Any, *, email: str, item_id: int, item: dict[str, Any], mapping: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    live = await _live_assignment(email, mapping)
+    grading = live.get("grading") if isinstance(live.get("grading"), dict) else {}
+    microsoft_possible = float(grading.get("maxPoints") or mapping.get("max_points") or 0)
+    local_possible = float(item.get("points") or 0)
+    if local_possible <= 0 or microsoft_possible <= 0:
+        raise HTTPException(409, "Both NUVEDRA and Microsoft assignments must use positive point values before grades can be synchronized.")
+    members = await _education_members(email, str(mapping["class_id"]))
+    member_by_email = {_member_email(x): str(x.get("id") or "") for x in members if _member_email(x) and x.get("id")}
+    microsoft_submissions = await _education_submissions(email, str(mapping["class_id"]), str(mapping["microsoft_assignment_id"]))
+    submission_by_user = {_recipient_user_id(x): x for x in microsoft_submissions if _recipient_user_id(x)}
+    canonical = rows(execute(conn, """SELECT s.id AS submission_id,lower(s.student_email) AS student_email,s.status AS submission_status,
+        g.points_awarded,g.feedback,g.status AS grade_status,g.graded_at
+        FROM nuvedra_submissions s JOIN nuvedra_grades g ON g.submission_id=s.id
+        WHERE s.item_id=? AND g.status='graded' ORDER BY lower(s.student_email)""", (item_id,)))
+    if len(canonical) > MAX_GRADE_EXPORT_ROWS:
+        raise HTTPException(409, f"Grade synchronization is limited to {MAX_GRADE_EXPORT_ROWS} graded submissions per operation.")
+    result: list[dict[str, Any]] = []
+    for row in canonical:
+        student_email = str(row.get("student_email") or "").lower()
+        member_id = member_by_email.get(student_email, "")
+        microsoft_submission = submission_by_user.get(member_id) if member_id else None
+        awarded = float(row.get("points_awarded") or 0)
+        ratio = min(1.0, max(0.0, awarded / local_possible))
+        microsoft_points = round(ratio * microsoft_possible, 6)
+        result.append({
+            **row,
+            "member_id": member_id,
+            "microsoft_submission_id": str((microsoft_submission or {}).get("id") or ""),
+            "microsoft_submission_status": str((microsoft_submission or {}).get("status") or ""),
+            "microsoft_possible": microsoft_possible,
+            "microsoft_points": microsoft_points,
+            "ready": bool(member_id and microsoft_submission),
+        })
+    return live, result
+
+
+def _log_export(conn: Any, *, item_id: int, row: dict[str, Any], mapping: dict[str, Any], outcome_id: str, action: str, status: str, details: str, actor: str) -> None:
+    execute(conn, """INSERT INTO nuvedra_microsoft_grade_exports
+        (item_id,submission_id,student_email,microsoft_assignment_id,microsoft_submission_id,outcome_id,
+         nuvedra_points,nuvedra_possible,microsoft_points,microsoft_possible,action,status,details,exported_by,exported_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            item_id,
+            int(row["submission_id"]),
+            str(row["student_email"]).lower(),
+            str(mapping["microsoft_assignment_id"]),
+            str(row.get("microsoft_submission_id") or "") or None,
+            outcome_id or None,
+            float(row.get("points_awarded") or 0),
+            float(row.get("nuvedra_possible") or 0),
+            float(row.get("microsoft_points") or 0),
+            float(row.get("microsoft_possible") or 0),
+            action,
+            status,
+            details[:700],
+            actor.lower(),
+            utcnow(),
+        ),
+    )
+
+
+def register_microsoft365_education_sync_v6(app: FastAPI) -> None:
+    ensure_microsoft365_education_sync_schema()
+
+    @app.get(f"{STUDIO_PREFIX}/courses/{{course_id}}/microsoft365/education-sync", response_class=HTMLResponse, response_model=None)
+    async def education_sync_workspace(course_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-sync")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            class_link = readiness._class_link(conn, course_id)
+            scopes = _scopes(conn, user["email"])
+            data = rows(execute(conn, """SELECT i.id,i.title,i.points,i.due_at,i.status,m.title AS module_title,
+                e.microsoft_assignment_id,e.microsoft_status,e.web_url,e.max_points,e.last_verified_at,
+                (SELECT COUNT(*) FROM nuvedra_submissions s JOIN nuvedra_grades g ON g.submission_id=s.id WHERE s.item_id=i.id AND g.status='graded') AS graded_count,
+                (SELECT COUNT(*) FROM nuvedra_microsoft_grade_exports x WHERE x.item_id=i.id AND x.status='exported') AS export_count
+                FROM nexus_content_items i JOIN nexus_modules m ON m.id=i.module_id
+                LEFT JOIN nuvedra_microsoft_education_assignments e ON e.item_id=i.id
+                WHERE m.course_id=? AND i.item_type IN ('assignment','project','presentation')
+                ORDER BY m.position,i.position,i.id""", (course_id,)))
+        class_note = '<p class="studio-notice">Link a Microsoft Education class in Education Readiness v5 before synchronizing assignments.</p>' if not class_link else f'<p class="studio-notice"><strong>Linked educationClass:</strong> {academic_access.esc(class_link.get("display_name"))} · <code>{academic_access.esc(class_link.get("class_id"))}</code></p>'
+        cards = []
+        for row in data:
+            mapped = bool(row.get("microsoft_assignment_id"))
+            status = str(row.get("microsoft_status") or "not linked")
+            actions = f'<a class="studio-button" href="{STUDIO_PREFIX}/assignments/{int(row["id"])}/microsoft365/education-sync">Open sync</a>'
+            cards.append(f'''<article class="studio-panel"><p class="studio-eyebrow">{academic_access.esc(row.get("module_title"))}</p><h3>{academic_access.esc(row.get("title"))}</h3><p>NUVEDRA: {academic_access.esc(row.get("status"))} · {academic_access.esc(row.get("points") or "—")} pts · Microsoft: {academic_access.esc(status)}</p><p>{int(row.get("graded_count") or 0)} canonical grade(s) · {int(row.get("export_count") or 0)} successful Microsoft export record(s)</p><p>{'Mapped to '+academic_access.esc(row.get('microsoft_assignment_id')) if mapped else 'Not yet mapped to Microsoft Education'}</p>{actions}</article>''')
+        policy = f'''<ul><li>Assignment writes: <strong>{'enabled' if _truthy('MICROSOFT_ALLOW_EDUCATION_WRITES') else 'disabled'}</strong></li><li>Grade export: <strong>{'enabled' if _truthy('MICROSOFT_ALLOW_GRADE_EXPORT') else 'disabled'}</strong></li><li>Return grades to students in Teams: <strong>{'enabled' if _truthy('MICROSOFT_ALLOW_GRADE_RETURN') else 'disabled'}</strong></li><li>Effective scopes: {academic_access.esc(' '.join(sorted(scopes)) or 'none')}</li></ul>'''
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-education-sync-v6"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-readiness">Education Readiness v5</a><span> / </span><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Classwork v4</a></nav><header class="studio-hero"><div><p class="studio-eyebrow">Microsoft Education Assignments & Grade Integration v6</p><h2>{academic_access.esc(course.get("course_code"))}: {academic_access.esc(course.get("title"))}</h2><p>NUVEDRA remains the canonical academic record. Microsoft Education assignment and grade writes are explicit, instructor-initiated, scope-gated, policy-gated, and fully audited.</p></div></header>{class_note}<section class="studio-panel"><h3>Institutional write policy</h3>{policy}<p><small>NUVEDRA never grants Microsoft tenant consent. These switches only permit use of permissions that Microsoft has already granted to the connected instructor.</small></p></section><section class="studio-grid">{''.join(cards) or '<section class="studio-empty">No assignments are available.</section>'}</section></main>'''
+        return academic_access.portal_page("Microsoft Education Sync v6", body, user)
+
+    @app.get(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/education-sync", response_class=HTMLResponse, response_model=None)
+    async def assignment_sync(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, module = _bundle(conn, item_id)
+            course = academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            class_link = readiness._class_link(conn, course_id)
+            mapping = _mapping(conn, item_id)
+            scopes = _scopes(conn, user["email"])
+            history = rows(execute(conn, "SELECT * FROM nuvedra_microsoft_grade_exports WHERE item_id=? ORDER BY id DESC LIMIT 20", (item_id,)))
+        if not class_link:
+            raise HTTPException(409, "Link a Microsoft Education class in Education Readiness v5 before synchronizing this assignment.")
+        mapping_html = '<p>No Microsoft Education assignment has been created from this NUVEDRA activity.</p>'
+        if mapping:
+            link = f'<a href="{academic_access.esc(mapping.get("web_url"), attr=True)}" target="_blank" rel="noopener noreferrer">Open in Microsoft Teams</a>' if mapping.get("web_url") else ""
+            mapping_html = f'<p><strong>{academic_access.esc(mapping.get("microsoft_status"))}</strong> · <code>{academic_access.esc(mapping.get("microsoft_assignment_id"))}</code> · {academic_access.esc(mapping.get("max_points") or "—")} pts</p><p>{link}</p>'
+        create_form = ""
+        if not mapping:
+            create_form = f'''<form method="post" action="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/create"><button class="studio-button">Create Microsoft draft from NUVEDRA</button></form>'''
+        publish_form = ""
+        if mapping and str(mapping.get("microsoft_status") or "").lower() == "draft":
+            publish_form = f'''<form method="post" action="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/publish"><button class="studio-button">Publish Microsoft assignment</button></form>'''
+        grade_link = f'<a class="studio-button" href="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/grades">Preview grade export</a>' if mapping else ""
+        history_rows = "".join(f'<tr><td>{academic_access.esc(x.get("exported_at"))}</td><td>{academic_access.esc(x.get("student_email"))}</td><td>{academic_access.esc(x.get("action"))}</td><td>{academic_access.esc(x.get("status"))}</td><td>{academic_access.esc(x.get("details") or "")}</td></tr>' for x in history) or '<tr><td colspan="5">No grade export attempts recorded.</td></tr>'
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-assignment-sync-v6"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/education-sync">Education Sync v6</a><span> / </span><a href="{STUDIO_PREFIX}/assignments/{item_id}">Submission inbox</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Assignment synchronization</p><h2>{academic_access.esc(item.get("title"))}</h2><p>{academic_access.esc(course.get("course_code"))} · {academic_access.esc(module.get("title"))} · {academic_access.esc(item.get("points") or "—")} pts</p></div></header><section class="studio-grid"><article class="studio-panel"><h3>NUVEDRA source</h3><p>Status: {academic_access.esc(item.get("status"))}</p><p>Due: {academic_access.esc(item.get("due_at") or "No due date")}</p><p><strong>Canonical authority:</strong> NUVEDRA Gradebook.</p></article><article class="studio-panel"><h3>Microsoft Education mapping</h3>{mapping_html}<div class="studio-actions">{create_form}{publish_form}{grade_link}</div></article></section><section class="studio-panel"><h3>Required effective scopes</h3><p>Assignment create/publish: EduAssignments.ReadWriteBasic or EduAssignments.ReadWrite. Grade export: EduAssignments.ReadWrite.</p><p><code>{academic_access.esc(' '.join(sorted(scopes)) or 'none')}</code></p></section><section class="studio-panel"><h3>Recent grade export audit</h3><table><thead><tr><th>Time</th><th>Student</th><th>Action</th><th>Status</th><th>Details</th></tr></thead><tbody>{history_rows}</tbody></table></section></main>'''
+        return academic_access.portal_page("Microsoft Education assignment sync", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/education-sync/create", response_model=None)
+    async def create_microsoft_assignment(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            _require_assignment_write(conn, user["email"])
+            class_link = readiness._class_link(conn, course_id)
+            if not class_link:
+                raise HTTPException(409, "Link a Microsoft Education class first.")
+            if _mapping(conn, item_id):
+                raise HTTPException(409, "This NUVEDRA assignment is already mapped to Microsoft Education.")
+            payload = _assignment_payload(item)
+            class_id = readiness._class_id(str(class_link["class_id"]))
+        created = await m365._graph_json(user["email"], "POST", f"/education/classes/{class_id}/assignments", json_body=payload)
+        with db() as conn:
+            _upsert_mapping(conn, item_id=item_id, course_id=course_id, class_id=class_id, assignment=created, actor=user["email"])
+            audit(conn, user["email"], "microsoft_education_assignment_created", "item", str(item_id), str(created.get("id") or ""), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync", status_code=303)
+
+    @app.post(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/education-sync/publish", response_model=None)
+    async def publish_microsoft_assignment(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync")
+        if isinstance(user, RedirectResponse):
+            return user
+        if not _truthy("MICROSOFT_ALLOW_EDUCATION_PUBLISH"):
+            raise HTTPException(403, "Publishing Microsoft Education assignments is disabled by platform policy. Set MICROSOFT_ALLOW_EDUCATION_PUBLISH=true only after institutional approval.")
+        with db() as conn:
+            course_id, item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            _require_assignment_write(conn, user["email"])
+            if str(item.get("status") or "") != "published":
+                raise HTTPException(409, "Publish the NUVEDRA assignment before publishing its Microsoft Education counterpart.")
+            mapping = _mapping(conn, item_id)
+            if not mapping:
+                raise HTTPException(409, "Create the Microsoft Education draft first.")
+        published = await m365._graph_json(user["email"], "POST", f"/education/classes/{readiness._class_id(str(mapping['class_id']))}/assignments/{readiness._class_id(str(mapping['microsoft_assignment_id']))}/publish")
+        with db() as conn:
+            now = utcnow()
+            execute(conn, "UPDATE nuvedra_microsoft_education_assignments SET microsoft_status=?,web_url=?,updated_at=?,last_verified_at=? WHERE item_id=?", (str(published.get("status") or "published"), str(published.get("webUrl") or mapping.get("web_url") or "") or None, now, now, item_id))
+            audit(conn, user["email"], "microsoft_education_assignment_published", "item", str(item_id), str(mapping["microsoft_assignment_id"]), request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync", status_code=303)
+
+    @app.get(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/education-sync/grades", response_class=HTMLResponse, response_model=None)
+    async def grade_export_preview(item_id: int, request: Request):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/grades")
+        if isinstance(user, RedirectResponse):
+            return user
+        with db() as conn:
+            course_id, item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            _require_connection(conn, user["email"])
+            mapping = _mapping(conn, item_id)
+            if not mapping:
+                raise HTTPException(409, "Create the Microsoft Education assignment first.")
+            live, candidates = await _grade_candidates(conn, email=user["email"], item_id=item_id, item=item, mapping=mapping)
+        rows_html = "".join(f'<tr><td>{academic_access.esc(x.get("student_email"))}</td><td>{float(x.get("points_awarded") or 0):g} / {float(item.get("points") or 0):g}</td><td>{float(x.get("microsoft_points") or 0):g} / {float(x.get("microsoft_possible") or 0):g}</td><td>{academic_access.esc(x.get("microsoft_submission_status") or "Not matched")}</td><td>{"Ready" if x.get("ready") else "Cannot export"}</td></tr>' for x in candidates) or '<tr><td colspan="5">No canonical graded submissions are ready for export.</td></tr>'
+        return_box = '<label><input type="checkbox" name="return_to_student" value="1"> Return successfully exported grades to students in Microsoft Teams</label>' if _truthy("MICROSOFT_ALLOW_GRADE_RETURN") else '<p><small>Microsoft grade return is disabled. Exported outcome values remain teacher-side until returned through an approved workflow.</small></p>'
+        form = f'''<form method="post" action="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/grades"><p>This operation writes only the displayed canonical NUVEDRA grades. It does not import Microsoft grades into NUVEDRA.</p>{return_box}<button class="studio-button">Export ready grades to Microsoft</button></form>'''
+        body = f'''{_assets()}<main class="studio-shell" data-studio-root data-testid="microsoft365-grade-export-v6"><nav class="studio-breadcrumbs"><a href="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync">Assignment sync</a></nav><header class="studio-hero studio-hero--module"><div><p class="studio-eyebrow">Canonical NUVEDRA → Microsoft grade export</p><h2>{academic_access.esc(item.get("title"))}</h2><p>Microsoft assignment status: {academic_access.esc(live.get("status") or "unknown")}</p></div></header><section class="studio-panel"><table><thead><tr><th>Student</th><th>NUVEDRA grade</th><th>Microsoft normalized grade</th><th>Microsoft submission</th><th>Export readiness</th></tr></thead><tbody>{rows_html}</tbody></table></section><section class="studio-panel">{form}</section></main>'''
+        return academic_access.portal_page("Microsoft grade export", body, user)
+
+    @app.post(f"{STUDIO_PREFIX}/assignments/{{item_id}}/microsoft365/education-sync/grades", response_model=None)
+    async def export_grades(item_id: int, request: Request, return_to_student: str = Form("")):
+        user = _user(request, f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync/grades")
+        if isinstance(user, RedirectResponse):
+            return user
+        should_return = return_to_student == "1"
+        if should_return and not _truthy("MICROSOFT_ALLOW_GRADE_RETURN"):
+            raise HTTPException(403, "Returning grades to Microsoft students is disabled by platform policy.")
+        with db() as conn:
+            course_id, item, _module = _bundle(conn, item_id)
+            academic_access.require_course_role(conn, course_id, user["email"], academic_access.AUTHOR_ROLES)
+            _require_grade_write(conn, user["email"])
+            mapping = _mapping(conn, item_id)
+            if not mapping:
+                raise HTTPException(409, "Create the Microsoft Education assignment first.")
+            live, candidates = await _grade_candidates(conn, email=user["email"], item_id=item_id, item=item, mapping=mapping)
+            if str(live.get("status") or "").lower() == "draft":
+                raise HTTPException(409, "Publish the Microsoft Education assignment before exporting grades.")
+        class_id = readiness._class_id(str(mapping["class_id"]))
+        assignment_id = readiness._class_id(str(mapping["microsoft_assignment_id"]))
+        for row in candidates:
+            row["nuvedra_possible"] = float(item.get("points") or 0)
+            if not row.get("ready"):
+                with db() as conn:
+                    _log_export(conn, item_id=item_id, row=row, mapping=mapping, outcome_id="", action="grade_export", status="skipped", details="No Microsoft class member/submission match for this NUVEDRA student.", actor=user["email"])
+                continue
+            submission_id = readiness._class_id(str(row["microsoft_submission_id"]))
+            outcome = await _points_outcome(user["email"], class_id, assignment_id, submission_id)
+            if not outcome or not outcome.get("id"):
+                with db() as conn:
+                    _log_export(conn, item_id=item_id, row=row, mapping=mapping, outcome_id="", action="grade_export", status="skipped", details="Microsoft submission does not expose a points outcome.", actor=user["email"])
+                continue
+            outcome_id = readiness._class_id(str(outcome["id"]))
+            payload = {
+                "@odata.type": "#microsoft.graph.educationPointsOutcome",
+                "points": {
+                    "@odata.type": "#microsoft.graph.educationAssignmentPointsGrade",
+                    "points": float(row["microsoft_points"]),
+                },
+            }
+            await m365._graph_json(user["email"], "PATCH", f"/education/classes/{class_id}/assignments/{assignment_id}/submissions/{submission_id}/outcomes/{outcome_id}", json_body=payload)
+            action = "grade_export"
+            details = "Canonical NUVEDRA grade exported to Microsoft points outcome."
+            if should_return and str(row.get("microsoft_submission_status") or "").lower() == "submitted":
+                await m365._graph_json(user["email"], "POST", f"/education/classes/{class_id}/assignments/{assignment_id}/submissions/{submission_id}/return")
+                action = "grade_export_return"
+                details = "Canonical NUVEDRA grade exported and Microsoft submission returned to the student."
+            with db() as conn:
+                _log_export(conn, item_id=item_id, row=row, mapping=mapping, outcome_id=outcome_id, action=action, status="exported", details=details, actor=user["email"])
+        with db() as conn:
+            audit(conn, user["email"], "microsoft_education_grade_export", "item", str(item_id), f"rows={len(candidates)};return={should_return}", request.client.host if request.client else "")
+        return RedirectResponse(f"{STUDIO_PREFIX}/assignments/{item_id}/microsoft365/education-sync", status_code=303)
+
+    print("NUVEDRA Microsoft Education Assignments & Grade Integration v6 registered: policy-gated assignment draft creation/publish, canonical NUVEDRA grade export, Microsoft submission/outcome matching, optional teacher return, normalization, and immutable export audit records.", flush=True)
