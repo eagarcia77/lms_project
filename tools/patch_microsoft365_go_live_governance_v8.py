@@ -8,7 +8,10 @@ ACADEMIC_PORTAL = Path("app/academic_portal.py")
 CONSENT_V7 = Path("app/microsoft365_consent_wizard_v7.py")
 EDUCATION_V6 = Path("app/microsoft365_education_sync_v6.py")
 PRODUCTION_V3 = Path("app/microsoft365_production_v3.py")
+PRODUCTION_V3_SMOKE = Path("tools/smoke_test_microsoft365_production_v3.py")
+EDUCATION_V6_SMOKE = Path("tools/smoke_test_microsoft365_education_sync_v6.py")
 TAG = "NUVEDRA_MICROSOFT365_GO_LIVE_GOVERNANCE_V8"
+SMOKE_TAG = "NUVEDRA_MICROSOFT365_GO_LIVE_GOVERNANCE_V8_COMPAT"
 
 
 def patch_academic_portal() -> None:
@@ -93,6 +96,36 @@ def patch_team_creation_gate() -> None:
     PRODUCTION_V3.write_text(text, encoding="utf-8")
 
 
+def patch_prior_smoke_compatibility() -> None:
+    if PRODUCTION_V3_SMOKE.is_file():
+        text = PRODUCTION_V3_SMOKE.read_text(encoding="utf-8")
+        if SMOKE_TAG not in text:
+            anchor = '            admin_page = client.get("/admin/microsoft365/production")\n'
+            if anchor not in text:
+                raise RuntimeError("Go-Live v8 could not locate Microsoft Production v3 smoke compatibility anchor.")
+            block = '''            # NUVEDRA_MICROSOFT365_GO_LIVE_GOVERNANCE_V8_COMPAT
+            with db() as conn:
+                execute(conn, "INSERT INTO nuvedra_microsoft_go_live_profiles (mode,status,acknowledgements_json,notes,approved_by,created_at) VALUES ('production','active','{}','Legacy v3 smoke compatibility','smoke-v8',?)", (utcnow(),))
+
+'''
+            text = text.replace(anchor, block + anchor, 1)
+            PRODUCTION_V3_SMOKE.write_text(text, encoding="utf-8")
+
+    if EDUCATION_V6_SMOKE.is_file():
+        text = EDUCATION_V6_SMOKE.read_text(encoding="utf-8")
+        if SMOKE_TAG not in text:
+            anchor = '            expect(client.get("/__smoke/microsoft-v6-user/instructor"), 200, "set instructor session")\n'
+            if anchor not in text:
+                raise RuntimeError("Go-Live v8 could not locate Microsoft Education v6 smoke compatibility anchor.")
+            block = '''            # NUVEDRA_MICROSOFT365_GO_LIVE_GOVERNANCE_V8_COMPAT
+            with db() as conn:
+                execute(conn, "INSERT INTO nuvedra_microsoft_go_live_profiles (mode,status,acknowledgements_json,notes,approved_by,created_at) VALUES ('production','active','{}','Legacy v6 smoke compatibility','smoke-v8',?)", (utcnow(),))
+
+'''
+            text = text.replace(anchor, block + anchor, 1)
+            EDUCATION_V6_SMOKE.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
     if not SOURCE.is_file():
         raise RuntimeError("Microsoft 365 Go-Live Governance v8 source template is missing.")
@@ -103,9 +136,11 @@ def main() -> None:
     patch_consent_navigation()
     patch_education_write_gates()
     patch_team_creation_gate()
-    for path in (ACADEMIC_PORTAL, CONSENT_V7, EDUCATION_V6, PRODUCTION_V3):
-        compile(path.read_text(encoding="utf-8"), str(path), "exec")
-    print("NUVEDRA Microsoft 365 Go-Live Governance & Pilot v8 installed: read-only default, controlled pilot allowlist, validated production promotion, and rollout gates for Team creation plus Microsoft Education assignment/grade writes.", flush=True)
+    patch_prior_smoke_compatibility()
+    for path in (ACADEMIC_PORTAL, CONSENT_V7, EDUCATION_V6, PRODUCTION_V3, PRODUCTION_V3_SMOKE, EDUCATION_V6_SMOKE):
+        if path.is_file():
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+    print("NUVEDRA Microsoft 365 Go-Live Governance & Pilot v8 installed: read-only default, controlled pilot allowlist, validated production promotion, rollout gates for Team creation plus Microsoft Education assignment/grade writes, and legacy smoke compatibility.", flush=True)
 
 
 if __name__ == "__main__":
