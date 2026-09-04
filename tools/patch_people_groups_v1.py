@@ -19,6 +19,25 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 
+def _insert_student_assignment_group_notice(text: str) -> str:
+    """Place group context after the student assignment hero without depending on hero internals."""
+    injected = '</header>{group_html}<article class="studio-panel content-body">'
+    if injected in text:
+        return text
+
+    root_marker = 'data-testid="student-assignment-v2"'
+    root_index = text.find(root_marker)
+    if root_index < 0:
+        raise RuntimeError("People & Groups v1 could not locate the student assignment view.")
+
+    stable_boundary = '</header><article class="studio-panel content-body">'
+    boundary_index = text.find(stable_boundary, root_index)
+    if boundary_index < 0:
+        raise RuntimeError("People & Groups v1 could not locate the student assignment hero/content boundary.")
+
+    return text[:boundary_index] + injected + text[boundary_index + len(stable_boundary):]
+
+
 def patch_academic_portal() -> None:
     text = ACADEMIC_PORTAL.read_text(encoding="utf-8")
     import_line = "from app.people_groups import register_people_groups\n"
@@ -112,9 +131,7 @@ def patch_assignments() -> None:
             group_html = f'<section class="studio-panel"><p class="studio-notice"><strong data-i18n-en="Group activity" data-i18n-es="Actividad de grupo">Group activity</strong>: {academic_access.esc(group_context.get("name"))}. <span data-i18n-en="Your submission and grade remain individual in v1." data-i18n-es="Su entrega y calificación continúan siendo individuales en v1.">Your submission and grade remain individual in v1.</span></p></section>'
 '''
     text = replace_once(text, due_anchor, due_block, "assignment group context notice")
-    body_anchor = '</p></div></header><article class="studio-panel content-body">'
-    body_block = '</p></div></header>{group_html}<article class="studio-panel content-body">'
-    text = replace_once(text, body_anchor, body_block, "assignment group notice placement")
+    text = _insert_student_assignment_group_notice(text)
     ASSIGNMENTS.write_text(text, encoding="utf-8")
 
 
