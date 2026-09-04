@@ -49,9 +49,16 @@ def expect(response, status: int, label: str) -> None:
 
 def main() -> None:
     with TestClient(app, follow_redirects=False) as client:
-        expect(client.get('/portal'), 200, 'portal académico público')
-        if 'Continuar con Google' not in client.get('/portal').text:
-            raise RuntimeError('El portal académico no mostró el acceso con Google.')
+        portal = client.get('/portal')
+        expect(portal, 200, 'portal académico público')
+        # The UI is English-first with a Spanish switch, so validate the functional
+        # Google sign-in route instead of coupling the smoke test to translated copy.
+        if 'href="/portal/login"' not in portal.text:
+            raise RuntimeError('El portal académico no mostró un acceso funcional con Google.')
+        google_login = client.get('/portal/login')
+        expect(google_login, 303, 'inicio de autenticación Google')
+        if not google_login.headers.get('location', '').startswith('/auth/google/login'):
+            raise RuntimeError('El acceso académico no redirigió al flujo OAuth de Google.')
 
         login = client.post('/admin/login', data={
             'email': 'admin@example.com',
@@ -191,8 +198,8 @@ def main() -> None:
         expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para estudiante')
         item = client.get(f'/learn/items/{item_id}')
         expect(item, 200, 'evaluación para estudiante')
-        if 'Responder evaluación' not in item.text:
-            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')
+        if f'action="/learn/items/{item_id}/submit"' not in item.text:
+            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')
         submission = client.post(f'/learn/items/{item_id}/submit', data={
             'response_text': 'Respuesta de validación.',
             'response_url': '',
