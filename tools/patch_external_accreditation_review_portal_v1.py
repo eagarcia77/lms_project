@@ -38,6 +38,21 @@ def patch_academic_portal() -> None:
     ACADEMIC_PORTAL.write_text(text, encoding="utf-8")
 
 
+def _inject_external_review_action(text: str, body_index: int) -> str:
+    """Inject into the portfolio action container without depending on its existing buttons."""
+    rendered_marker = '<div class="studio-actions">{external_review_action}'
+    if rendered_marker in text[body_index:]:
+        return text
+
+    action_marker = '<div class="studio-actions">'
+    action_index = text.find(action_marker, body_index)
+    if action_index < 0:
+        raise RuntimeError("External Accreditation Review Portal v1 could not locate the portfolio action container.")
+
+    insert_at = action_index + len(action_marker)
+    return text[:insert_at] + "{external_review_action}" + text[insert_at:]
+
+
 def patch_evidence_portfolio() -> None:
     if not EVIDENCE_MODULE.is_file():
         raise RuntimeError("External Accreditation Review Portal v1 requires Institutional Evidence Portfolio v1.")
@@ -54,11 +69,8 @@ def patch_evidence_portfolio() -> None:
         raise RuntimeError("External Accreditation Review Portal v1 could not locate the accreditation portfolio body anchor.")
     insertion = """        # NUVEDRA_EXTERNAL_ACCREDITATION_REVIEW_PORTAL_V1\n        external_review_action = \"\"\n        if str(portfolio.get(\"status\")) == \"frozen\":\n            external_review_action = f'<a class=\"studio-button\" data-external-review-link=\"v1\" href=\"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review\">External Review</a>'\n"""
     text = text[:body_index] + insertion + text[body_index:]
-    old_actions = '<div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv">Portfolio CSV</a>'
-    new_actions = '<div class="studio-actions">{external_review_action}<a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv">Portfolio CSV</a>'
-    if old_actions not in text:
-        raise RuntimeError("External Accreditation Review Portal v1 could not locate the portfolio action bar.")
-    text = text.replace(old_actions, new_actions, 1)
+    body_index += len(insertion)
+    text = _inject_external_review_action(text, body_index)
     EVIDENCE_MODULE.write_text(text, encoding="utf-8")
 
 
