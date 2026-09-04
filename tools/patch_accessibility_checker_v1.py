@@ -84,7 +84,10 @@ def patch_course_editor() -> None:
             )
 
     if "NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate" not in text:
-        anchor = '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}\n'
+        anchors = (
+            '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type in {"assessment", "quiz"} else {}\n',
+            '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}\n',
+        )
         block = '''            # NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate
             if status == "published":
                 accessibility_report = accessibility_checker.check_item_payload(
@@ -102,7 +105,14 @@ def patch_course_editor() -> None:
                         + accessibility_checker.blocking_summary(accessibility_report),
                     )
 '''
-        text = _insert_after(text, anchor, block, "item assessment metadata update")
+        for anchor in anchors:
+            if anchor in text:
+                text = _insert_after(text, anchor, block, "item assessment metadata update")
+                break
+        else:
+            raise RuntimeError(
+                "Accessibility Checker v1 could not find a supported item assessment metadata update anchor."
+            )
 
     if "accessibility_checker.check_item_row(item)" not in text:
         anchor = '            next_state = "draft" if str(item.get("status")) == "published" else "published"\n'
