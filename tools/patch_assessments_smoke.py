@@ -11,11 +11,15 @@ def main() -> None:
     from patch_assessment_editor_settings import main as patch_assessment_editor_settings
     patch_assessment_editor_settings()
 
-    # The academic-role smoke test validates the legacy free-text assessment path.
-    # Assessments v2 reserves item_type=assessment/quiz for the structured runner,
-    # so keep that older smoke scenario on assignment where the free-text workflow remains valid.
+    # The academic-role smoke is now aligned with Assessments v2: it creates a
+    # structured assessment, adds a real question, starts an attempt, submits it,
+    # verifies automatic grading, and confirms observer restrictions. Do not
+    # rewrite assessment items to legacy assignments here.
     role_text = ROLE_SMOKE.read_text(encoding="utf-8")
-    role_text = role_text.replace("'item_type': 'assessment'", "'item_type': 'assignment'")
+    if "redirección de evaluación al motor Assessments v2" not in role_text:
+        raise RuntimeError(
+            "Assessments v2 expected the academic-role smoke to use the structured assessment workflow."
+        )
     ROLE_SMOKE.write_text(role_text, encoding="utf-8")
 
     text = PATH.read_text(encoding="utf-8")
@@ -28,7 +32,7 @@ def main() -> None:
         block = "    # NUVEDRA_ASSESSMENTS_V2_SMOKE\n    subprocess.run(\n        [sys.executable, 'tools/smoke_test_assessments_v2.py'],\n        check=True,\n        env={**os.environ, 'PYTHONPATH': '.'},\n    )\n\n"
         text = text.replace(marker, block + marker, 1)
     PATH.write_text(text, encoding="utf-8")
-    print("Assessments v2 editor settings and functional smoke validation attached to Course Studio.", flush=True)
+    print("Assessments v2 editor settings and structured functional smoke validation attached to Course Studio.", flush=True)
 
 
 if __name__ == "__main__":
