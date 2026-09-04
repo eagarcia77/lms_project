@@ -40,16 +40,39 @@ def patch_production_navigation() -> None:
     PRODUCTION_V3.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
+def _patch_student_assignment_action(text: str) -> str:
+    """Add Microsoft 365 work to the assignment hero without assuming prior hero buttons."""
+    if "NUVEDRA_MICROSOFT365_CLASSWORK_V4_ASSIGNMENT" in text:
+        return text
+
+    root_marker = 'data-testid="student-assignment-v2"'
+    root_index = text.find(root_marker)
+    if root_index < 0:
+        raise RuntimeError("Microsoft 365 Classwork v4 could not locate the student assignment view.")
+
+    header_start = text.find('<header class="studio-hero', root_index)
+    if header_start < 0:
+        raise RuntimeError("Microsoft 365 Classwork v4 could not locate the student assignment hero.")
+    header_end = text.find("</header>", header_start)
+    if header_end < 0:
+        raise RuntimeError("Microsoft 365 Classwork v4 could not locate the end of the student assignment hero.")
+
+    action = '<a class="studio-button studio-button--quiet" href="/learn/assignments/{item_id}/microsoft365">Microsoft 365 work</a><!-- NUVEDRA_MICROSOFT365_CLASSWORK_V4_ASSIGNMENT -->'
+    action_container = '<div class="studio-actions">'
+    action_index = text.find(action_container, header_start, header_end)
+    if action_index >= 0:
+        insert_at = action_index + len(action_container)
+        return text[:insert_at] + action + text[insert_at:]
+
+    block = '<div class="studio-actions">' + action + '</div>'
+    return text[:header_end] + block + text[header_end:]
+
+
 def patch_assignment_navigation() -> None:
     if not ASSIGNMENTS.is_file():
         raise RuntimeError("Microsoft 365 Classwork v4 requires generated Assignments & Submissions v2.")
     text = ASSIGNMENTS.read_text(encoding="utf-8")
-    student_old = '</div></header><article class="studio-panel content-body">'
-    student_new = '</div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/learn/assignments/{item_id}/microsoft365">Microsoft 365 work</a></div></header><!-- NUVEDRA_MICROSOFT365_CLASSWORK_V4 --><article class="studio-panel content-body">'
-    if TAG not in text:
-        if student_old not in text:
-            raise RuntimeError("Microsoft 365 Classwork v4 could not locate the student assignment hero anchor.")
-        text = text.replace(student_old, student_new, 1)
+    text = _patch_student_assignment_action(text)
 
     course_old = '<div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Calificaciones">Gradebook</a></div></header><section class="studio-grid">{cards}</section>'
     course_new = '<div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Microsoft 365 Classwork</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Calificaciones">Gradebook</a></div></header><section class="studio-grid">{cards}</section>'
