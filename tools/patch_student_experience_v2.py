@@ -81,15 +81,8 @@ def patch_portal_dashboard_link() -> None:
 
 
 def patch_role_smoke_compatibility() -> None:
-    """Keep the role smoke test structural instead of language/portal-markup dependent."""
+    """Keep the role smoke aligned with the current structured-assessment contract."""
     text = ROLE_SMOKE.read_text(encoding="utf-8")
-
-    old = "        if 'Responder evaluación' not in item.text:\n            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')\n"
-    new = "        if f'action=\"/learn/items/{item_id}/submit\"' not in item.text:\n            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')\n"
-    if old in text:
-        text = text.replace(old, new, 1)
-    elif new not in text:
-        raise RuntimeError("Student Experience v2 could not modernize the academic-role submission-form smoke assertion.")
 
     portal_markup_gate = '''        # The UI is English-first with a Spanish switch, so validate the functional
         # Google sign-in route instead of coupling the smoke test to translated copy.
@@ -98,6 +91,134 @@ def patch_role_smoke_compatibility() -> None:
 '''
     if portal_markup_gate in text:
         text = text.replace(portal_markup_gate, "", 1)
+
+    # Older role smoke versions asserted a translated legacy form. Normalize that first.
+    old_form_assertion = "        if 'Responder evaluación' not in item.text:\n            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')\n"
+    structural_form_assertion = "        if f'action=\"/learn/items/{item_id}/submit\"' not in item.text:\n            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')\n"
+    if old_form_assertion in text:
+        text = text.replace(old_form_assertion, structural_form_assertion, 1)
+
+    # Add a real structured question after the assessment item is created. Assessments v2
+    # intentionally redirects legacy assessment URLs to its canonical attempt workflow.
+    item_lookup = '''        with db() as conn:
+            item_id = int(rows(execute(
+                conn,
+                'SELECT id FROM nexus_content_items WHERE module_id=? ORDER BY id DESC LIMIT 1',
+                (module_id,),
+            ))[0]['id'])
+'''
+    question_setup = item_lookup + '''
+        question_response = client.post(f'/faculty/studio/items/{item_id}/assessment/questions', data={
+            'question_type': 'true_false',
+            'prompt': 'NUVEDRA role validation question',
+            'choices': '',
+            'correct_answer': 'True',
+            'points': '20',
+            'position': '1',
+            'feedback_correct': 'Correct',
+            'feedback_incorrect': 'Review the activity.',
+            'save_to_bank': '',
+        })
+        expect(question_response, 303, 'creación de pregunta estructurada por profesor')
+        with db() as conn:
+            question_id = int(rows(execute(
+                conn,
+                'SELECT id FROM nuvedra_assessment_questions WHERE item_id=? ORDER BY id DESC LIMIT 1',
+                (item_id,),
+            ))[0]['id'])
+'''
+    if "NUVEDRA role validation question" not in text:
+        if item_lookup not in text:
+            raise RuntimeError("Student Experience v2 could not add the structured question to the academic-role smoke test.")
+        text = text.replace(item_lookup, question_setup, 1)
+
+    legacy_student_block = '''        item = client.get(f'/learn/items/{item_id}')
+        expect(item, 200, 'evaluación para estudiante')
+        if f'action="/learn/items/{item_id}/submit"' not in item.text:
+            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')
+        submission = client.post(f'/learn/items/{item_id}/submit', data={
+            'response_text': 'Respuesta de validación.',
+            'response_url': '',
+        })
+        expect(submission, 303, 'entrega de evaluación')
+        with db() as conn:
+            saved = rows(execute(
+                conn,
+                "SELECT * FROM nuvedra_submissions WHERE item_id=? AND student_email='student@example.com'",
+                (item_id,),
+            ))
+            if not saved or saved[0]['response_text'] != 'Respuesta de validación.':
+                raise RuntimeError('La respuesta del estudiante no quedó guardada.')
+'''
+    structured_student_block = '''        legacy_item = client.get(f'/learn/items/{item_id}')
+        expect(legacy_item, 303, 'redirección de evaluación al motor Assessments v2')
+        canonical_assessment = f'/learn/assessments/{item_id}'
+        if legacy_item.headers.get('location', '') != canonical_assessment:
+            raise RuntimeError('La evaluación no redirigió a Assessments v2.')
+        item = client.get(canonical_assessment)
+        expect(item, 200, 'evaluación estructurada para estudiante')
+        if f'action="/learn/assessments/{item_id}/start"' not in item.text:
+            raise RuntimeError('Assessments v2 no mostró el botón para iniciar el intento.')
+        started = client.post(f'/learn/assessments/{item_id}/start')
+        expect(started, 303, 'inicio de intento estructurado')
+        with db() as conn:
+            attempt = rows(execute(
+                conn,
+                "SELECT id,status FROM nuvedra_assessment_attempts WHERE item_id=? AND student_email='student@example.com' ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ))
+            if not attempt or attempt[0]['status'] != 'in_progress':
+                raise RuntimeError('Assessments v2 no creó el intento del estudiante.')
+            attempt_id = int(attempt[0]['id'])
+        active_item = client.get(canonical_assessment)
+        expect(active_item, 200, 'intento estructurado activo')
+        if f'action="/learn/assessments/{item_id}/attempts/{attempt_id}/submit"' not in active_item.text:
+            raise RuntimeError('Assessments v2 no mostró el formulario del intento activo.')
+        submission = client.post(
+            f'/learn/assessments/{item_id}/attempts/{attempt_id}/submit',
+            data={f'q_{question_id}': 'True'},
+        )
+        expect(submission, 303, 'entrega de evaluación estructurada')
+        with db() as conn:
+            saved_attempt = rows(execute(
+                conn,
+                'SELECT status,score_total FROM nuvedra_assessment_attempts WHERE id=?',
+                (attempt_id,),
+            ))
+            saved_submission = rows(execute(
+                conn,
+                "SELECT status FROM nuvedra_submissions WHERE item_id=? AND student_email='student@example.com'",
+                (item_id,),
+            ))
+            if not saved_attempt or saved_attempt[0]['status'] not in {'submitted', 'submitted_late'}:
+                raise RuntimeError('El intento estructurado del estudiante no quedó entregado.')
+            if float(saved_attempt[0].get('score_total') or 0) != 20.0:
+                raise RuntimeError('La pregunta estructurada no se calificó automáticamente como se esperaba.')
+            if not saved_submission or saved_submission[0]['status'] not in {'submitted', 'submitted_late'}:
+                raise RuntimeError('Assessments v2 no sincronizó la entrega canónica del estudiante.')
+'''
+    if "redirección de evaluación al motor Assessments v2" not in text:
+        if legacy_student_block not in text:
+            raise RuntimeError("Student Experience v2 could not modernize the student assessment role smoke workflow.")
+        text = text.replace(legacy_student_block, structured_student_block, 1)
+
+    legacy_observer_block = '''        expect(client.get(f'/learn/items/{item_id}'), 200, 'lectura para observador')
+        expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para observador')
+        expect(client.post(f'/learn/items/{item_id}/submit', data={
+            'response_text': 'No debe guardarse.',
+            'response_url': '',
+        }), 403, 'bloqueo de entrega para observador')
+'''
+    structured_observer_block = '''        observer_legacy = client.get(f'/learn/items/{item_id}')
+        expect(observer_legacy, 303, 'redirección de evaluación para observador')
+        expect(client.get(f'/learn/assessments/{item_id}'), 403, 'bloqueo de evaluación estructurada para observador')
+        expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para observador')
+        expect(client.post(f'/learn/assessments/{item_id}/start'), 403, 'bloqueo de intento estructurado para observador')
+'''
+    if "bloqueo de evaluación estructurada para observador" not in text:
+        if legacy_observer_block not in text:
+            raise RuntimeError("Student Experience v2 could not modernize the observer assessment role smoke workflow.")
+        text = text.replace(legacy_observer_block, structured_observer_block, 1)
 
     ROLE_SMOKE.write_text(text, encoding="utf-8")
 
@@ -110,7 +231,7 @@ def main() -> None:
     patch_academic_portal()
     patch_portal_dashboard_link()
     patch_role_smoke_compatibility()
-    print("NUVEDRA Student Experience v2 installed: dashboard, progress, continue learning, to-do, completion tracking, and language-neutral role validation.", flush=True)
+    print("NUVEDRA Student Experience v2 installed: dashboard, progress, continue learning, to-do, completion tracking, and structured role validation.", flush=True)
 
 
 if __name__ == "__main__":
