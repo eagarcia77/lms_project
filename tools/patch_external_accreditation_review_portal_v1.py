@@ -54,11 +54,23 @@ def patch_evidence_portfolio() -> None:
         raise RuntimeError("External Accreditation Review Portal v1 could not locate the accreditation portfolio body anchor.")
     insertion = """        # NUVEDRA_EXTERNAL_ACCREDITATION_REVIEW_PORTAL_V1\n        external_review_action = \"\"\n        if str(portfolio.get(\"status\")) == \"frozen\":\n            external_review_action = f'<a class=\"studio-button\" data-external-review-link=\"v1\" href=\"/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}/external-review\">External Review</a>'\n"""
     text = text[:body_index] + insertion + text[body_index:]
-    old_actions = '<div class="studio-actions"><a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv">Portfolio CSV</a>'
-    new_actions = '<div class="studio-actions">{external_review_action}<a class="studio-button studio-button--quiet" href="/faculty/programs/{program_id}/evidence/portfolios/{portfolio_id}.csv">Portfolio CSV</a>'
-    if old_actions not in text:
+
+    # Locate the portfolio header action bar semantically instead of relying on
+    # an exact sequence of links. Other accreditation patches may add or reorder
+    # actions before this patch runs, so exact-string matching is intentionally
+    # avoided here.
+    body_index = text.find(body_anchor, body_index + len(insertion))
+    if body_index < 0:
+        raise RuntimeError("External Accreditation Review Portal v1 lost the accreditation portfolio body anchor after insertion.")
+    actions_anchor = '<div class="studio-actions">'
+    actions_index = text.find(actions_anchor, body_index)
+    if actions_index < 0:
         raise RuntimeError("External Accreditation Review Portal v1 could not locate the portfolio action bar.")
-    text = text.replace(old_actions, new_actions, 1)
+    next_body_boundary = text.find("</header>", body_index)
+    if next_body_boundary >= 0 and actions_index > next_body_boundary:
+        raise RuntimeError("External Accreditation Review Portal v1 found an action bar outside the portfolio header.")
+    insert_at = actions_index + len(actions_anchor)
+    text = text[:insert_at] + "{external_review_action}" + text[insert_at:]
     EVIDENCE_MODULE.write_text(text, encoding="utf-8")
 
 
