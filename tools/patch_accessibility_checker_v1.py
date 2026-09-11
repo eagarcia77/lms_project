@@ -26,6 +26,23 @@ def _insert_before(text: str, anchor: str, addition: str, label: str) -> str:
     return text.replace(anchor, addition + anchor, 1)
 
 
+def _insert_after_matching_line(text: str, needle: str, addition: str, label: str) -> str:
+    """Insert after a semantic line instead of depending on its complete formatting.
+
+    NUVEDRA's build pipeline composes multiple source patches before this feature is
+    installed. Matching a stable semantic token makes the accessibility patch
+    resilient to whitespace, formatting, and earlier metadata extensions.
+    """
+    if addition.strip() in text:
+        return text
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if needle in line:
+            lines.insert(index + 1, addition)
+            return "".join(lines)
+    raise RuntimeError(f"Accessibility Checker v1 could not find {label}: {needle!r}")
+
+
 def patch_academic_portal() -> None:
     text = ACADEMIC_PORTAL.read_text(encoding="utf-8")
     if "from app.accessibility_checker import register_accessibility_checker" not in text:
@@ -84,7 +101,6 @@ def patch_course_editor() -> None:
             )
 
     if "NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate" not in text:
-        anchor = '            metadata["assessment"] = {"response_type": assessment_response_type, "attempts": max(1, attempts), "time_limit": max(0, time_limit), "rubric": rubric.strip()} if item_type == "assessment" else {}\n'
         block = '''            # NUVEDRA_ACCESSIBILITY_CHECKER_V1 publication gate
             if status == "published":
                 accessibility_report = accessibility_checker.check_item_payload(
@@ -102,10 +118,14 @@ def patch_course_editor() -> None:
                         + accessibility_checker.blocking_summary(accessibility_report),
                     )
 '''
-        text = _insert_after(text, anchor, block, "item assessment metadata update")
+        text = _insert_after_matching_line(
+            text,
+            'metadata["assessment"] =',
+            block,
+            "item assessment metadata update",
+        )
 
     if "accessibility_checker.check_item_row(item)" not in text:
-        anchor = '            next_state = "draft" if str(item.get("status")) == "published" else "published"\n'
         block = '''            if next_state == "published":
                 accessibility_report = accessibility_checker.check_item_row(item)
                 if accessibility_report["blocking"]:
@@ -115,7 +135,12 @@ def patch_course_editor() -> None:
                         + accessibility_checker.blocking_summary(accessibility_report),
                     )
 '''
-        text = _insert_after(text, anchor, block, "quick publish state change")
+        text = _insert_after_matching_line(
+            text,
+            'next_state = "draft" if str(item.get("status")) == "published" else "published"',
+            block,
+            "quick publish state change",
+        )
 
     COURSE_EDITOR.write_text(text, encoding="utf-8")
 
