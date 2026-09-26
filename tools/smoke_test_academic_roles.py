@@ -50,8 +50,15 @@ def expect(response, status: int, label: str) -> None:
 def main() -> None:
     with TestClient(app, follow_redirects=False) as client:
         expect(client.get('/portal'), 200, 'portal académico público')
-        if 'Continuar con Google' not in client.get('/portal').text:
-            raise RuntimeError('El portal académico no mostró el acceso con Google.')
+        portal_html = client.get('/portal').text
+        # The production UI is English-first with a Spanish language switch. Accept
+        # either localized label, but require the canonical academic login route so
+        # this smoke test validates behavior rather than presentation copy.
+        if '/portal/login' not in portal_html or not (
+            'Continuar con Google' in portal_html
+            or 'Continue with Google' in portal_html
+        ):
+            raise RuntimeError('El portal académico no mostró un acceso institucional válido con Google.')
 
         login = client.post('/admin/login', data={
             'email': 'admin@example.com',
