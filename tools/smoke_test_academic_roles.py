@@ -42,8 +42,8 @@ async def smoke_google_user(kind: str, request: Request):
 def expect(response, status: int, label: str) -> None:
     if response.status_code != status:
         raise RuntimeError(
-            f'{label}: se esperaba {status} y se recibió {response.status_code}: '
-            f'{response.text[:800]}'
+            f'{label}: se esperaba {status} y se recibió {response.status_code}; '
+            f"Location={response.headers.get('location')!r}: {response.text[:800]}"
         )
 
 
