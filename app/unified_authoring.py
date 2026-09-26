@@ -671,13 +671,15 @@ def register_unified_authoring(app: FastAPI) -> None:
         title = html.escape(str(item.get("title") or "Contenido"))
         external = ""
         if item.get("external_url"):
-            url = html.escape(str(item["external_url"]), quote=True)
-            external = f'<p><a href="{url}" target="_blank" rel="noopener">Abrir recurso o editor</a></p>'
+            url = html.escape(safe_url(str(item["external_url"])), quote=True)
+            external = f'<p><a href="{url}" target="_blank" rel="noopener noreferrer">Abrir recurso o editor</a></p>'
         embed = ""
         if item.get("embed_url"):
-            url = html.escape(str(item["embed_url"]), quote=True)
+            url = html.escape(safe_url(str(item["embed_url"])), quote=True)
             if item.get("item_type") == "ar":
-                embed = f'<model-viewer src="{url}" camera-controls ar ar-modes="webxr scene-viewer quick-look" style="width:100%;height:620px"></model-viewer><script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>'
+                embed = f'<model-viewer src="{url}" alt="{title}" camera-controls ar ar-modes="webxr scene-viewer quick-look" style="width:100%;height:620px"><p>El modelo 3D requiere un navegador compatible. <a href="{url}" target="_blank" rel="noopener noreferrer">Abrir modelo 3D</a></p></model-viewer><script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>'
+            elif item.get("item_type") == "vr":
+                embed = f'<iframe class="preview-frame" src="{url}" title="Experiencia de realidad virtual: {title}" allow="fullscreen; xr-spatial-tracking" allowfullscreen loading="lazy"></iframe><p><a href="{url}" target="_blank" rel="noopener noreferrer">Abrir experiencia VR en otra pestaña</a></p>'
             else:
-                embed = f'<iframe class="preview-frame" src="{url}" title="{title}" allow="fullscreen; xr-spatial-tracking"></iframe>'
+                embed = f'<iframe class="preview-frame" src="{url}" title="{title}" loading="lazy"></iframe>'
         return HTMLResponse(f'<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{_studio_css()}</head><body style="font:17px/1.6 system-ui;max-width:1100px;margin:auto;padding:28px"><h1>{title}</h1>{item.get("body_html") or ""}{external}{embed}</body></html>')
