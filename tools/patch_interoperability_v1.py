@@ -124,7 +124,14 @@ def patch_studio_js() -> None:
 
 def patch_student_experience() -> None:
     text = STUDENT_EXPERIENCE.read_text(encoding="utf-8")
-    candidates = (\n        '            if str(item.get("item_type")) in {"assignment","project","presentation"} and str(item.get("item_type")) not in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\\n',\n        '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\\n',\n    )\n    redirect_anchor = next((candidate for candidate in candidates if candidate in text), None)\n    if redirect_anchor is None:\n        raise RuntimeError("SCORM & LTI v1 could not locate the student item dispatch point.")\n    redirect_new = '            if str(item.get("item_type")) == "scorm" and item.get("external_url"): return RedirectResponse(str(item.get("external_url")),status_code=303)\\n' + redirect_anchor
+    candidates = (
+        '            if str(item.get("item_type")) in {"assignment","project","presentation"} and str(item.get("item_type")) not in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n',
+        '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n',
+    )
+    redirect_anchor = next((candidate for candidate in candidates if candidate in text), None)
+    if redirect_anchor is None:
+        raise RuntimeError("SCORM & LTI v1 could not locate the student item dispatch point.")
+    redirect_new = '            if str(item.get("item_type")) == "scorm" and item.get("external_url"): return RedirectResponse(str(item.get("external_url")),status_code=303)\n' + redirect_anchor
     text = replace_once(text, redirect_anchor, redirect_new, "SCORM student launch redirect")
     completion_anchor = '            if str(item.get("item_type")) in academic_access.ASSESSMENT_TYPES: raise HTTPException(409,"Assessment completion is determined by submission status.")\n'
     completion_new = '            if str(item.get("item_type")) == "scorm": raise HTTPException(409,"SCORM completion is determined by the package runtime.")\n' + completion_anchor
