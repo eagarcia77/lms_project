@@ -63,7 +63,7 @@ def register_student_portal(app: FastAPI) -> None:
             classroom = f"""<section class="card" aria-label="Aula virtual inmersiva">
 <h3>Aula WebXR · {esc(item.get("title"))}</h3>
 <p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>\n<p id="xr-device-compatibility" role="status">Comprobando si el navegador permite experiencias inmersivas…</p>
-<script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+<script src="https://aframe.io/releases/1.8.0/aframe.min.js" onerror="document.getElementById(\'xr-classroom-status\').textContent=\'No se pudo cargar el motor 3D. Comprueba la conexión o utiliza la alternativa textual.\'"></script>
 <div style="width:100%;height:480px;position:relative;background:#e7ecf5;border-radius:14px;overflow:hidden">
 <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true" background="color: #E7ECF5">
 <a-sky color="#E7ECF5"></a-sky><a-plane position="0 0 -4" rotation="-90 0 0" width="18" height="18" color="#cbd5e1"></a-plane>
@@ -96,6 +96,15 @@ def register_student_portal(app: FastAPI) -> None:
     }}
   }}
   if (!scene || !status) return;
+  if (!window.AFRAME) {{
+    status.textContent = 'El motor 3D no está disponible. Comprueba la conexión o utiliza la alternativa textual.';
+    return;
+  }}
+  window.setTimeout(() => {{
+    if (!scene.hasLoaded) {{
+      status.textContent = 'La escena 3D tarda en cargar. Comprueba la conexión y WebGL; la actividad textual sigue disponible.';
+    }}
+  }}, 12000);
   scene.addEventListener('loaded', () => {{
     status.textContent = 'Aula 3D cargada. Usa el botón VR de la escena para solicitar el modo inmersivo si tu dispositivo lo permite.';
   }}, {{ once: true }});
