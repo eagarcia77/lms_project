@@ -269,6 +269,7 @@ def register_innovation_hub(app: FastAPI) -> None:
 <div class="grid"><div class="card metric"><strong>{report['score']}%</strong>Calidad y accesibilidad</div><div class="card metric"><strong>{report['activity_count']}</strong>Actividades</div><div class="card metric"><strong>{report['total_points']:g}</strong>Puntos</div><div class="card metric"><strong>{report['word_count']}</strong>Palabras</div></div>
 <div class="grid">
 <section class="card"><h3>Asistente de IA</h3><p>Utiliza un proveedor configurado; si no existe, genera una propuesta local gratuita.</p><form method="post" action="{HUB_PREFIX}/modules/{module_id}/ai"><label>Objetivo o competencia<textarea name="objective">{html.escape(str(module.get('learning_outcomes') or ''))}</textarea></label><label>Audiencia<input name="audience" value="estudiantes universitarios"></label><label>Tipo<select name="mode"><option value="content">Contenido instruccional</option><option value="assessment">Actividad auténtica</option><option value="immersive">Experiencia inmersiva</option></select></label><label>Acción<select name="action"><option value="replace">Reemplazar borrador</option><option value="append">Añadir al borrador</option><option value="activity">Crear como actividad</option></select></label><button>Generar con IA</button></form></section>
+<section class="card"><h3>Crear aula virtual 3D para Meta Quest y navegador</h3><p>Genera un salón WebXR propio, sin URL externa. El estudiante entra desde su curso publicado y puede usar el modo VR cuando su visor y navegador sean compatibles.</p><form method="post" action="{HUB_PREFIX}/modules/{module_id}/classroom"><label>Nombre del aula<input name="title" required maxlength="120" placeholder="Aula virtual de ciencias"></label><label>Objetivo de la clase<textarea name="instructions" required maxlength="1500" placeholder="Describe la actividad y las instrucciones de seguridad."></textarea></label><label>Estilo del aula<select name="room_style"><option value="classroom">Aula académica</option><option value="lab">Laboratorio</option></select></label><button>Crear aula VR</button></form></section>
 <section class="card"><h3>Crear RA, VR o 360</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/xr"><label>Experiencia<select name="experience_type"><option value="ar">Realidad aumentada</option><option value="vr">Realidad virtual/WebXR</option><option value="360">Video o recorrido 360</option></select></label><label>Título<input name="title" required></label><label>URL del modelo o experiencia<input type="url" name="source_url" required></label><label>Instrucciones<textarea name="instructions"></textarea></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Crear experiencia</button></form></section>
 <section class="card"><h3>Herramientas emergentes</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/tool"><label>Herramienta<select name="tool_name">{tool_options}</select></label><label>Título<input name="title" required></label><label>URL específica<input type="url" name="resource_url"></label><label>Uso<select name="graded"><option value="false">Recurso de aprendizaje</option><option value="true">Actividad evaluada</option></select></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Vincular herramienta</button></form></section>
 </div>
@@ -301,6 +302,17 @@ def register_innovation_hub(app: FastAPI) -> None:
                 else:
                     execute(conn, "INSERT INTO nexus_module_drafts (module_id,title,body_html,updated_by,updated_at) VALUES (?,?,?,?,?)", (module_id, f"Contenido de {module['title']}", body_html, user["email"], utcnow()))
             audit(conn, user["email"], "innovation_ai_generated", "module", str(module_id), f"{mode}:{action}", request.client.host if request.client else "")
+        return RedirectResponse(f"{HUB_PREFIX}/modules/{module_id}", status_code=303)
+
+    @app.post(f"{HUB_PREFIX}/modules/{{module_id}}/classroom", response_model=None)
+    async def create_classroom(module_id: int, request: Request, title: str = Form(...), instructions: str = Form(...), room_style: str = Form("classroom")):
+        user = require_admin(request, {"course_admin"})
+        if room_style not in {"classroom", "lab"} or not title.strip() or not instructions.strip():
+            raise HTTPException(400, "Complete el nombre, las instrucciones y el estilo del aula.")
+        with db() as conn:
+            _module(conn, module_id)
+            _insert_item(conn, module_id, "vr", title[:120], body_html=f"<h2>Instrucciones del aula</h2><p>{html.escape(instructions[:1500])}</p>", metadata={"technology": "webxr_classroom", "room_style": room_style, "accessible_alternative_required": True})
+            audit(conn, user["email"], "xr_classroom_created", "module", str(module_id), room_style, request.client.host if request.client else "")
         return RedirectResponse(f"{HUB_PREFIX}/modules/{module_id}", status_code=303)
 
     @app.post(f"{HUB_PREFIX}/modules/{{module_id}}/xr", response_model=None)
