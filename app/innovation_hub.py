@@ -270,6 +270,27 @@ def register_innovation_hub(app: FastAPI) -> None:
         user = require_admin(request, {"course_admin"})
         with db() as conn:
             course, module, draft, items = _module_bundle(conn, module_id)
+        with db() as conn:
+            enrolled_students = rows(execute(
+                conn,
+                "SELECT COUNT(*) AS total FROM nexus_admin_enrollments WHERE course_id=? AND status='active' AND course_role='student'",
+                (int(course["id"]),),
+            ))
+        student_count = int(enrolled_students[0]["total"] or 0) if enrolled_students else 0
+        course_ready = str(course.get("status")) == "active"
+        module_ready = str(module.get("status")) == "published"
+        readiness = (
+            f'<p><strong>Curso:</strong> {html.escape(str(course.get("status") or "sin estado"))} '
+            f'· <strong>Módulo:</strong> {html.escape(str(module.get("status") or "sin estado"))} '
+            f'· <strong>Estudiantes matriculados activos:</strong> {student_count}</p>'
+        )
+        readiness += (
+            '<p class="notice">Antes de probar como estudiante: activa el curso, publica el módulo '
+            'y cada aula, y verifica que la cuenta de prueba tenga una matrícula activa. '
+            'El enlace estudiantil no omite estos permisos.</p>'
+            if not course_ready or not module_ready or student_count == 0
+            else '<p>Curso y módulo publicados; hay estudiantes matriculados. Comprueba también el estado individual del aula.</p>'
+        )
         report = _quality_report(module, draft, items)
         quality_rows = "".join(
             f"<tr><td>{html.escape(name)}</td><td class='status'>{'Correcto' if ok else 'Atención'}</td><td>{html.escape(detail)}</td></tr>"
@@ -280,6 +301,7 @@ def register_innovation_hub(app: FastAPI) -> None:
         vr_cards = "".join(
             f'<li><strong>{html.escape(str(item.get("title") or "Aula VR"))}</strong> '
             f'<span class="badge">{html.escape(str(item.get("status") or "draft"))}</span> '
+            f'<span aria-label="Disponibilidad estudiantil">{"Listo para estudiantes matriculados" if course_ready and module_ready and str(item.get("status")) == "published" and student_count > 0 else "Requiere revisar publicación o matrícula"}</span> · '
             f'<a href="{PREFIX}/items/{int(item["id"])}/preview" target="_blank" rel="noopener">Vista previa administrativa</a> · '
             f'<a href="/learn/items/{int(item["id"])}" target="_blank" rel="noopener">Enlace estudiantil</a> · '
             f'<a href="{PREFIX}/items/{int(item["id"])}/forum">Comunidad</a></li>'
@@ -295,7 +317,7 @@ def register_innovation_hub(app: FastAPI) -> None:
 <section class="card"><h3>Crear RA, VR o 360</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/xr"><label>Experiencia<select name="experience_type"><option value="ar">Realidad aumentada</option><option value="vr">Realidad virtual/WebXR</option><option value="360">Video o recorrido 360</option></select></label><label>Título<input name="title" required></label><label>URL del modelo o experiencia<input type="url" name="source_url" required></label><label>Instrucciones<textarea name="instructions"></textarea></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Crear experiencia</button></form></section>
 <section class="card"><h3>Herramientas emergentes</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/tool"><label>Herramienta<select name="tool_name">{tool_options}</select></label><label>Título<input name="title" required></label><label>URL específica<input type="url" name="resource_url"></label><label>Uso<select name="graded"><option value="false">Recurso de aprendizaje</option><option value="true">Actividad evaluada</option></select></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Vincular herramienta</button></form></section>
 </div>
-<section class="card"><h3>Aulas VR del módulo y acceso de prueba</h3><p>El enlace estudiantil exige matrícula y publicación del curso, módulo y aula. Una vista previa administrativa no confirma que el estudiante pueda entrar.</p><ul>{vr_cards}</ul><p>Para verificar la experiencia completa, publica el contenido y abre el enlace estudiantil con una cuenta matriculada. Prueba después el modo VR desde el navegador del visor.</p></section>
+<section class="card"><h3>Aulas VR del módulo y acceso de prueba</h3><p>El enlace estudiantil exige matrícula y publicación del curso, módulo y aula. Una vista previa administrativa no confirma que el estudiante pueda entrar.</p>{readiness}<ul>{vr_cards}</ul><p>Para verificar la experiencia completa, publica el contenido y abre el enlace estudiantil con una cuenta matriculada. Prueba después el modo VR desde el navegador del visor.</p></section>
 <section class="card"><h3>Auditoría pedagógica y de accesibilidad</h3><table><thead><tr><th>Criterio</th><th>Estado</th><th>Recomendación</th></tr></thead><tbody>{quality_rows}</tbody></table></section>
 """
         return page("Innovación del módulo", body, user)
