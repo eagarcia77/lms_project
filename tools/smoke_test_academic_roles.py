@@ -134,6 +134,12 @@ def main() -> None:
                 (course_id,),
             ))[0]['id'])
 
+        with db() as conn:
+            before_items = rows(execute(conn,
+                'SELECT id,item_type FROM nexus_content_items WHERE module_id=? ORDER BY id',
+                (module_id,),
+            ))
+
         item_response = client.post(f'/faculty/modules/{module_id}/items', data={
             'item_type': 'assessment',
             'title': 'Evaluación del módulo',
@@ -144,6 +150,17 @@ def main() -> None:
             'due_at': '',
             'accessible_alternative': 'La misma pregunta está disponible en texto.',
         })
+        with db() as conn:
+            after_items = rows(execute(conn,
+                'SELECT id,item_type FROM nexus_content_items WHERE module_id=? ORDER BY id',
+                (module_id,),
+            ))
+        if len(after_items) != len(before_items) + 1:
+            raise RuntimeError(
+                'La creación de evaluación no insertó exactamente un registro: '
+                f"before={before_items!r}, after={after_items!r}, "
+                f"location={item_response.headers.get('location')!r}."
+            )
         expect(item_response, 303, 'creación de evaluación por profesor')
         with db() as conn:
             item_id = int(rows(execute(
