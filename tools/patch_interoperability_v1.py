@@ -125,7 +125,7 @@ def patch_studio_js() -> None:
 def patch_student_experience() -> None:
     text = STUDENT_EXPERIENCE.read_text(encoding="utf-8")
     candidates = (
-        '            if str(item.get("item_type")) in {"assignment","project","presentation"} and str(item.get("item_type")) not in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n',
+        '            if str(item.get("item_type")) in {"assignment","project","presentation"} and str(item.get("item_type")) not in {"assessment","quiz"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n',
         '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n',
     )
     redirect_anchor = next((candidate for candidate in candidates if candidate in text), None)
