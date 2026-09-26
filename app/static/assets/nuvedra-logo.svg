@@ -1,1 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 310 88" role="img" aria-labelledby="title desc"><title id="title">NUVEDRA</title><desc id="desc">NUVEDRA, educación inmersiva e inteligente</desc><defs><linearGradient id="n" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#7C3AED"/><stop offset=".52" stop-color="#2563EB"/><stop offset="1" stop-color="#00B8B8"/></linearGradient></defs><g transform="translate(8 12)"><path fill="url(#n)" d="M0 58V0h13l29 34V0h15v58H44L15 24v34z"/><path d="M15 17 42 48" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" opacity=".9"/><circle cx="29" cy="32" r="4.5" fill="#FFB000"/></g><text x="82" y="43" fill="currentColor" font-family="Inter,Arial,sans-serif" font-size="27" font-weight="800" letter-spacing="3.5">NUVEDRA</text><text x="84" y="62" fill="currentColor" opacity=".66" font-family="Inter,Arial,sans-serif" font-size="8.5" font-weight="700" letter-spacing="1.5">EDUCACIÓN INMERSIVA</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 108" preserveAspectRatio="xMinYMid meet" role="img" aria-labelledby="nuvedraLogoTitle nuvedraLogoDesc">
+<title id="nuvedraLogoTitle">NUVEDRA</title>
+<desc id="nuvedraLogoDesc">NUVEDRA. Learn, Create, Achieve. Geometric N symbol representing connected digital learning.</desc>
+<defs>
+  <linearGradient id="nuvedraBlue" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#22C7F2"/><stop offset=".48" stop-color="#0878E8"/><stop offset="1" stop-color="#172D78"/>
+  </linearGradient>
+  <linearGradient id="nuvedraDeep" x1="0" y1="1" x2="1" y2="0">
+    <stop offset="0" stop-color="#0B5FD7"/><stop offset="1" stop-color="#101F5A"/>
+  </linearGradient>
+</defs>
+<g transform="translate(8 9)">
+  <path d="M10 76V12l17-10 42 43V8l17-8v65L69 76 27 33v52z" fill="url(#nuvedraBlue)"/>
+  <path d="M27 33v52l17-10V51z" fill="#0A64D8" opacity=".92"/>
+  <path d="M69 45V8l17-8v65z" fill="url(#nuvedraDeep)"/>
+  <path d="M10 12L27 2l42 43-17 10z" fill="#16B8EE" opacity=".9"/>
+</g>
+<text x="112" y="54" fill="#F8FBFF" font-family="Inter,Arial,sans-serif" font-size="37" font-weight="800" letter-spacing="5">NUVEDRA</text>
+<text x="115" y="79" fill="#BFD1EC" font-family="Inter,Arial,sans-serif" font-size="10.5" font-weight="700" letter-spacing="4">LEARN · CREATE · ACHIEVE</text>
+</svg>
