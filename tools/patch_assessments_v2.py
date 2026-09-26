@@ -56,7 +56,7 @@ def _student_item_href(item: dict) -> str:
     )
     redirect_marker = '            course_id, item, module = item_bundle(conn, item_id)\n'
     redirect_block = '''            course_id, item, module = item_bundle(conn, item_id)
-            if str(item.get("item_type")) in {"assessment", "quiz"}:
+            if str(item.get("item_type")) in {"assessment", "quiz"} and rows(execute(conn, "SELECT id FROM nuvedra_assessment_questions WHERE item_id=? LIMIT 1", (item_id,))):
                 return RedirectResponse(f"/learn/assessments/{item_id}", status_code=303)
 '''
     if redirect_block not in text:
@@ -65,7 +65,7 @@ def _student_item_href(item: dict) -> str:
         text = text.replace(redirect_marker, redirect_block, 1)
     submit_marker = '            course_id, item, module = item_bundle(conn, item_id)\n            access = require_course_role(conn, course_id, user["email"], {"student"})\n'
     submit_block = '''            course_id, item, module = item_bundle(conn, item_id)
-            if str(item.get("item_type")) in {"assessment", "quiz"}:
+            if str(item.get("item_type")) in {"assessment", "quiz"} and rows(execute(conn, "SELECT id FROM nuvedra_assessment_questions WHERE item_id=? LIMIT 1", (item_id,))):
                 raise HTTPException(409, "Use the structured assessment workflow for this item.")
             access = require_course_role(conn, course_id, user["email"], {"student"})
 '''
