@@ -52,6 +52,30 @@ def register_student_portal(app: FastAPI) -> None:
         embed = ""
         if item.get("embed_url"):
             embed = f'<iframe src="{esc(item.get("embed_url"), attr=True)}" title="{esc(item.get("title"), attr=True)}" allow="fullscreen; xr-spatial-tracking"></iframe>'
+        classroom = ""
+        try:
+            metadata = __import__("json").loads(item.get("metadata_json") or "{}")
+        except (ValueError, TypeError):
+            metadata = {}
+        if item.get("item_type") == "vr" and metadata.get("technology") == "webxr_classroom":
+            room_style = metadata.get("room_style", "classroom")
+            accent = "#047857" if room_style == "lab" else "#4338ca"
+            classroom = f"""<section class="card" aria-label="Aula virtual inmersiva">
+<h3>Aula WebXR · {esc(item.get("title"))}</h3>
+<p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>
+<div style="width:100%;height:480px;position:relative;background:#e7ecf5;border-radius:14px;overflow:hidden">
+<a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true" background="color: #E7ECF5">
+<a-sky color="#E7ECF5"></a-sky><a-plane position="0 0 -4" rotation="-90 0 0" width="18" height="18" color="#cbd5e1"></a-plane>
+<a-box position="0 2 -7" width="7" height="2.5" depth="0.12" color="{accent}"></a-box>
+<a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
+<a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
+<a-box position="-2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-box position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-box position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}"></a-cursor></a-camera></a-entity>
+</a-scene></div><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+<script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+</section>"""
         assessment = ""
         if str(item.get("item_type")) in ASSESSMENT_TYPES and str(access.get("course_role")) == "student":
             existing = submissions[0] if submissions else {}
@@ -59,7 +83,7 @@ def register_student_portal(app: FastAPI) -> None:
             assessment = f'''<section class="card"><h3>Responder evaluación</h3>{saved}<form method="post" action="/learn/items/{item_id}/submit"><label>Respuesta<textarea name="response_text" required>{esc(existing.get("response_text"))}</textarea></label><label>Enlace de evidencia (opcional)<input type="url" name="response_url" value="{esc(existing.get("response_url"), attr=True)}"></label><button>Guardar y entregar</button></form></section>'''
         elif str(item.get("item_type")) in ASSESSMENT_TYPES:
             assessment = '<p class="notice">El rol de observador permite consultar la evaluación, pero no enviar respuestas.</p>'
-        body = f'<p><a href="/learn/courses/{course_id}">&larr; Volver al curso</a></p><section class="card content-body"><span class="badge">{esc(item.get("item_type"))}</span><h2>{esc(item["title"])}</h2>{item.get("body_html") or ""}{external}{embed}</section>{assessment}'
+        body = f'<p><a href="/learn/courses/{course_id}">&larr; Volver al curso</a></p><section class="card content-body"><span class="badge">{esc(item.get("item_type"))}</span><h2>{esc(item["title"])}</h2>{item.get("body_html") or ""}{external}{embed}</section>{classroom}{assessment}'
         return portal_page("Contenido", body, user)
 
     @app.post("/learn/items/{item_id}/submit", response_model=None)
