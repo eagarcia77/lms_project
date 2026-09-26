@@ -221,6 +221,12 @@ def register_innovation_hub(app: FastAPI) -> None:
 <p>Este centro forma parte del mismo Course Studio y utiliza los mismos cursos, módulos, usuarios, permisos y base de datos.</p>
 <div class="grid"><div class="card metric"><strong>{course_total}</strong>Cursos</div><div class="card metric"><strong>{module_total}</strong>Módulos</div><div class="card metric"><strong>{item_total}</strong>Recursos y actividades</div><div class="card metric"><strong>{xr_total}</strong>Experiencias RA/VR/360</div></div>
 <section class="card"><h3>Capacidades integradas</h3><p>Asistente de IA con alternativa local, herramientas gratuitas, RA, VR, 360, control de calidad, accesibilidad, publicación, duplicación, exportación y analítica.</p></section>
+<section class="card" id="crear-aula-vr" style="border:2px solid #4f46e5;background:#f4f3ff">
+<h3>Crear un aula virtual 3D · Meta Quest / WebXR</h3>
+<p><strong>Paso 1:</strong> <a class="button" href="{PREFIX}">Abrir Course Studio y crear un curso</a>. <strong>Paso 2:</strong> añadir un módulo al curso. <strong>Paso 3:</strong> regresar aquí, abrir «Innovación y calidad» del curso y seleccionar «IA, RA/VR y calidad» del módulo. <strong>Paso 4:</strong> completar «Crear aula virtual 3D» y publicar el contenido.</p>
+<p>El estudiante matriculado encontrará el aula en su curso y podrá explorarla en escritorio o utilizar la entrada VR si el visor y su navegador admiten WebXR. La escena actual no incluye videollamada ni avatares multiusuario.</p>
+<p><a href="/admin/password">Cambiar contraseña administrativa</a> · <a href="/portal">Ver portal académico</a></p>
+</section>
 <h2>Cursos</h2><div class="grid">{cards}</div>
 """
         return page("Innovación y calidad", body, user)
