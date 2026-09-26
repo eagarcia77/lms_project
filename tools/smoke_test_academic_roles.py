@@ -152,6 +152,16 @@ def main() -> None:
                 (module_id,),
             ))[0]['id'])
 
+        with db() as conn:
+            created_item = rows(execute(
+                conn, 'SELECT item_type FROM nexus_content_items WHERE id=?', (item_id,),
+            ))[0]
+            if str(created_item.get('item_type')) != 'assessment':
+                raise RuntimeError(
+                    'El handler de creación cambió el tipo solicitado: '
+                    f"item_type={created_item.get('item_type')!r}."
+                )
+
         expect(client.post(f'/faculty/modules/{module_id}/update', data={
             'title': 'Módulo publicado',
             'description': 'Contenido preparado por el profesor.',
