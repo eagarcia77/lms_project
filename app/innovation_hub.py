@@ -193,6 +193,13 @@ def _tool_item_type(tool_name: str, graded: bool) -> str:
 
 
 def register_innovation_hub(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def innovation_login_redirect(request: Request, call_next):
+        response = await call_next(request)
+        if request.method == "GET" and request.url.path.startswith(HUB_PREFIX) and response.status_code == 401:
+            return RedirectResponse("/admin/login", status_code=303)
+        return response
+
     @app.get(HUB_PREFIX, response_class=HTMLResponse, response_model=None)
     async def innovation_home(request: Request):
         user = require_admin(request, {"course_admin"})
