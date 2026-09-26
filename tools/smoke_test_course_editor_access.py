@@ -201,6 +201,26 @@ def main() -> None:
         expect(innovation_page, 200, 'XR module innovation page')
         require_marker(innovation_page, f'/learn/items/{classroom_id}', 'XR learner link')
         require_marker(innovation_page, f'/admin/authoring/items/{classroom_id}/forum', 'XR community link')
+        # A public visitor must never see a draft XR classroom or post to its community.
+        with TestClient(app, follow_redirects=False) as anonymous:
+            unauthenticated_view = anonymous.get(f'/learn/items/{classroom_id}')
+            expect(unauthenticated_view, 303, 'unauthenticated XR classroom redirect')
+            if not unauthenticated_view.headers.get('location', '').startswith('/portal/login'):
+                raise RuntimeError('Unauthenticated XR visitor was not sent to portal login.')
+            unauthenticated_post = anonymous.post(
+                f'/learn/items/{classroom_id}/discuss',
+                data={'body': 'This unauthenticated post must not be stored.'},
+            )
+            expect(unauthenticated_post, 303, 'unauthenticated XR discussion redirect')
+        with db() as conn:
+            unauthorized_posts = rows(execute(
+                conn,
+                "SELECT COUNT(*) AS total FROM nexus_forum_posts WHERE item_id=? AND body=?",
+                (classroom_id, 'This unauthenticated post must not be stored.'),
+            ))
+        if int(unauthorized_posts[0]['total'] or 0) != 0:
+            raise RuntimeError('Unauthenticated XR discussion post was persisted.')
+
         classroom_forum = client.get(f'/admin/authoring/items/{classroom_id}/forum')
         expect(classroom_forum, 200, 'XR instructor community')
         classroom_post = client.post(
