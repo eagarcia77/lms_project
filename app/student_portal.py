@@ -63,6 +63,7 @@ def register_student_portal(app: FastAPI) -> None:
             classroom = f"""<section class="card" aria-label="Aula virtual inmersiva">
 <h3>Aula WebXR · {esc(item.get("title"))}</h3>
 <p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>
+<script src="https://aframe.io/releases/1.8.0/aframe.min.js" defer></script>
 <div style="width:100%;height:480px;position:relative;background:#e7ecf5;border-radius:14px;overflow:hidden">
 <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true" background="color: #E7ECF5">
 <a-sky color="#E7ECF5"></a-sky><a-plane position="0 0 -4" rotation="-90 0 0" width="18" height="18" color="#cbd5e1"></a-plane>
@@ -74,7 +75,22 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}"></a-cursor></a-camera></a-entity>
 </a-scene></div><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
-<script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+<script>
+(function () {{
+  const scene = document.querySelector('a-scene');
+  const status = document.getElementById('xr-classroom-status');
+  if (!scene || !status) return;
+  scene.addEventListener('loaded', () => {{
+    status.textContent = 'Aula 3D cargada. Usa el botón VR de la escena para solicitar el modo inmersivo si tu dispositivo lo permite.';
+  }}, {{ once: true }});
+  scene.addEventListener('renderstart', () => {{
+    status.textContent = 'Escena 3D lista para explorar. El modo VR depende del visor y del navegador.';
+  }}, {{ once: true }});
+  scene.addEventListener('webglcontextlost', () => {{
+    status.textContent = 'Se perdió el contexto gráfico WebGL. Recarga la página o utiliza la alternativa textual.';
+  }});
+}})();
+</script>
 </section>"""
         assessment = ""
         if str(item.get("item_type")) in ASSESSMENT_TYPES and str(access.get("course_role")) == "student":
