@@ -90,6 +90,7 @@ def register_faculty_portal(app: FastAPI) -> None:
         user = google_user(request)
         if not user:
             return login_redirect(f"/faculty/modules/{module_id}")
+        print("NUVEDRA item creation received:", repr(item_type), flush=True)
         if item_type not in ITEM_TYPES:
             raise HTTPException(400, "Tipo inválido.")
         points_value = None
