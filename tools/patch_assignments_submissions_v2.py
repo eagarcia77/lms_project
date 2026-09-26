@@ -49,13 +49,13 @@ def patch_student_assignment_links() -> None:
     if TAG in text:
         return
     discussion_version = '''def _item_href(item: dict[str, Any]) -> str:\n    # NUVEDRA_DISCUSSIONS_COLLABORATION_V1\n    item_id = int(item["id"])\n    item_type = str(item.get("item_type") or "")\n    if item_type == "discussion":\n        return f"/learn/discussions/{item_id}"\n    return f"/learn/assessments/{item_id}" if item_type in STRUCTURED_TYPES else f"/learn/items/{item_id}"\n'''
-    assignment_version = '''def _item_href(item: dict[str, Any]) -> str:\n    # NUVEDRA_DISCUSSIONS_COLLABORATION_V1\n    # NUVEDRA_ASSIGNMENTS_SUBMISSIONS_V2\n    item_id = int(item["id"])\n    item_type = str(item.get("item_type") or "")\n    if item_type == "discussion":\n        return f"/learn/discussions/{item_id}"\n    if item_type in {"assignment", "project", "presentation"}:\n        return f"/learn/assignments/{item_id}"\n    return f"/learn/assessments/{item_id}" if item_type in STRUCTURED_TYPES else f"/learn/items/{item_id}"\n'''
+    assignment_version = '''def _item_href(item: dict[str, Any]) -> str:\n    # NUVEDRA_DISCUSSIONS_COLLABORATION_V1\n    # NUVEDRA_ASSIGNMENTS_SUBMISSIONS_V2\n    item_id = int(item["id"])\n    item_type = str(item.get("item_type") or "")\n    if item_type == "discussion":\n        return f"/learn/discussions/{item_id}"\n    if item_type in {"assignment", "project", "presentation"} and item_type not in STRUCTURED_TYPES:\n        return f"/learn/assignments/{item_id}"\n    return f"/learn/assessments/{item_id}" if item_type in STRUCTURED_TYPES else f"/learn/items/{item_id}"\n'''
     if discussion_version not in text:
         raise RuntimeError("Assignments & Submissions v2 could not patch the discussion-aware Student Experience item router.")
     text = text.replace(discussion_version, assignment_version, 1)
 
     legacy_redirect = '            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)\n'
-    assignment_redirect = '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n            # Structured assessments keep /learn/items/{id} as the stable compatibility entry.\n'
+    assignment_redirect = '            if str(item.get("item_type")) in {"assignment","project","presentation"} and str(item.get("item_type")) not in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n            # Structured assessments keep /learn/items/{id} as the stable compatibility entry.\n'
     if legacy_redirect not in text:
         raise RuntimeError("Assignments & Submissions v2 could not redirect legacy assignment item URLs.")
     text = text.replace(legacy_redirect, assignment_redirect, 1)
