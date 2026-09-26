@@ -415,14 +415,14 @@ def register_unified_authoring(app: FastAPI) -> None:
         activity_items = [x for x in items if x["item_type"] in ACTIVITY_TYPES]
         resources = "".join(
             f'<li><span class="badge">{html.escape(str(x["item_type"]))}</span> <strong>{html.escape(str(x["title"]))}</strong> '
-            f'<a href="{PREFIX}/items/{x["id"]}/preview" target="_blank">Vista previa</a></li>'
+            f'<a href="{PREFIX}/items/{x["id"]}/preview" target="_blank">Vista previa</a>' + (f' · <a href="{PREFIX}/items/{x["id"]}/forum">Comunidad</a>' if x["item_type"] == "vr" else "") + '</li>'
             for x in content_items
         ) or "<li>Sin recursos adicionales.</li>"
         activities = "".join(
             f'<li><span class="badge">{html.escape(ACTIVITY_TYPES.get(str(x["item_type"]), str(x["item_type"])))}</span> '
             f'<strong>{html.escape(str(x["title"]))}</strong> '
             f'<a href="{PREFIX}/items/{x["id"]}/preview" target="_blank">Abrir</a>'
-            + (f' · <a href="{PREFIX}/items/{x["id"]}/forum">Foro</a>' if x["item_type"] == "discussion" else "")
+            + (f' · <a href="{PREFIX}/items/{x["id"]}/forum">Foro</a>' if x["item_type"] in {"discussion", "vr"} else "")
             + "</li>"
             for x in activity_items
         ) or "<li>Sin actividades de evaluación.</li>"
@@ -642,12 +642,12 @@ def register_unified_authoring(app: FastAPI) -> None:
         user = require_admin(request, {"course_admin", "support"})
         with db() as conn:
             item = _item(conn, item_id)
-            if item.get("item_type") != "discussion":
-                raise HTTPException(400, "Esta actividad no es un foro.")
+            if item.get("item_type") not in {"discussion", "vr"}:
+                raise HTTPException(400, "Esta actividad no admite una comunidad de aprendizaje.")
             posts = rows(execute(conn, "SELECT * FROM nexus_forum_posts WHERE item_id=? ORDER BY id", (item_id,)))
         rendered = "".join(f'<article class="card"><b>{html.escape(str(post["author_email"]))}</b><p>{html.escape(str(post["body"]))}</p><small>{html.escape(str(post["created_at"]))}</small></article>' for post in posts) or '<p class="notice">No hay aportaciones.</p>'
         body = f'<p><a href="{PREFIX}/items/{item_id}/preview">&larr; Vista previa</a></p><h2>Foro: {html.escape(str(item["title"]))}</h2><section class="card"><form method="post"><label>Aportación<textarea name="body" required maxlength="5000"></textarea></label><button>Publicar</button></form></section>{rendered}'
-        return page("Foro de discusión", body, user)
+        return page("Comunidad de aprendizaje", body, user)
 
     @app.post(f"{PREFIX}/items/{{item_id}}/forum", response_model=None)
     async def discussion_forum_post(item_id: int, request: Request, body: str = Form(...)):
@@ -657,8 +657,8 @@ def register_unified_authoring(app: FastAPI) -> None:
             raise HTTPException(400, "La aportación está vacía.")
         with db() as conn:
             item = _item(conn, item_id)
-            if item.get("item_type") != "discussion":
-                raise HTTPException(400, "Esta actividad no es un foro.")
+            if item.get("item_type") not in {"discussion", "vr"}:
+                raise HTTPException(400, "Esta actividad no admite una comunidad de aprendizaje.")
             execute(conn, "INSERT INTO nexus_forum_posts (item_id,author_email,body,created_at) VALUES (?,?,?,?)", (item_id, user["email"], clean, utcnow()))
             audit(conn, user["email"], "discussion_post_created", "item", str(item_id), "", request.client.host if request.client else "")
         return RedirectResponse(f"{PREFIX}/items/{item_id}/forum", status_code=303)
