@@ -132,8 +132,8 @@ def patch_studio_js() -> None:
 
 def patch_student_experience() -> None:
     text = STUDENT_EXPERIENCE.read_text(encoding="utf-8")
-    text = replace_function(text, "_item_href", '''def _item_href(item: dict[str, Any]) -> str:
-    return f"/learn/paths/items/{int(item['id'])}"''')
+    # Keep the stable learner content route canonical. Prerequisite enforcement
+    # belongs inside the route, not in a redirect chain.
     get_anchor = '''            access=academic_access.require_course_role(conn,course_id,user["email"],academic_access.STUDENT_ROLES)\n            if str(access.get("course_status"))!="active" or str(item.get("status"))!="published" or str(module.get("status"))!="published": raise HTTPException(403,"This content is not published.")\n'''
     get_new = '''            access=academic_access.require_course_role(conn,course_id,user["email"],academic_access.STUDENT_ROLES)\n            if str(access.get("course_status"))!="active" or str(item.get("status"))!="published" or str(module.get("status"))!="published": raise HTTPException(403,"This content is not published.")\n            academic_access.require_learning_path_item_access(conn,item_id,user["email"])\n'''
     text = replace_once(text, get_anchor, get_new, "student content access gate")
