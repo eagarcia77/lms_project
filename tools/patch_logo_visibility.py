@@ -163,10 +163,10 @@ def main() -> None:
         css += "\n" + LOGO_CSS.strip() + "\n"
         STYLES.write_text(css, encoding="utf-8")
     svg = LOGO.read_text(encoding="utf-8")
-    required = ('viewBox="-8 -6 288 92"', 'preserveAspectRatio="xMinYMid meet"', '>NUVEDRA</text>')
+    required = ('viewBox="0 0 420 108"', 'preserveAspectRatio="xMinYMid meet"', '>NUVEDRA</text>', 'LEARN · CREATE · ACHIEVE')
     missing = [marker for marker in required if marker not in svg]
     if missing:
-        raise RuntimeError(f"NUVEDRA logo asset is not using the expanded safe viewport: {missing}")
+        raise RuntimeError(f"NUVEDRA logo asset is not using the minimal production brand system: {missing}")
     print("NUVEDRA Accessibility Checker v1, Learning Analytics v1, Calendar and Notifications v1, Course Announcements v1, Discussions & Collaboration v1, Assignments & Submissions v2, Rubrics & Outcomes v1, Course Copy & Import v1, People & Groups v1, Attendance & Participation v1, Certificates & Course Completion v1, SCORM & LTI v1, LTI 1.3 / Advantage v1, LTI 1.3 production hardening, xAPI & cmi5 v1, Learning Paths & Prerequisites v1, Mastery & Competency Dashboard v1, Program Outcomes & Accreditation v1, Assessment Plans & Continuous Improvement v1, Institutional Evidence Repository & Accreditation Portfolio v1, and logo visibility finalized for production.", flush=True)
 
 
