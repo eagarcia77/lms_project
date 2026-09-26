@@ -114,6 +114,17 @@ def register_student_portal(app: FastAPI) -> None:
   scene.addEventListener('webglcontextlost', () => {{
     status.textContent = 'Se perdió el contexto gráfico WebGL. Recarga la página o utiliza la alternativa textual.';
   }});
+  scene.addEventListener('enter-vr', () => {{
+    status.textContent = 'Sesión inmersiva iniciada. Puedes salir del modo VR desde los controles del visor.';
+  }});
+  scene.addEventListener('exit-vr', () => {{
+    status.textContent = 'Has salido del modo VR. Puedes continuar en pantalla y consultar la comunidad.';
+  }});
+  scene.addEventListener('render-target-loaded', () => {{
+    if (scene.hasLoaded && !scene.is('vr-mode')) {{
+      status.textContent = 'Escena lista para explorar. El acceso inmersivo depende de los permisos del navegador.';
+    }}
+  }});
 }})();
 </script>
 </section>"""
