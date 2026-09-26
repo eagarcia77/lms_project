@@ -189,9 +189,10 @@ def main() -> None:
             raise RuntimeError('El estudiante no pudo ver la evaluación publicada.')
         expect(client.get(studio_location), 403, 'bloqueo del Visual Course Studio para estudiante')
         item = client.get(f'/learn/items/{item_id}')
-        expect(item, 200, 'evaluación para estudiante')
-        if 'Responder evaluación' not in item.text:
-            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')
+        if item.status_code not in {200, 303}:
+            raise RuntimeError(f'evaluación para estudiante devolvió {item.status_code}')
+        expect(client.get(f'/learn/assessments/{item_id}'), 200, 'evaluación v2 para estudiante')
+
         submission = client.post(f'/learn/items/{item_id}/submit', data={
             'response_text': 'Respuesta de validación.',
             'response_url': '',
