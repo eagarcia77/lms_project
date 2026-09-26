@@ -81,15 +81,9 @@ def patch_portal_dashboard_link() -> None:
 
 
 def patch_role_smoke_compatibility() -> None:
-    """Keep the role smoke test structural instead of language-dependent."""
-    text = ROLE_SMOKE.read_text(encoding="utf-8")
-    old = "        if 'Responder evaluación' not in item.text:\n            raise RuntimeError('La evaluación no mostró el formulario de respuesta.')\n"
-    new = "        if f'action=\"/learn/items/{item_id}/submit\"' not in item.text:\n            raise RuntimeError('La evaluación no mostró un formulario de entrega funcional.')\n"
-    if old in text:
-        text = text.replace(old, new, 1)
-    elif new not in text:
-        raise RuntimeError("Student Experience v2 could not modernize the academic-role submission-form smoke assertion.")
-    ROLE_SMOKE.write_text(text, encoding="utf-8")
+    """Smoke tests are versioned source and must not be rewritten during image builds."""
+    if not ROLE_SMOKE.is_file():
+        raise RuntimeError("Student Experience v2 requires the academic-role smoke test.")
 
 
 def main() -> None:
