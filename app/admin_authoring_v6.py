@@ -706,7 +706,7 @@ def register_authoring_v6(app: FastAPI) -> None:
         if item.get("embed_url"):
             url = html.escape(str(item["embed_url"]), quote=True)
             if item.get("item_type") == "ar":
-                embed = f'<model-viewer src="{url}" camera-controls ar ar-modes="webxr scene-viewer quick-look" style="width:100%;height:600px"></model-viewer><script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>'
+                embed = f'<model-viewer src="{url}" alt="{title}" camera-controls ar ar-modes="webxr scene-viewer quick-look" style="width:100%;height:600px"><p>El modelo 3D requiere un navegador compatible. <a href="{url}" target="_blank" rel="noopener noreferrer">Abrir recurso 3D</a></p></model-viewer><script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>'
             elif item.get("item_type") == "vr":
                 embed = f'<iframe src="{url}" title="Experiencia de realidad virtual" allow="xr-spatial-tracking; fullscreen" style="width:100%;min-height:650px;border:0"></iframe>'
             else:
