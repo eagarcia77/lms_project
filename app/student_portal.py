@@ -62,7 +62,7 @@ def register_student_portal(app: FastAPI) -> None:
             accent = "#047857" if room_style == "lab" else "#4338ca"
             classroom = f"""<section class="card" aria-label="Aula virtual inmersiva">
 <h3>Aula WebXR · {esc(item.get("title"))}</h3>
-<p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>
+<p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>\n<p id="xr-device-compatibility" role="status">Comprobando si el navegador permite experiencias inmersivas…</p>
 <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
 <div style="width:100%;height:480px;position:relative;background:#e7ecf5;border-radius:14px;overflow:hidden">
 <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true" background="color: #E7ECF5">
@@ -79,6 +79,22 @@ def register_student_portal(app: FastAPI) -> None:
 (function () {{
   const scene = document.querySelector('a-scene');
   const status = document.getElementById('xr-classroom-status');
+  const compatibility = document.getElementById('xr-device-compatibility');
+  if (compatibility) {{
+    if (!window.isSecureContext) {{
+      compatibility.textContent = 'El modo VR necesita una conexión segura (HTTPS). Puedes utilizar la versión 3D de escritorio.';
+    }} else if (!navigator.xr || typeof navigator.xr.isSessionSupported !== 'function') {{
+      compatibility.textContent = 'Este navegador no ofrece WebXR inmersivo. Puedes explorar el aula en pantalla y participar en su comunidad.';
+    }} else {{
+      navigator.xr.isSessionSupported('immersive-vr').then((supported) => {{
+        compatibility.textContent = supported
+          ? 'El navegador indica compatibilidad con VR inmersiva. Selecciona el botón VR del aula para solicitar acceso.'
+          : 'No se detectó compatibilidad con VR inmersiva. La versión 3D de escritorio sigue disponible.';
+      }}).catch(() => {{
+        compatibility.textContent = 'No fue posible comprobar la compatibilidad del visor. Prueba el botón VR si está disponible.';
+      }});
+    }}
+  }}
   if (!scene || !status) return;
   scene.addEventListener('loaded', () => {{
     status.textContent = 'Aula 3D cargada. Usa el botón VR de la escena para solicitar el modo inmersivo si tu dispositivo lo permite.';
