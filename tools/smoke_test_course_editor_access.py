@@ -177,6 +177,43 @@ def main() -> None:
             if assessment_metadata.get('assessment', {}).get('time_limit') != 45:
                 raise RuntimeError('Assessment time limit was not stored correctly.')
 
+        classroom_created = client.post(
+            f'/admin/authoring/innovation/modules/{module_id}/classroom',
+            data={
+                'title': 'Test XR Classroom',
+                'instructions': 'Read the instructions and discuss your observations.',
+                'room_style': 'classroom',
+            },
+        )
+        expect(classroom_created, 303, 'XR classroom creation')
+        with db() as conn:
+            classroom = rows(execute(
+                conn,
+                "SELECT id,item_type,metadata_json FROM nexus_content_items WHERE module_id=? AND title=?",
+                (module_id, 'Test XR Classroom'),
+            ))
+        if len(classroom) != 1 or classroom[0]['item_type'] != 'vr':
+            raise RuntimeError('XR classroom was not persisted as a VR content item.')
+        if json.loads(classroom[0]['metadata_json']).get('technology') != 'webxr_classroom':
+            raise RuntimeError('XR classroom metadata was not persisted.')
+        classroom_id = int(classroom[0]['id'])
+        innovation_page = client.get(f'/admin/authoring/innovation/modules/{module_id}')
+        expect(innovation_page, 200, 'XR module innovation page')
+        require_marker(innovation_page, f'/learn/items/{classroom_id}', 'XR learner link')
+        require_marker(innovation_page, f'/admin/authoring/items/{classroom_id}/forum', 'XR community link')
+        classroom_forum = client.get(f'/admin/authoring/items/{classroom_id}/forum')
+        expect(classroom_forum, 200, 'XR instructor community')
+        classroom_post = client.post(
+            f'/admin/authoring/items/{classroom_id}/forum',
+            data={'body': 'Instructor XR discussion smoke test.'},
+        )
+        expect(classroom_post, 303, 'XR instructor discussion post')
+        require_marker(
+            client.get(f'/admin/authoring/items/{classroom_id}/forum'),
+            'Instructor XR discussion smoke test.',
+            'XR discussion persistence',
+        )
+
         legacy_item = client.get(f'/faculty/items/{item_id}/edit')
         expect(legacy_item, 303, 'legacy item edit route')
         if legacy_item.headers.get('location') != f'/faculty/studio/items/{item_id}/edit':
