@@ -336,6 +336,9 @@ def register_assessment_plans_continuous_improvement(app: FastAPI) -> None:
         for a in bundle["actions"]:
             writer.writerow(["Improvement action", bundle["cycle"].get("label"), f"{a.get('outcome_code') or ''}: {a.get('outcome_title') or ''}".strip(": "), "", a.get("title"), "", "", "", "", a.get("action_plan") or "", a.get("responsible_email") or "", a.get("due_date") or "", a.get("status"), a.get("follow_up_result") or "", a.get("closing_note") or ""])
         filename = f"{str(program.get('program_code') or 'program').replace(' ', '_')}-{str(bundle['cycle'].get('label') or 'assessment-cycle').replace(' ', '_')}-continuous-improvement.csv"
+        import re
+        from unicodedata import normalize
+        filename = re.sub(r"[^A-Za-z0-9._-]", "_", normalize("NFKD", filename).encode("ascii", "ignore").decode("ascii")).strip("._") or "assessment-export.csv"
         return Response(stream.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     print("NUVEDRA Assessment Plans & Continuous Improvement v1 registered: assessment cycles, direct/indirect measures, findings, targets, improvement actions, closing-the-loop verification, read-only closed cycles, and CSV export.", flush=True)
