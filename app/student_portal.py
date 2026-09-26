@@ -92,6 +92,20 @@ def register_student_portal(app: FastAPI) -> None:
 }})();
 </script>
 </section>"""
+        discussion = ""
+        if str(item.get("item_type")) in {"vr", "discussion"}:
+            with db() as conn:
+                posts = rows(execute(conn, "SELECT author_email,body,created_at FROM nexus_forum_posts WHERE item_id=? ORDER BY id DESC LIMIT 100", (item_id,)))
+            rendered = "".join(
+                f'<article class="card"><strong>{esc(post["author_email"])}</strong><p style="white-space:pre-wrap">{esc(post["body"])}</p><small>{esc(post["created_at"])}</small></article>'
+                for post in posts
+            ) or '<p class="notice">Todavía no hay aportaciones. Inicia la conversación sobre esta experiencia.</p>'
+            composer = (
+                f'<form method="post" action="/learn/items/{item_id}/discuss"><label>Tu aportación<textarea name="body" required maxlength="5000" placeholder="Comparte una observación o pregunta sobre la actividad."></textarea></label><button>Publicar aportación</button></form>'
+                if str(access.get("course_role")) == "student"
+                else '<p class="notice">Puedes leer las aportaciones, pero tu rol no permite publicar.</p>'
+            )
+            discussion = f'<section class="card" aria-label="Comunidad de aprendizaje"><h3>Comunidad de aprendizaje</h3><p>Conversación vinculada a esta actividad. Evita compartir información personal o confidencial.</p>{composer}{rendered}</section>'
         assessment = ""
         if str(item.get("item_type")) in ASSESSMENT_TYPES and str(access.get("course_role")) == "student":
             existing = submissions[0] if submissions else {}
@@ -99,8 +113,28 @@ def register_student_portal(app: FastAPI) -> None:
             assessment = f'''<section class="card"><h3>Responder evaluación</h3>{saved}<form method="post" action="/learn/items/{item_id}/submit"><label>Respuesta<textarea name="response_text" required>{esc(existing.get("response_text"))}</textarea></label><label>Enlace de evidencia (opcional)<input type="url" name="response_url" value="{esc(existing.get("response_url"), attr=True)}"></label><button>Guardar y entregar</button></form></section>'''
         elif str(item.get("item_type")) in ASSESSMENT_TYPES:
             assessment = '<p class="notice">El rol de observador permite consultar la evaluación, pero no enviar respuestas.</p>'
-        body = f'<p><a href="/learn/courses/{course_id}">&larr; Volver al curso</a></p><section class="card content-body"><span class="badge">{esc(item.get("item_type"))}</span><h2>{esc(item["title"])}</h2>{item.get("body_html") or ""}{external}{embed}</section>{classroom}{assessment}'
+        body = f'<p><a href="/learn/courses/{course_id}">&larr; Volver al curso</a></p><section class="card content-body"><span class="badge">{esc(item.get("item_type"))}</span><h2>{esc(item["title"])}</h2>{item.get("body_html") or ""}{external}{embed}</section>{classroom}{discussion}{assessment}'
         return portal_page("Contenido", body, user)
+
+    @app.post("/learn/items/{item_id}/discuss", response_model=None)
+    async def student_discussion_post(item_id: int, request: Request, body: str = Form(...)):
+        user = google_user(request)
+        if not user:
+            return login_redirect(f"/learn/items/{item_id}")
+        clean = body.strip()
+        if not clean or len(clean) > 5000:
+            raise HTTPException(400, "La aportación debe contener entre 1 y 5000 caracteres.")
+        with db() as conn:
+            course_id, item, module = item_bundle(conn, item_id)
+            access = require_course_role(conn, course_id, user["email"], {"student"})
+            if (str(access.get("course_status")) != "active"
+                or str(item.get("status")) != "published"
+                or str(module.get("status")) != "published"
+                or str(item.get("item_type")) not in {"vr", "discussion"}):
+                raise HTTPException(403, "La comunidad no está disponible.")
+            execute(conn, "INSERT INTO nexus_forum_posts (item_id,author_email,body,created_at) VALUES (?,?,?,?)", (item_id, user["email"], clean, utcnow()))
+            audit(conn, user["email"], "student_discussion_post_created", "item", str(item_id), "", request.client.host if request.client else "")
+        return RedirectResponse(f"/learn/items/{item_id}", status_code=303)
 
     @app.post("/learn/items/{item_id}/submit", response_model=None)
     async def submit_assessment(item_id: int, request: Request, response_text: str = Form(...), response_url: str = Form("")):
