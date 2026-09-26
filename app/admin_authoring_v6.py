@@ -701,7 +701,7 @@ def register_authoring_v6(app: FastAPI) -> None:
         link = ""
         if item.get("external_url"):
             url = html.escape(str(item["external_url"]), quote=True)
-            link = f'<p><a href="{url}" target="_blank" rel="noopener">Abrir recurso externo</a></p>'
+            link = f'<p><a href="{url}" target="_blank" rel="noopener noreferrer">Abrir recurso externo</a></p>'
         embed = ""
         if item.get("embed_url"):
             url = html.escape(str(item["embed_url"]), quote=True)
