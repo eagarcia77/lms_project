@@ -140,6 +140,16 @@ def main() -> None:
                 (module_id,),
             ))
 
+        matching_routes = [
+            (getattr(route.endpoint, '__module__', ''), getattr(route.endpoint, '__name__', ''))
+            for route in app.router.routes
+            if getattr(route, 'path', '') == '/faculty/modules/{module_id}/items'
+            and 'POST' in (getattr(route, 'methods', set()) or set())
+        ]
+        if len(matching_routes) != 1:
+            raise RuntimeError(f'Rutas duplicadas de creación académica: {matching_routes!r}.')
+        print(f'Academic item creation endpoint: {matching_routes!r}', flush=True)
+
         item_response = client.post(f'/faculty/modules/{module_id}/items', data={
             'item_type': 'assessment',
             'title': 'Evaluación del módulo',
