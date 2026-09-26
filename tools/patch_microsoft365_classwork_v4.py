@@ -40,26 +40,55 @@ def patch_production_navigation() -> None:
     PRODUCTION_V3.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
+def _inject_header_action(text: str, testid: str, action_html: str, marker: str) -> str:
+    """Insert a navigation action into a specific page hero without brittle full-HTML anchors."""
+    page_anchor = f'data-testid="{testid}"'
+    page_index = text.find(page_anchor)
+    if page_index < 0:
+        raise RuntimeError(f"Microsoft 365 Classwork v4 could not locate page {testid!r}.")
+    header_index = text.find("<header", page_index)
+    if header_index < 0:
+        raise RuntimeError(f"Microsoft 365 Classwork v4 could not locate the hero header for {testid!r}.")
+    header_end = text.find("</header>", header_index)
+    if header_end < 0:
+        raise RuntimeError(f"Microsoft 365 Classwork v4 could not locate the hero header boundary for {testid!r}.")
+    if marker in text[header_index:header_end]:
+        return text
+
+    actions_anchor = '<div class="studio-actions">'
+    actions_index = text.find(actions_anchor, header_index, header_end)
+    tagged_action = f'<!-- {marker} -->' + action_html
+    if actions_index >= 0:
+        insert_at = actions_index + len(actions_anchor)
+        return text[:insert_at] + tagged_action + text[insert_at:]
+
+    actions = f'<div class="studio-actions">{tagged_action}</div>'
+    return text[:header_end] + actions + text[header_end:]
+
+
 def patch_assignment_navigation() -> None:
     if not ASSIGNMENTS.is_file():
         raise RuntimeError("Microsoft 365 Classwork v4 requires generated Assignments & Submissions v2.")
     text = ASSIGNMENTS.read_text(encoding="utf-8")
-    student_old = '</div></header><article class="studio-panel content-body">'
-    student_new = '</div><div class="studio-actions"><a class="studio-button studio-button--quiet" href="/learn/assignments/{item_id}/microsoft365">Microsoft 365 work</a></div></header><!-- NUVEDRA_MICROSOFT365_CLASSWORK_V4 --><article class="studio-panel content-body">'
-    if TAG not in text:
-        if student_old not in text:
-            raise RuntimeError("Microsoft 365 Classwork v4 could not locate the student assignment hero anchor.")
-        text = text.replace(student_old, student_new, 1)
 
-    course_old = '<div class="studio-actions"><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Calificaciones">Gradebook</a></div></header><section class="studio-grid">{cards}</section>'
-    course_new = '<div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Microsoft 365 Classwork</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Gradebook" data-i18n-es="Calificaciones">Gradebook</a></div></header><section class="studio-grid">{cards}</section>'
-    if course_old in text:
-        text = text.replace(course_old, course_new, 1)
-
-    inbox_old = '<div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Open Gradebook" data-i18n-es="Abrir calificaciones">Open Gradebook</a></div></header><section class="studio-grid">{content}</section>'
-    inbox_new = '<div class="studio-actions"><a class="studio-button" href="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365">Microsoft 365 setup</a><a class="studio-button studio-button--quiet" href="{STUDIO_PREFIX}/courses/{course_id}/gradebook" data-i18n-en="Open Gradebook" data-i18n-es="Abrir calificaciones">Open Gradebook</a></div></header><section class="studio-grid">{content}</section>'
-    if inbox_old in text:
-        text = text.replace(inbox_old, inbox_new, 1)
+    text = _inject_header_action(
+        text,
+        "student-assignment-v2",
+        '<a class="studio-button studio-button--quiet" href="/learn/assignments/{item_id}/microsoft365">Microsoft 365 work</a>',
+        "NUVEDRA_MICROSOFT365_CLASSWORK_V4_STUDENT",
+    )
+    text = _inject_header_action(
+        text,
+        "course-assignments-v2",
+        '<a class="studio-button" href="{STUDIO_PREFIX}/courses/{course_id}/microsoft365/classwork">Microsoft 365 Classwork</a>',
+        "NUVEDRA_MICROSOFT365_CLASSWORK_V4_COURSE",
+    )
+    text = _inject_header_action(
+        text,
+        "assignment-submission-inbox-v2",
+        '<a class="studio-button" href="{STUDIO_PREFIX}/assignments/{item_id}/microsoft365">Microsoft 365 setup</a>',
+        "NUVEDRA_MICROSOFT365_CLASSWORK_V4_INBOX",
+    )
     ASSIGNMENTS.write_text(text, encoding="utf-8")
 
 
