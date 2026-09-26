@@ -165,8 +165,8 @@ def main() -> None:
         with db() as conn:
             item_id = int(rows(execute(
                 conn,
-                'SELECT id FROM nexus_content_items WHERE module_id=? ORDER BY id DESC LIMIT 1',
-                (module_id,),
+                'SELECT id FROM nexus_content_items WHERE module_id=? AND title=? ORDER BY id DESC LIMIT 1',
+                (module_id, 'Evaluación del módulo'),
             ))[0]['id'])
 
         with db() as conn:
