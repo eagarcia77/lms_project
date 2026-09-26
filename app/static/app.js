@@ -334,7 +334,27 @@ async function loadHomeContent() {
   }
 }
 
+function diagnoseXR() {
+  const output = document.getElementById("xr-diagnostics");
+  if (!output) return;
+  const canvas = document.createElement("canvas");
+  let gl = null;
+  try { gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl"); } catch {}
+  const modelViewer = Boolean(customElements.get("model-viewer"));
+  const aframe = Boolean(window.AFRAME);
+  const immersive = Boolean(navigator.xr);
+  const checks = [
+    gl ? "WebGL disponible" : "WebGL no disponible: comprueba la aceleración gráfica del navegador",
+    modelViewer ? "Visor de modelos 3D cargado" : "Visor 3D sin cargar: comprueba la conexión o el bloqueo de scripts externos",
+    aframe ? "Motor de escenas VR cargado" : "Motor VR sin cargar: comprueba la conexión o el bloqueo de scripts externos",
+    immersive ? "API WebXR detectada (no garantiza compatibilidad con el visor)" : "API WebXR no detectada: utiliza el modo de escritorio",
+  ];
+  output.textContent = checks.join(" · ");
+}
+
 async function init() {
+  diagnoseXR();
+  window.addEventListener("load", diagnoseXR, { once: true });
   try {
     const [config, dashboard, courses, xr] = await Promise.all([
       api("/api/config"),
