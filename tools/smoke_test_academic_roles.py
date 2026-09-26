@@ -176,7 +176,7 @@ def main() -> None:
             if str(created_item.get('item_type')) != 'assessment':
                 raise RuntimeError(
                     'El handler de creación cambió el tipo solicitado: '
-                    f"item_type={created_item.get('item_type')!r}."
+                    f"item_type={created_item.get('item_type')!r}; before={before_items!r}; after={after_items!r}; location={item_response.headers.get('location')!r}."
                 )
 
         expect(client.post(f'/faculty/modules/{module_id}/update', data={
