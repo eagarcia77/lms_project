@@ -174,6 +174,18 @@ def main() -> None:
         }), 303, 'publicación de evaluación por profesor')
 
         with db() as conn:
+            stored_item = rows(execute(
+                conn,
+                'SELECT id,item_type,status FROM nexus_content_items WHERE id=?',
+                (item_id,),
+            ))[0]
+            if str(stored_item.get('item_type')) != 'assessment':
+                raise RuntimeError(
+                    'La evaluación cambió de tipo antes del acceso del estudiante: '
+                    f"item_type={stored_item.get('item_type')!r}, status={stored_item.get('status')!r}."
+                )
+
+        with db() as conn:
             execute(conn, "UPDATE nexus_admin_courses SET status='active',updated_at=? WHERE id=?", (utcnow(), course_id))
 
         drive = client.get(f'/admin/authoring/modules/{module_id}/drive')
