@@ -223,9 +223,10 @@ def main() -> None:
     require(
         "app/static/assets/nuvedra-logo.svg",
         (
-            'viewBox="-8 -6 288 92"',
+            'viewBox="0 0 420 108"',
             'preserveAspectRatio="xMinYMid meet"',
             '>NUVEDRA</text>',
+            'LEARN · CREATE · ACHIEVE',
         ),
     )
     print("Visual Course Studio, Gradebook v1/v2, Assessments v2, Student Experience v2, Content Library v1, and full NUVEDRA logo source validated with functional smoke coverage.", flush=True)
