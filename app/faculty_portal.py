@@ -106,6 +106,9 @@ def register_faculty_portal(app: FastAPI) -> None:
             if accessible:
                 content += f'<h3>Alternativa accesible</h3><p>{esc(accessible)}</p>'
             _insert_item(conn, module_id, item_type, title.strip(), body_html=content, external_url=external_url, embed_url=embed_url, metadata={"accessible_alternative": accessible, "created_by": user["email"]}, points=points_value, due_at=due_at, status="draft")
+            created = rows(execute(conn, "SELECT id,item_type,title FROM nexus_content_items WHERE module_id=? ORDER BY id DESC LIMIT 1", (module_id,)))
+            if not created or str(created[0]["item_type"]) != item_type:
+                raise RuntimeError(f"Faculty item creation integrity failure: requested={item_type!r}, stored={created!r}")
             audit(conn, user["email"], "faculty_item_created", "module", str(module_id), item_type, request.client.host if request.client else "")
         return RedirectResponse(f"/faculty/modules/{module_id}", status_code=303)
 
