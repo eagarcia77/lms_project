@@ -40,8 +40,9 @@ def patch_student_portal() -> None:
     text = STUDENT_PORTAL.read_text(encoding="utf-8")
     helper = '''
 def _student_item_href(item: dict) -> str:
-    item_id = int(item["id"])
-    return f"/learn/assessments/{item_id}" if str(item.get("item_type")) in {"assessment", "quiz"} else f"/learn/items/{item_id}"
+    # Keep /learn/items/{id} as the stable learner entry point. The route itself
+    # decides whether a structured Assessments v2 attempt exists.
+    return f"/learn/items/{int(item['id'])}"
 '''
     if "def _student_item_href(" not in text:
         marker = "\n\ndef _module_html(module: dict, items: list[dict]) -> str:\n"
