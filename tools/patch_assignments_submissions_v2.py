@@ -55,7 +55,7 @@ def patch_student_assignment_links() -> None:
     text = text.replace(discussion_version, assignment_version, 1)
 
     legacy_redirect = '            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)\n'
-    assignment_redirect = '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n            if str(item.get("item_type")) in STRUCTURED_TYPES: return RedirectResponse(f"/learn/assessments/{item_id}",status_code=303)\n'
+    assignment_redirect = '            if str(item.get("item_type")) in {"assignment","project","presentation"}: return RedirectResponse(f"/learn/assignments/{item_id}",status_code=303)\n            # Structured assessments keep /learn/items/{id} as the stable compatibility entry.\n'
     if legacy_redirect not in text:
         raise RuntimeError("Assignments & Submissions v2 could not redirect legacy assignment item URLs.")
     text = text.replace(legacy_redirect, assignment_redirect, 1)
