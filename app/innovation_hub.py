@@ -291,6 +291,38 @@ def register_innovation_hub(app: FastAPI) -> None:
             if not course_ready or not module_ready or student_count == 0
             else '<p>Curso y módulo publicados; hay estudiantes matriculados. Comprueba también el estado individual del aula.</p>'
         )
+        blockers = []
+        if not course_ready:
+            blockers.append(
+                f'<li>El curso no está activo. <a href="/admin/courses">Revisar estado del curso</a>.</li>'
+            )
+        if not module_ready:
+            blockers.append(
+                f'<li>El módulo no está publicado. <a href="{PREFIX}/modules/{module_id}">Editar módulo</a>.</li>'
+            )
+        if student_count == 0:
+            blockers.append(
+                '<li>No hay estudiantes con matrícula activa. '
+                '<a href="/admin/enrollments">Administrar matrículas</a>.</li>'
+            )
+        unpublished_vr = [
+            item for item in items
+            if str(item.get("item_type")) == "vr" and str(item.get("status")) != "published"
+        ]
+        if unpublished_vr:
+            blockers.append(
+                f'<li>{len(unpublished_vr)} aula(s) VR aún no publicada(s). '
+                f'<a href="{PREFIX}/modules/{module_id}">Editar contenido del módulo</a>.</li>'
+            )
+        if not any(str(item.get("item_type")) == "vr" for item in items):
+            blockers.append('<li>Aún no hay aulas VR. Usa el formulario de creación de esta página.</li>')
+        readiness += (
+            '<div class="notice" role="status"><strong>Acciones pendientes</strong><ul>'
+            + ''.join(blockers) + '</ul></div>'
+            if blockers else
+            '<p class="success" role="status">Publicación y matrícula configuradas. '
+            'Falta confirmar el acceso con una cuenta estudiantil y el funcionamiento del visor.</p>'
+        )
         report = _quality_report(module, draft, items)
         quality_rows = "".join(
             f"<tr><td>{html.escape(name)}</td><td class='status'>{'Correcto' if ok else 'Atención'}</td><td>{html.escape(detail)}</td></tr>"
