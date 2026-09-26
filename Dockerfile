@@ -105,6 +105,7 @@ RUN PYTHONPATH=. python tools/smoke_test_nuvedra_branding.py
 RUN PYTHONPATH=. python tools/smoke_test_course_workspace.py
 RUN PYTHONPATH=. python tools/smoke_test_academic_roles.py
 RUN PYTHONPATH=. python tools/smoke_test_platform_upgrade.py
+RUN python tools/fix_attendance_smoke_visibility.py
 RUN PYTHONPATH=. python tools/smoke_test_course_editor_access.py
 RUN grep -q "store_token" app/google_api.py \
     && grep -q "https://www.googleapis.com/auth/drive.file" app/google_api.py \
