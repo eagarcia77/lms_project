@@ -276,6 +276,15 @@ def register_innovation_hub(app: FastAPI) -> None:
             for name, ok, detail in report["checks"]
         )
         tool_options = "".join(f'<option value="{key}">{html.escape(label)}</option>' for key, (label, _) in TOOL_PRESETS.items() if key != "native")
+        vr_items = [item for item in items if str(item.get("item_type")) == "vr"]
+        vr_cards = "".join(
+            f'<li><strong>{html.escape(str(item.get("title") or "Aula VR"))}</strong> '
+            f'<span class="badge">{html.escape(str(item.get("status") or "draft"))}</span> '
+            f'<a href="{PREFIX}/items/{int(item["id"])}/preview" target="_blank" rel="noopener">Vista previa administrativa</a> · '
+            f'<a href="/learn/items/{int(item["id"])}" target="_blank" rel="noopener">Enlace estudiantil</a> · '
+            f'<a href="{PREFIX}/items/{int(item["id"])}/forum">Comunidad</a></li>'
+            for item in vr_items
+        ) or "<li>Aún no hay aulas VR en este módulo.</li>"
         body = f"""
 <p><a href="{HUB_PREFIX}/courses/{course['id']}">&larr; Innovación del curso</a> · <a href="{PREFIX}/modules/{module_id}">Abrir Studio del módulo</a></p>
 <h2>{html.escape(str(module['title']))}</h2>
@@ -286,6 +295,7 @@ def register_innovation_hub(app: FastAPI) -> None:
 <section class="card"><h3>Crear RA, VR o 360</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/xr"><label>Experiencia<select name="experience_type"><option value="ar">Realidad aumentada</option><option value="vr">Realidad virtual/WebXR</option><option value="360">Video o recorrido 360</option></select></label><label>Título<input name="title" required></label><label>URL del modelo o experiencia<input type="url" name="source_url" required></label><label>Instrucciones<textarea name="instructions"></textarea></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Crear experiencia</button></form></section>
 <section class="card"><h3>Herramientas emergentes</h3><form method="post" action="{HUB_PREFIX}/modules/{module_id}/tool"><label>Herramienta<select name="tool_name">{tool_options}</select></label><label>Título<input name="title" required></label><label>URL específica<input type="url" name="resource_url"></label><label>Uso<select name="graded"><option value="false">Recurso de aprendizaje</option><option value="true">Actividad evaluada</option></select></label><label>Puntos<input type="number" name="points" min="0" step="0.01"></label><button>Vincular herramienta</button></form></section>
 </div>
+<section class="card"><h3>Aulas VR del módulo y acceso de prueba</h3><p>El enlace estudiantil exige matrícula y publicación del curso, módulo y aula. Una vista previa administrativa no confirma que el estudiante pueda entrar.</p><ul>{vr_cards}</ul><p>Para verificar la experiencia completa, publica el contenido y abre el enlace estudiantil con una cuenta matriculada. Prueba después el modo VR desde el navegador del visor.</p></section>
 <section class="card"><h3>Auditoría pedagógica y de accesibilidad</h3><table><thead><tr><th>Criterio</th><th>Estado</th><th>Recomendación</th></tr></thead><tbody>{quality_rows}</tbody></table></section>
 """
         return page("Innovación del módulo", body, user)
