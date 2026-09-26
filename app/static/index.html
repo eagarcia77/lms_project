@@ -168,10 +168,11 @@
       <div class="xr-stage-grid">
         <section class="panel xr-panel">
           <div class="panel-heading"><div><p class="eyebrow">Realidad aumentada</p><h2>Objeto 3D interactivo</h2></div><span class="chip">Móvil</span></div>
-          <model-viewer src="https://modelviewer.dev/shared-assets/models/Astronaut.glb" alt="Modelo tridimensional de un astronauta para una demostración educativa" ar ar-modes="webxr scene-viewer quick-look" camera-controls auto-rotate shadow-intensity="1" exposure="1" touch-action="pan-y"><button class="ar-button" slot="ar-button">Ver en mi espacio</button></model-viewer>
+          <model-viewer src="https://modelviewer.dev/shared-assets/models/Astronaut.glb" alt="Modelo tridimensional de un astronauta para una demostración educativa" ar ar-modes="webxr scene-viewer quick-look" camera-controls auto-rotate shadow-intensity="1" exposure="1" touch-action="pan-y"><button class="ar-button" slot="ar-button">Ver en mi espacio</button><p>Para ver el modelo 3D necesitas un navegador compatible. <a href="https://modelviewer.dev/shared-assets/models/Astronaut.glb" target="_blank" rel="noopener noreferrer">Abrir modelo 3D</a>.</p></model-viewer><p class="xr-access-note">Si el modelo no aparece, <a href="https://modelviewer.dev/examples/" target="_blank" rel="noopener noreferrer">comprueba la compatibilidad 3D de tu navegador</a>. La realidad aumentada requiere un dispositivo compatible.</p>
         </section>
         <section class="panel xr-panel">
           <div class="panel-heading"><div><p class="eyebrow">Realidad virtual</p><h2>Salón de cobertura Wi-Fi</h2></div><span class="chip">Headset</span></div>
+          <p class="xr-access-note">Explora el salón con el ratón o el panel táctil. Para entrar en VR, utiliza un navegador y visor compatibles. Si la escena está en blanco, comprueba que WebGL y la aceleración gráfica estén disponibles.</p>
           <div class="aframe-wrap">
             <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true; colorManagement: true" background="color: #F7F8FC">
               <a-box position="-2 1 -4" width="1.2" height="2" depth="0.2" color="#4338CA"></a-box>
