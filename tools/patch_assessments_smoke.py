@@ -11,13 +11,6 @@ def main() -> None:
     from patch_assessment_editor_settings import main as patch_assessment_editor_settings
     patch_assessment_editor_settings()
 
-    # The academic-role smoke test validates the legacy free-text assessment path.
-    # Assessments v2 reserves item_type=assessment/quiz for the structured runner,
-    # so keep that older smoke scenario on assignment where the free-text workflow remains valid.
-    role_text = ROLE_SMOKE.read_text(encoding="utf-8")
-    role_text = role_text.replace("'item_type': 'assessment'", "'item_type': 'assignment'")
-    ROLE_SMOKE.write_text(role_text, encoding="utf-8")
-
     text = PATH.read_text(encoding="utf-8")
     if "import subprocess\n" not in text:
         text = text.replace("import os\n", "import os\nimport subprocess\nimport sys\n", 1)
