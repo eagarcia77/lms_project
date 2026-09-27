@@ -188,6 +188,9 @@ def register_student_portal(app: FastAPI) -> None:
     const lines = [
       'NUVEDRA - Resumen local de prueba VR',
       'Fecha: ' + new Date().toISOString(),
+      'Navegador: ' + navigator.userAgent,
+      'WebXR API disponible: ' + (Boolean(navigator.xr) ? 'si' : 'no'),
+      'Contexto seguro HTTPS: ' + (window.isSecureContext ? 'si' : 'no'),
       'Selecciones totales: ' + sessionSelections,
       'Estaciones distintas en recorrido actual: ' + visited.size + '/3',
       'Escena 3D: ' + selectionSources.scene,
