@@ -88,17 +88,22 @@ def register_student_portal(app: FastAPI) -> None:
   const scene = document.querySelector('a-scene');
   const status = document.getElementById('xr-classroom-status');
   const compatibility = document.getElementById('xr-device-compatibility');
+  let immersiveCapability = 'pendiente';
   if (compatibility) {{
     if (!window.isSecureContext) {{
+      immersiveCapability = 'requiere contexto seguro';
       compatibility.textContent = 'El modo VR necesita una conexión segura (HTTPS). Puedes utilizar la versión 3D de escritorio.';
     }} else if (!navigator.xr || typeof navigator.xr.isSessionSupported !== 'function') {{
+      immersiveCapability = 'API no disponible';
       compatibility.textContent = 'Este navegador no ofrece WebXR inmersivo. Puedes explorar el aula en pantalla y participar en su comunidad.';
     }} else {{
       navigator.xr.isSessionSupported('immersive-vr').then((supported) => {{
+        immersiveCapability = supported ? 'compatible declarado' : 'no compatible declarado';
         compatibility.textContent = supported
           ? 'El navegador indica compatibilidad con VR inmersiva. Selecciona el botón VR del aula para solicitar acceso.'
           : 'No se detectó compatibilidad con VR inmersiva. La versión 3D de escritorio sigue disponible.';
       }}).catch(() => {{
+        immersiveCapability = 'comprobacion fallida';
         compatibility.textContent = 'No fue posible comprobar la compatibilidad del visor. Prueba el botón VR si está disponible.';
       }});
     }}
@@ -191,6 +196,7 @@ def register_student_portal(app: FastAPI) -> None:
       'Navegador: ' + navigator.userAgent,
       'WebXR API disponible: ' + (Boolean(navigator.xr) ? 'si' : 'no'),
       'Compatibilidad inmersiva: ' + (compatibility?.textContent || 'sin diagnostico'),
+      'Resultado WebXR immersive-vr: ' + immersiveCapability,
       'Contexto seguro HTTPS: ' + (window.isSecureContext ? 'si' : 'no'),
       'Selecciones totales: ' + sessionSelections,
       'Estaciones distintas en recorrido actual: ' + visited.size + '/3',
