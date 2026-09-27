@@ -198,6 +198,7 @@ def register_student_portal(app: FastAPI) -> None:
     const elapsed = Math.round((immersiveElapsedMs + (immersiveStartedAt !== null ? performance.now() - immersiveStartedAt : 0)) / 1000);
     immersiveSessionStatus.textContent = 'Sesión VR: ' + (immersiveStartedAt !== null ? 'activa' : 'fuera del modo inmersivo') + '; entradas: ' + immersiveEntries + '; salidas: ' + immersiveExits + '; tiempo aproximado: ' + elapsed + ' s.';
   }};
+  syncImmersiveSession();
   const exportSession = document.getElementById('xr-export-session');
   if (exportSession) exportSession.addEventListener('click', () => {{
     const lines = [
