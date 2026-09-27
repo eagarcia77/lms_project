@@ -71,6 +71,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
 <a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
 <a-entity position="0 1.65 -2.3"><a-plane width="2.9" height="0.85" color="#0f172a" opacity="0.94"></a-plane><a-text id="xr-inworld-guidance" value="Recorrido: 0/3 | Siguiente: Objetivos" align="center" color="#ffffff" width="2.7" wrap-count="38" position="0 0 0.02"></a-text></a-entity>
+<a-entity position="0 1.08 -2.3"><a-plane width="3.3" height="0.62" color="#1e293b" opacity="0.94"></a-plane><a-text id="xr-inworld-topic" value="Selecciona una mesa para consultar la actividad." align="center" color="#ffffff" width="3.05" wrap-count="47" position="0 0 0.02"></a-text></a-entity>
 <a-entity id="xr-next-marker" position="-2 1.75 -3.5"><a-cone color="#f59e0b" radius-bottom="0.18" radius-top="0" height="0.3" rotation="180 0 0"></a-cone><a-text value="SIGUIENTE" align="center" width="2.5" color="#92400e" position="0 0.35 0"></a-text></a-entity>
 <a-text value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
 <a-text value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
@@ -122,6 +123,7 @@ def register_student_portal(app: FastAPI) -> None:
     status.textContent = 'Se perdió el contexto gráfico WebGL. Recarga la página o utiliza la alternativa textual.';
   }});
   const stationStatus = document.getElementById('xr-learning-station');
+  const inWorldTopic = scene.querySelector('#xr-inworld-topic');
   const stations = Array.from(scene.querySelectorAll('.xr-station'));
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
@@ -159,6 +161,10 @@ def register_student_portal(app: FastAPI) -> None:
 
   const selectStation = (station) => {{
     if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
+    if (inWorldTopic) {{
+      const topic = station.getAttribute('data-topic') || 'Estación seleccionada.';
+      inWorldTopic.setAttribute('value', topic);
+    }}
     const index = stations.indexOf(station);
     if (index < 0) return;
     visited.add(index);
@@ -186,6 +192,7 @@ def register_student_portal(app: FastAPI) -> None:
     }});
     if (routeProgress) routeProgress.textContent = 'Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.';
     if (stationStatus) stationStatus.textContent = 'Recorrido reiniciado. Selecciona una estación o consulta las instrucciones en texto.';
+    if (inWorldTopic) inWorldTopic.setAttribute('value', 'Selecciona una mesa para consultar la actividad.');
   }});
   stations.forEach((station) => {{
     station.addEventListener('mouseenter', () => {{
