@@ -70,6 +70,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box position="0 2 -7" width="7" height="2.5" depth="0.12" color="{accent}"></a-box>
 <a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
 <a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
+<a-entity id="xr-next-marker" position="-2 1.75 -3.5"><a-cone color="#f59e0b" radius-bottom="0.18" radius-top="0" height="0.3" rotation="180 0 0"></a-cone><a-text value="SIGUIENTE" align="center" width="2.5" color="#92400e" position="0 0.35 0"></a-text></a-entity>
 <a-text value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
 <a-text value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
 <a-text value="3. Reflexion" position="0 1.2 -4.7" align="center" width="2.8" color="#1e293b"></a-text>
@@ -124,11 +125,25 @@ def register_student_portal(app: FastAPI) -> None:
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
   const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
+  const nextMarker = scene.querySelector('#xr-next-marker');
+  const markerPositions = ['-2 1.75 -3.5', '2 1.75 -3.5', '0 1.75 -4.7'];
+  const updateMarker = () => {{
+    if (!nextMarker) return;
+    const next = [0, 1, 2].find((step) => !visited.has(step));
+    if (next === undefined) {{
+      nextMarker.setAttribute('visible', false);
+    }} else {{
+      nextMarker.setAttribute('visible', true);
+      nextMarker.setAttribute('position', markerPositions[next]);
+    }}
+  }};
+
   const selectStation = (station) => {{
     if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
     const index = stations.indexOf(station);
     if (index < 0) return;
     visited.add(index);
+    updateMarker();
     station.setAttribute('color', '#059669');
     station.setAttribute('scale', '1 1 1');
     if (routeProgress) {{
@@ -141,6 +156,7 @@ def register_student_portal(app: FastAPI) -> None:
   const resetRoute = document.getElementById('xr-route-reset');
   if (resetRoute) resetRoute.addEventListener('click', () => {{
     visited.clear();
+    updateMarker();
     stations.forEach((station) => {{
       station.setAttribute('color', '#64748b');
       station.setAttribute('scale', '1 1 1');
