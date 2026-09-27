@@ -195,6 +195,9 @@ def register_student_portal(app: FastAPI) -> None:
       'Atajos de teclado: ' + selectionSources.shortcut,
       'Estaciones consultadas: ' + (Array.from(visited).sort().map((index) => ['Objetivos', 'Exploracion', 'Reflexion'][index]).join(', ') || 'ninguna'),
       'Estado de controladores: ' + (document.getElementById('xr-controller-status')?.textContent || 'no disponible'),
+      'Estado del aula: ' + (status?.textContent || 'no disponible'),
+      'Diagnostico de seleccion: ' + (document.getElementById('xr-selection-diagnostic')?.textContent || 'no disponible'),
+      'Modo inmersivo activo al exportar: ' + (scene?.is('vr-mode') ? 'si' : 'no'),
       'Verificaciones manuales (declaradas por quien realiza la prueba):',
       ...Array.from(document.querySelectorAll('#xr-manual-checks input[data-xr-check]')).map((check) => (check.checked ? '[REALIZADA] ' : '[PENDIENTE] ') + check.getAttribute('data-xr-check')),
       'Nota: el registro no demuestra compatibilidad con un visor fisico ni acredita calificaciones.'
