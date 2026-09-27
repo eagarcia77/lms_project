@@ -226,6 +226,8 @@ def register_student_portal(app: FastAPI) -> None:
       'Entradas a modo VR: ' + immersiveEntries,
       'Salidas de modo VR: ' + immersiveExits,
       'Tiempo inmersivo aproximado (segundos): ' + Math.round((immersiveElapsedMs + (immersiveStartedAt !== null ? performance.now() - immersiveStartedAt : 0)) / 1000),
+      'Estado de recorrido: ' + (visited.size === 3 ? '3 estaciones consultadas' : 'recorrido parcial'),
+      'Verificacion de gatillo en visor: ' + (document.querySelector('#xr-manual-checks input[data-xr-check="Gatillo selecciona estacion"]')?.checked ? 'declarada realizada' : 'pendiente'),
       'Verificaciones manuales (declaradas por quien realiza la prueba):',
       ...Array.from(document.querySelectorAll('#xr-manual-checks input[data-xr-check]')).map((check) => (check.checked ? '[REALIZADA] ' : '[PENDIENTE] ') + check.getAttribute('data-xr-check')),
       'Nota: el registro no demuestra compatibilidad con un visor fisico ni acredita calificaciones.'
