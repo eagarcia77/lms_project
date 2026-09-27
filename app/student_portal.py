@@ -188,6 +188,10 @@ def register_student_portal(app: FastAPI) -> None:
   let sessionSelections = 0;
   const selectionSources = {{scene: 0, button: 0, shortcut: 0}};
   const interactionCount = document.getElementById('xr-interaction-count');
+  let immersiveEntries = 0;
+  let immersiveExits = 0;
+  let immersiveStartedAt = null;
+  let immersiveElapsedMs = 0;
   const exportSession = document.getElementById('xr-export-session');
   if (exportSession) exportSession.addEventListener('click', () => {{
     const lines = [
@@ -208,6 +212,9 @@ def register_student_portal(app: FastAPI) -> None:
       'Estado del aula: ' + (status?.textContent || 'no disponible'),
       'Diagnostico de seleccion: ' + (document.getElementById('xr-selection-diagnostic')?.textContent || 'no disponible'),
       'Modo inmersivo activo al exportar: ' + (scene?.is('vr-mode') ? 'si' : 'no'),
+      'Entradas a modo VR: ' + immersiveEntries,
+      'Salidas de modo VR: ' + immersiveExits,
+      'Tiempo inmersivo aproximado (segundos): ' + Math.round((immersiveElapsedMs + (immersiveStartedAt !== null ? performance.now() - immersiveStartedAt : 0)) / 1000),
       'Verificaciones manuales (declaradas por quien realiza la prueba):',
       ...Array.from(document.querySelectorAll('#xr-manual-checks input[data-xr-check]')).map((check) => (check.checked ? '[REALIZADA] ' : '[PENDIENTE] ') + check.getAttribute('data-xr-check')),
       'Nota: el registro no demuestra compatibilidad con un visor fisico ni acredita calificaciones.'
@@ -360,9 +367,16 @@ def register_student_portal(app: FastAPI) -> None:
     }});
   }});
   scene.addEventListener('enter-vr', () => {{
+    immersiveEntries += 1;
+    if (immersiveStartedAt === null) immersiveStartedAt = performance.now();
     status.textContent = 'Sesión inmersiva iniciada. Puedes salir del modo VR desde los controles del visor.';
   }});
   scene.addEventListener('exit-vr', () => {{
+    immersiveExits += 1;
+    if (immersiveStartedAt !== null) {{
+      immersiveElapsedMs += performance.now() - immersiveStartedAt;
+      immersiveStartedAt = null;
+    }}
     status.textContent = 'Has salido del modo VR. Puedes continuar en pantalla y consultar la comunidad.';
   }});
   scene.addEventListener('render-target-loaded', () => {{
