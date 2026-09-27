@@ -70,11 +70,11 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box position="0 2 -7" width="7" height="2.5" depth="0.12" color="{accent}"></a-box>
 <a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
 <a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
-<a-box position="-2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
-<a-box position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
-<a-box position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
-<a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}"></a-cursor></a-camera></a-entity>
-</a-scene></div><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+<a-box class="xr-station" data-topic="Objetivos: identifica el propósito de la actividad y los resultados de aprendizaje." position="-2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-box class="xr-station" data-topic="Exploración: examina el aula y relaciona lo observado con las instrucciones." position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-box class="xr-station" data-topic="Reflexión: comparte un hallazgo o una pregunta en la comunidad de aprendizaje." position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
+<a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
+</a-scene></div><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -113,6 +113,12 @@ def register_student_portal(app: FastAPI) -> None:
   }}, {{ once: true }});
   scene.addEventListener('webglcontextlost', () => {{
     status.textContent = 'Se perdió el contexto gráfico WebGL. Recarga la página o utiliza la alternativa textual.';
+  }});
+  const stationStatus = document.getElementById('xr-learning-station');
+  scene.querySelectorAll('.xr-station').forEach((station) => {{
+    station.addEventListener('click', () => {{
+      if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
+    }});
   }});
   scene.addEventListener('enter-vr', () => {{
     status.textContent = 'Sesión inmersiva iniciada. Puedes salir del modo VR desde los controles del visor.';
