@@ -70,8 +70,8 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box position="0 2 -7" width="7" height="2.5" depth="0.12" color="{accent}"></a-box>
 <a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
 <a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
-<a-entity position="0 1.65 -2.3"><a-plane width="2.9" height="0.85" color="#0f172a" opacity="0.94"></a-plane><a-text id="xr-inworld-guidance" value="Recorrido: 0/3 | Siguiente: Objetivos" align="center" color="#ffffff" width="2.7" wrap-count="38" position="0 0 0.02"></a-text></a-entity>
-<a-entity position="0 1.08 -2.3"><a-plane width="3.3" height="0.62" color="#1e293b" opacity="0.94"></a-plane><a-text id="xr-inworld-topic" value="Selecciona una mesa para consultar la actividad." align="center" color="#ffffff" width="3.05" wrap-count="47" position="0 0 0.02"></a-text></a-entity>
+<a-entity class="xr-guidance-panel" position="0 1.65 -2.3"><a-plane width="2.9" height="0.85" color="#0f172a" opacity="0.94"></a-plane><a-text id="xr-inworld-guidance" value="Recorrido: 0/3 | Siguiente: Objetivos" align="center" color="#ffffff" width="2.7" wrap-count="38" position="0 0 0.02"></a-text></a-entity>
+<a-entity class="xr-guidance-panel" position="0 1.08 -2.3"><a-plane width="3.3" height="0.62" color="#1e293b" opacity="0.94"></a-plane><a-text id="xr-inworld-topic" value="Selecciona una mesa para consultar la actividad." align="center" color="#ffffff" width="3.05" wrap-count="47" position="0 0 0.02"></a-text></a-entity>
 <a-entity id="xr-next-marker" position="-2 1.75 -3.5"><a-cone color="#f59e0b" radius-bottom="0.18" radius-top="0" height="0.3" rotation="180 0 0"></a-cone><a-text value="SIGUIENTE" align="center" width="2.5" color="#92400e" position="0 0.35 0"></a-text></a-entity>
 <a-text value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
 <a-text value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
@@ -82,7 +82,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
 <a-entity laser-controls="hand: left" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
 <a-entity laser-controls="hand: right" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
-</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-route-reset">Reiniciar recorrido</button><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-toggle-guidance" aria-pressed="true">Ocultar paneles 3D</button> <button type="button" id="xr-route-reset">Reiniciar recorrido</button><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -121,6 +121,14 @@ def register_student_portal(app: FastAPI) -> None:
   }}, {{ once: true }});
   scene.addEventListener('webglcontextlost', () => {{
     status.textContent = 'Se perdió el contexto gráfico WebGL. Recarga la página o utiliza la alternativa textual.';
+  }});
+
+  const guidanceToggle = document.getElementById('xr-toggle-guidance');
+  if (guidanceToggle) guidanceToggle.addEventListener('click', () => {{
+    const show = guidanceToggle.getAttribute('aria-pressed') !== 'true';
+    scene.querySelectorAll('.xr-guidance-panel').forEach((panel) => panel.setAttribute('visible', show));
+    guidanceToggle.setAttribute('aria-pressed', show ? 'true' : 'false');
+    guidanceToggle.textContent = show ? 'Ocultar paneles 3D' : 'Mostrar paneles 3D';
   }});
   const stationStatus = document.getElementById('xr-learning-station');
   const inWorldTopic = scene.querySelector('#xr-inworld-topic');
