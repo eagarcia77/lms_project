@@ -82,7 +82,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
 <a-entity laser-controls="hand: left" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
 <a-entity laser-controls="hand: right" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
-</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-reset-visual">Restablecer preferencias visuales</button> <button type="button" id="xr-toggle-contrast" aria-pressed="false">Alto contraste 3D</button> <button type="button" id="xr-toggle-motion" aria-pressed="false">Reducir movimiento</button> <button type="button" id="xr-toggle-guidance" aria-pressed="true">Ocultar paneles 3D</button> <button type="button" id="xr-route-reset">Reiniciar recorrido</button><p>Atajos de teclado: Alt+1 Objetivos, Alt+2 Exploración, Alt+3 Reflexión y Alt+0 reiniciar. Funcionan fuera del modo inmersivo.</p><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-interaction-count" role="status">Interacciones de esta sesión: 0 selecciones; 0 estaciones distintas.</p><p id="xr-selection-diagnostic" role="status" aria-live="polite">Selección XR: todavía no se ha registrado una interacción con una estación.</p><p id="xr-controller-status" role="status" aria-live="polite">Controles XR: sin conexión detectada. Puedes utilizar el cursor, el ratón o los botones accesibles.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-reset-visual">Restablecer preferencias visuales</button> <button type="button" id="xr-toggle-contrast" aria-pressed="false">Alto contraste 3D</button> <button type="button" id="xr-toggle-motion" aria-pressed="false">Reducir movimiento</button> <button type="button" id="xr-toggle-guidance" aria-pressed="true">Ocultar paneles 3D</button> <button type="button" id="xr-route-reset">Reiniciar recorrido</button><p>Atajos de teclado: Alt+1 Objetivos, Alt+2 Exploración, Alt+3 Reflexión y Alt+0 reiniciar. Funcionan fuera del modo inmersivo.</p><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><button type="button" id="xr-export-session">Descargar resumen de sesión VR (.txt)</button><p id="xr-interaction-count" role="status">Interacciones de esta sesión: 0 selecciones; 0 estaciones distintas.</p><p id="xr-selection-diagnostic" role="status" aria-live="polite">Selección XR: todavía no se ha registrado una interacción con una estación.</p><p id="xr-controller-status" role="status" aria-live="polite">Controles XR: sin conexión detectada. Puedes utilizar el cursor, el ratón o los botones accesibles.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -183,6 +183,29 @@ def register_student_portal(app: FastAPI) -> None:
   let sessionSelections = 0;
   const selectionSources = {{scene: 0, button: 0, shortcut: 0}};
   const interactionCount = document.getElementById('xr-interaction-count');
+  const exportSession = document.getElementById('xr-export-session');
+  if (exportSession) exportSession.addEventListener('click', () => {{
+    const lines = [
+      'NUVEDRA - Resumen local de prueba VR',
+      'Fecha: ' + new Date().toISOString(),
+      'Selecciones totales: ' + sessionSelections,
+      'Estaciones distintas en recorrido actual: ' + visited.size + '/3',
+      'Escena 3D: ' + selectionSources.scene,
+      'Botones accesibles: ' + selectionSources.button,
+      'Atajos de teclado: ' + selectionSources.shortcut,
+      'Estaciones consultadas: ' + (Array.from(visited).sort().map((index) => ['Objetivos', 'Exploracion', 'Reflexion'][index]).join(', ') || 'ninguna'),
+      'Estado de controladores: ' + (document.getElementById('xr-controller-status')?.textContent || 'no disponible'),
+      'Nota: el registro no demuestra compatibilidad con un visor fisico ni acredita calificaciones.'
+    ];
+    const blob = new Blob([lines.join('\\n') + '\\n'], {{type: 'text/plain;charset=utf-8'}});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'nuvedra-prueba-vr.txt';
+    link.click();
+    URL.revokeObjectURL(url);
+  }});
+
   const syncInteractionCount = () => {{
     if (interactionCount) interactionCount.textContent = 'Interacciones de esta sesión: ' + sessionSelections + ' selecciones; ' + visited.size + ' estaciones distintas. Escena 3D: ' + selectionSources.scene + '; botones: ' + selectionSources.button + '; atajos: ' + selectionSources.shortcut + '.';
   }};
