@@ -181,9 +181,10 @@ def register_student_portal(app: FastAPI) -> None:
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
   let sessionSelections = 0;
+  const selectionSources = {{scene: 0, button: 0, shortcut: 0}};
   const interactionCount = document.getElementById('xr-interaction-count');
   const syncInteractionCount = () => {{
-    if (interactionCount) interactionCount.textContent = 'Interacciones de esta sesión: ' + sessionSelections + ' selecciones; ' + visited.size + ' estaciones distintas.';
+    if (interactionCount) interactionCount.textContent = 'Interacciones de esta sesión: ' + sessionSelections + ' selecciones; ' + visited.size + ' estaciones distintas. Escena 3D: ' + selectionSources.scene + '; botones: ' + selectionSources.button + '; atajos: ' + selectionSources.shortcut + '.';
   }};
   const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
   const inWorldStationLabels = Array.from(scene.querySelectorAll('.xr-station-label'));
@@ -226,7 +227,7 @@ def register_student_portal(app: FastAPI) -> None:
     }}
   }};
 
-  const selectStation = (station) => {{
+  const selectStation = (station, source = 'scene') => {{
     if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
     if (inWorldTopic) {{
       const topic = station.getAttribute('data-topic') || 'Estación seleccionada.';
@@ -236,6 +237,7 @@ def register_student_portal(app: FastAPI) -> None:
     if (index < 0) return;
     visited.add(index);
     sessionSelections += 1;
+    if (Object.prototype.hasOwnProperty.call(selectionSources, source)) selectionSources[source] += 1;
     syncInteractionCount();
     syncInWorldStationLabels();
     syncInWorldGuidance();
@@ -286,7 +288,7 @@ def register_student_portal(app: FastAPI) -> None:
   document.querySelectorAll('.xr-station-button').forEach((button) => {{
     button.addEventListener('click', () => {{
       const index = Number(button.getAttribute('data-station'));
-      if (stations[index]) selectStation(stations[index]);
+      if (stations[index]) selectStation(stations[index], 'button');
     }});
   }});
   document.addEventListener('keydown', (event) => {{
@@ -297,7 +299,7 @@ def register_student_portal(app: FastAPI) -> None:
       const station = stations[Number(event.key) - 1];
       if (station) {{
         event.preventDefault();
-        selectStation(station);
+        selectStation(station, 'shortcut');
       }}
     }} else if (event.key === '0' && resetRoute) {{
       event.preventDefault();
