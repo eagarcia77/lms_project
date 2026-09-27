@@ -17,7 +17,7 @@ from app.admin_authoring_v6 import (
     safe_url,
     sanitize_html,
 )
-from app.admin_console import audit, db, database_url, execute, page, require_admin, rows, utcnow
+from app.admin_console import audit, db, database_url, execute, page, require_admin, rows, session_user, utcnow
 from app.google_api import google_get
 
 PREFIX = "/admin/authoring"
@@ -238,7 +238,7 @@ def register_unified_authoring(app: FastAPI) -> None:
 
     @app.get(PREFIX, response_class=HTMLResponse, response_model=None)
     async def authoring_home(request: Request):
-        if not request.cookies.get("nexus_admin_session"):
+        if not session_user(request):
             return RedirectResponse("/admin/login", status_code=303)
         user = require_admin(request, {"course_admin"})
         with db() as conn:
