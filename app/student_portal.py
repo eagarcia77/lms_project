@@ -197,7 +197,7 @@ def register_student_portal(app: FastAPI) -> None:
       'Estado de controladores: ' + (document.getElementById('xr-controller-status')?.textContent || 'no disponible'),
       'Nota: el registro no demuestra compatibilidad con un visor fisico ni acredita calificaciones.'
     ];
-    const blob = new Blob([lines.join('\\n') + '\\n'], {{type: 'text/plain;charset=utf-8'}});
+    const blob = new Blob([lines.join('\n') + '\n'], {{type: 'text/plain;charset=utf-8'}});
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
