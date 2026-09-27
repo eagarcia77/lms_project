@@ -80,7 +80,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
 <a-entity laser-controls="hand: left" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
 <a-entity laser-controls="hand: right" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
-</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" data-station="2">3. Reflexión</button></div><button type="button" id="xr-route-reset">Reiniciar recorrido</button><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-route-reset">Reiniciar recorrido</button><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -125,6 +125,15 @@ def register_student_portal(app: FastAPI) -> None:
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
   const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
+  const stationButtons = Array.from(document.querySelectorAll('.xr-station-button'));
+  const syncStationButtons = () => {{
+    stationButtons.forEach((button, index) => {{
+      const completed = visited.has(index);
+      button.setAttribute('aria-pressed', completed ? 'true' : 'false');
+      button.textContent = (completed ? '✓ ' : '') + (index + 1) + '. ' + stationNames[index];
+    }});
+  }};
+
   const nextMarker = scene.querySelector('#xr-next-marker');
   const markerPositions = ['-2 1.75 -3.5', '2 1.75 -3.5', '0 1.75 -4.7'];
   const updateMarker = () => {{
@@ -143,6 +152,7 @@ def register_student_portal(app: FastAPI) -> None:
     const index = stations.indexOf(station);
     if (index < 0) return;
     visited.add(index);
+    syncStationButtons();
     updateMarker();
     station.setAttribute('color', '#059669');
     station.setAttribute('scale', '1 1 1');
@@ -156,6 +166,7 @@ def register_student_portal(app: FastAPI) -> None:
   const resetRoute = document.getElementById('xr-route-reset');
   if (resetRoute) resetRoute.addEventListener('click', () => {{
     visited.clear();
+    syncStationButtons();
     updateMarker();
     stations.forEach((station) => {{
       station.setAttribute('color', '#64748b');
