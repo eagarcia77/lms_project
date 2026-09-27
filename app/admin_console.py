@@ -205,7 +205,10 @@ def register_admin_console(app: FastAPI) -> None:
         if session_user(request):
             return RedirectResponse("/admin", status_code=303)
         message = '<p class="error">Credenciales inválidas.</p>' if error else ""
-        return page("Acceso administrativo", f'''<section class="card" style="max-width:520px;margin:auto"><h2>Acceso administrativo</h2>{message}<p>Utilice su cuenta administrativa de NUVEDRA. El acceso con Google a la página pública no inicia una sesión administrativa.</p><p><a href="/login">Volver al acceso general</a> · <a href="/admin/login">Reintentar acceso administrativo</a></p><form method="post" action="/admin/login"><label>Correo electrónico<input type="email" name="email" required autocomplete="username"></label><label>Contraseña<input type="password" name="password" required autocomplete="current-password"></label><button>Iniciar sesión</button></form></section>''')
+        response = page("Acceso administrativo", f'''<section class="card" style="max-width:520px;margin:auto"><h2>Acceso administrativo</h2>{message}<p>Utilice su cuenta administrativa de NUVEDRA. El acceso con Google a la página pública no inicia una sesión administrativa.</p><p><a href="/login">Volver al acceso general</a> · <a href="/admin/login">Reintentar acceso administrativo</a></p><form method="post" action="/admin/login"><label>Correo electrónico<input type="email" name="email" required autocomplete="username"></label><label>Contraseña<input type="password" name="password" required autocomplete="current-password"></label><button>Iniciar sesión</button></form><p>Si la sesión anterior quedó bloqueada, <a href="/admin/logout">cerrar la sesión administrativa y volver a intentar</a>.</p></section>''')
+        if request.cookies.get(COOKIE_NAME):
+            response.delete_cookie(COOKIE_NAME)
+        return response
 
     @app.post("/admin/login")
     async def admin_login_post(request: Request, email: str = Form(...), password: str = Form(...)):
