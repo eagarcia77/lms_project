@@ -238,6 +238,8 @@ def register_unified_authoring(app: FastAPI) -> None:
 
     @app.get(PREFIX, response_class=HTMLResponse, response_model=None)
     async def authoring_home(request: Request):
+        if not request.cookies.get("nexus_admin_session"):
+            return RedirectResponse("/admin/login", status_code=303)
         user = require_admin(request, {"course_admin"})
         with db() as conn:
             courses = rows(execute(conn, "SELECT * FROM nexus_admin_courses ORDER BY updated_at DESC,id DESC"))
