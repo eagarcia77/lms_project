@@ -73,9 +73,9 @@ def register_student_portal(app: FastAPI) -> None:
 <a-entity class="xr-guidance-panel" position="0 1.65 -2.3"><a-plane width="2.9" height="0.85" color="#0f172a" opacity="0.94"></a-plane><a-text id="xr-inworld-guidance" value="Recorrido: 0/3 | Siguiente: Objetivos" align="center" color="#ffffff" width="2.7" wrap-count="38" position="0 0 0.02"></a-text></a-entity>
 <a-entity class="xr-guidance-panel" position="0 1.08 -2.3"><a-plane width="3.3" height="0.62" color="#1e293b" opacity="0.94"></a-plane><a-text id="xr-inworld-topic" value="Selecciona una mesa para consultar la actividad." align="center" color="#ffffff" width="3.05" wrap-count="47" position="0 0 0.02"></a-text></a-entity>
 <a-entity id="xr-next-marker" position="-2 1.75 -3.5"><a-cone color="#f59e0b" radius-bottom="0.18" radius-top="0" height="0.3" rotation="180 0 0"></a-cone><a-text value="SIGUIENTE" align="center" width="2.5" color="#92400e" position="0 0.35 0"></a-text></a-entity>
-<a-text value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
-<a-text value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
-<a-text value="3. Reflexion" position="0 1.2 -4.7" align="center" width="2.8" color="#1e293b"></a-text>
+<a-text class="xr-station-label" value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
+<a-text class="xr-station-label" value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
+<a-text class="xr-station-label" value="3. Reflexion" position="0 1.2 -4.7" align="center" width="2.8" color="#1e293b"></a-text>
 <a-box class="xr-station" data-topic="Objetivos: identifica el propósito de la actividad y los resultados de aprendizaje." position="-2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-box class="xr-station" data-topic="Exploración: examina el aula y relaciona lo observado con las instrucciones." position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-box class="xr-station" data-topic="Reflexión: comparte un hallazgo o una pregunta en la comunidad de aprendizaje." position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
@@ -181,6 +181,15 @@ def register_student_portal(app: FastAPI) -> None:
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
   const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
+  const inWorldStationLabels = Array.from(scene.querySelectorAll('.xr-station-label'));
+  const syncInWorldStationLabels = () => {{
+    const labels = ['Objetivos', 'Exploracion', 'Reflexion'];
+    inWorldStationLabels.forEach((label, index) => {{
+      label.setAttribute('value', (index + 1) + '. ' + labels[index] + (visited.has(index) ? ' - HECHO' : ''));
+      label.setAttribute('color', visited.has(index) ? '#065f46' : '#1e293b');
+    }});
+  }};
+
   const inWorldGuidance = scene.querySelector('#xr-inworld-guidance');
   const syncInWorldGuidance = () => {{
     if (!inWorldGuidance) return;
@@ -221,6 +230,7 @@ def register_student_portal(app: FastAPI) -> None:
     const index = stations.indexOf(station);
     if (index < 0) return;
     visited.add(index);
+    syncInWorldStationLabels();
     syncInWorldGuidance();
     syncStationButtons();
     updateMarker();
@@ -236,6 +246,7 @@ def register_student_portal(app: FastAPI) -> None:
   const resetRoute = document.getElementById('xr-route-reset');
   if (resetRoute) resetRoute.addEventListener('click', () => {{
     visited.clear();
+    syncInWorldStationLabels();
     syncInWorldGuidance();
     syncStationButtons();
     updateMarker();
