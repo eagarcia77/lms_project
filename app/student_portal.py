@@ -129,6 +129,8 @@ def register_student_portal(app: FastAPI) -> None:
     const index = stations.indexOf(station);
     if (index < 0) return;
     visited.add(index);
+    station.setAttribute('color', '#059669');
+    station.setAttribute('scale', '1 1 1');
     if (routeProgress) {{
       const next = [0, 1, 2].find((step) => !visited.has(step));
       routeProgress.textContent = next === undefined
@@ -139,10 +141,20 @@ def register_student_portal(app: FastAPI) -> None:
   const resetRoute = document.getElementById('xr-route-reset');
   if (resetRoute) resetRoute.addEventListener('click', () => {{
     visited.clear();
+    stations.forEach((station) => {{
+      station.setAttribute('color', '#64748b');
+      station.setAttribute('scale', '1 1 1');
+    }});
     if (routeProgress) routeProgress.textContent = 'Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.';
     if (stationStatus) stationStatus.textContent = 'Recorrido reiniciado. Selecciona una estación o consulta las instrucciones en texto.';
   }});
   stations.forEach((station) => {{
+    station.addEventListener('mouseenter', () => {{
+      station.setAttribute('scale', '1.08 1.08 1.08');
+    }});
+    station.addEventListener('mouseleave', () => {{
+      station.setAttribute('scale', '1 1 1');
+    }});
     station.addEventListener('click', () => selectStation(station));
   }});
   document.querySelectorAll('.xr-station-button').forEach((button) => {{
