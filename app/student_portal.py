@@ -190,6 +190,7 @@ def register_student_portal(app: FastAPI) -> None:
       'Fecha: ' + new Date().toISOString(),
       'Navegador: ' + navigator.userAgent,
       'WebXR API disponible: ' + (Boolean(navigator.xr) ? 'si' : 'no'),
+      'Compatibilidad inmersiva: ' + (compatibility?.textContent || 'sin diagnostico'),
       'Contexto seguro HTTPS: ' + (window.isSecureContext ? 'si' : 'no'),
       'Selecciones totales: ' + sessionSelections,
       'Estaciones distintas en recorrido actual: ' + visited.size + '/3',
