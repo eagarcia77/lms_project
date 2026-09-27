@@ -74,7 +74,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box class="xr-station" data-topic="Exploración: examina el aula y relaciona lo observado con las instrucciones." position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-box class="xr-station" data-topic="Reflexión: comparte un hallazgo o una pregunta en la comunidad de aprendizaje." position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
-</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" data-station="2">3. Reflexión</button></div><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" data-station="2">3. Reflexión</button></div><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -116,8 +116,20 @@ def register_student_portal(app: FastAPI) -> None:
   }});
   const stationStatus = document.getElementById('xr-learning-station');
   const stations = Array.from(scene.querySelectorAll('.xr-station'));
+  const routeProgress = document.getElementById('xr-route-progress');
+  const visited = new Set();
+  const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
   const selectStation = (station) => {{
     if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
+    const index = stations.indexOf(station);
+    if (index < 0) return;
+    visited.add(index);
+    if (routeProgress) {{
+      const next = [0, 1, 2].find((step) => !visited.has(step));
+      routeProgress.textContent = next === undefined
+        ? 'Recorrido completo: 3 de 3 estaciones consultadas. Comparte tu reflexión en la comunidad del aula.'
+        : 'Recorrido guiado: ' + visited.size + ' de 3 estaciones consultadas. Próxima estación sugerida: ' + stationNames[next] + '.';
+    }}
   }};
   stations.forEach((station) => {{
     station.addEventListener('click', () => selectStation(station));
