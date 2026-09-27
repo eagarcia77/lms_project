@@ -186,6 +186,7 @@ def register_student_portal(app: FastAPI) -> None:
   const routeProgress = document.getElementById('xr-route-progress');
   const visited = new Set();
   let sessionSelections = 0;
+  const stationTimeline = [];
   const selectionSources = {{scene: 0, button: 0, shortcut: 0}};
   const interactionCount = document.getElementById('xr-interaction-count');
   let immersiveEntries = 0;
@@ -219,6 +220,8 @@ def register_student_portal(app: FastAPI) -> None:
       'Botones accesibles: ' + selectionSources.button,
       'Atajos de teclado: ' + selectionSources.shortcut,
       'Estaciones consultadas: ' + (Array.from(visited).sort().map((index) => ['Objetivos', 'Exploracion', 'Reflexion'][index]).join(', ') || 'ninguna'),
+      'Cronologia local de selecciones (hasta 100 eventos):',
+      ...(stationTimeline.length ? stationTimeline.map((entry, index) => (index + 1) + '. ' + entry) : ['sin selecciones']),
       'Estado de controladores: ' + (document.getElementById('xr-controller-status')?.textContent || 'no disponible'),
       'Estado del aula: ' + (status?.textContent || 'no disponible'),
       'Diagnostico de seleccion: ' + (document.getElementById('xr-selection-diagnostic')?.textContent || 'no disponible'),
@@ -295,6 +298,7 @@ def register_student_portal(app: FastAPI) -> None:
     if (index < 0) return;
     visited.add(index);
     sessionSelections += 1;
+    if (stationTimeline.length < 100) stationTimeline.push(new Date().toISOString() + ' | ' + ['Objetivos', 'Exploracion', 'Reflexion'][index] + ' | ' + source + ' | ' + (scene.is('vr-mode') ? 'inmersivo' : 'pantalla'));
     if (Object.prototype.hasOwnProperty.call(selectionSources, source)) selectionSources[source] += 1;
     syncInteractionCount();
     syncInWorldStationLabels();
