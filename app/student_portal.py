@@ -82,7 +82,7 @@ def register_student_portal(app: FastAPI) -> None:
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
 <a-entity laser-controls="hand: left" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
 <a-entity laser-controls="hand: right" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
-</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-toggle-motion" aria-pressed="false">Reducir movimiento</button> <button type="button" id="xr-toggle-guidance" aria-pressed="true">Ocultar paneles 3D</button> <button type="button" id="xr-route-reset">Reiniciar recorrido</button><p>Atajos de teclado: Alt+1 Objetivos, Alt+2 Exploración, Alt+3 Reflexión y Alt+0 reiniciar. Funcionan fuera del modo inmersivo.</p><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
+</a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" aria-pressed="false" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" aria-pressed="false" data-station="2">3. Reflexión</button></div><button type="button" id="xr-toggle-contrast" aria-pressed="false">Alto contraste 3D</button> <button type="button" id="xr-toggle-motion" aria-pressed="false">Reducir movimiento</button> <button type="button" id="xr-toggle-guidance" aria-pressed="true">Ocultar paneles 3D</button> <button type="button" id="xr-route-reset">Reiniciar recorrido</button><p>Atajos de teclado: Alt+1 Objetivos, Alt+2 Exploración, Alt+3 Reflexión y Alt+0 reiniciar. Funcionan fuera del modo inmersivo.</p><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
   const scene = document.querySelector('a-scene');
@@ -131,6 +131,24 @@ def register_student_portal(app: FastAPI) -> None:
     guidanceToggle.textContent = show ? 'Ocultar paneles 3D' : 'Mostrar paneles 3D';
   }});
 
+  const contrastToggle = document.getElementById('xr-toggle-contrast');
+  const contrastPanels = Array.from(scene.querySelectorAll('.xr-guidance-panel a-plane'));
+  const contrastTexts = Array.from(scene.querySelectorAll('.xr-guidance-panel a-text'));
+  const contrastStations = Array.from(scene.querySelectorAll('.xr-station'));
+  let highContrast = false;
+  const syncContrast = () => {{
+    contrastPanels.forEach((panel) => panel.setAttribute('color', highContrast ? '#000000' : (panel.getAttribute('height') === '0.85' ? '#0f172a' : '#1e293b')));
+    contrastTexts.forEach((label) => label.setAttribute('color', '#ffffff'));
+    contrastStations.forEach((station, index) => station.setAttribute('color', visited.has(index) ? (highContrast ? '#00ff99' : '#059669') : (highContrast ? '#ffffff' : '#64748b')));
+    if (contrastToggle) {{
+      contrastToggle.setAttribute('aria-pressed', highContrast ? 'true' : 'false');
+      contrastToggle.textContent = highContrast ? 'Contraste estándar 3D' : 'Alto contraste 3D';
+    }}
+  }};
+  if (contrastToggle) contrastToggle.addEventListener('click', () => {{
+    highContrast = !highContrast;
+    syncContrast();
+  }});
   const motionToggle = document.getElementById('xr-toggle-motion');
   let reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const syncMotionToggle = () => {{
@@ -193,7 +211,7 @@ def register_student_portal(app: FastAPI) -> None:
     syncInWorldGuidance();
     syncStationButtons();
     updateMarker();
-    station.setAttribute('color', '#059669');
+    station.setAttribute('color', highContrast ? '#00ff99' : '#059669');
     station.setAttribute('scale', '1 1 1');
     if (routeProgress) {{
       const next = [0, 1, 2].find((step) => !visited.has(step));
@@ -209,7 +227,7 @@ def register_student_portal(app: FastAPI) -> None:
     syncStationButtons();
     updateMarker();
     stations.forEach((station) => {{
-      station.setAttribute('color', '#64748b');
+      station.setAttribute('color', highContrast ? '#ffffff' : '#64748b');
       station.setAttribute('scale', '1 1 1');
     }});
     if (routeProgress) routeProgress.textContent = 'Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.';
