@@ -62,7 +62,7 @@ def register_student_portal(app: FastAPI) -> None:
             accent = "#047857" if room_style == "lab" else "#4338ca"
             classroom = f"""<section class="card" aria-label="Aula virtual inmersiva">
 <h3>Aula WebXR · {esc(item.get("title"))}</h3>
-<p>Utiliza el ratón para explorar el aula. En Meta Quest, abre esta página en el navegador del visor y selecciona el botón de entrada a VR si está disponible. También puedes seguir las instrucciones de la clase sin visor.</p>\n<p id="xr-device-compatibility" role="status">Comprobando si el navegador permite experiencias inmersivas…</p>
+<p>Utiliza el ratón para explorar el aula. En un visor compatible, abre esta página en el navegador y selecciona el botón VR si está disponible; apunta a una mesa con el controlador y utiliza el gatillo para seleccionarla. También puedes seguir las instrucciones de la clase sin visor.</p>\n<p id="xr-device-compatibility" role="status">Comprobando si el navegador permite experiencias inmersivas…</p>
 <script src="https://aframe.io/releases/1.8.0/aframe.min.js" onerror="document.getElementById(\'xr-classroom-status\').textContent=\'No se pudo cargar el motor 3D. Comprueba la conexión o utiliza la alternativa textual.\'"></script>
 <div style="width:100%;height:480px;position:relative;background:#e7ecf5;border-radius:14px;overflow:hidden">
 <a-scene embedded vr-mode-ui="enabled: true" renderer="antialias: true" background="color: #E7ECF5">
@@ -70,10 +70,15 @@ def register_student_portal(app: FastAPI) -> None:
 <a-box position="0 2 -7" width="7" height="2.5" depth="0.12" color="{accent}"></a-box>
 <a-text value="NUVEDRA - Aula virtual" align="center" width="5" color="#FFFFFF" position="0 2.8 -6.91"></a-text>
 <a-text value="Explora y aprende" align="center" width="4" color="#FFFFFF" position="0 2 -6.91"></a-text>
+<a-text value="1. Objetivos" position="-2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
+<a-text value="2. Exploracion" position="2 1.2 -3.5" align="center" width="2.8" color="#1e293b"></a-text>
+<a-text value="3. Reflexion" position="0 1.2 -4.7" align="center" width="2.8" color="#1e293b"></a-text>
 <a-box class="xr-station" data-topic="Objetivos: identifica el propósito de la actividad y los resultados de aprendizaje." position="-2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-box class="xr-station" data-topic="Exploración: examina el aula y relaciona lo observado con las instrucciones." position="2 0.55 -3.5" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-box class="xr-station" data-topic="Reflexión: comparte un hallazgo o una pregunta en la comunidad de aprendizaje." position="0 0.55 -4.7" width="1.4" height="0.15" depth="0.9" color="#64748b"></a-box>
 <a-entity position="0 1.6 1"><a-camera><a-cursor color="{accent}" raycaster="objects: .xr-station"></a-cursor></a-camera></a-entity>
+<a-entity laser-controls="hand: left" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
+<a-entity laser-controls="hand: right" raycaster="objects: .xr-station; far: 10" line="color: #2563eb; opacity: 0.8"></a-entity>
 </a-scene></div><div role="group" aria-label="Seleccionar estación de aprendizaje" style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.75rem"><button type="button" class="xr-station-button" data-station="0">1. Objetivos</button><button type="button" class="xr-station-button" data-station="1">2. Exploración</button><button type="button" class="xr-station-button" data-station="2">3. Reflexión</button></div><button type="button" id="xr-route-reset">Reiniciar recorrido</button><details><summary>Consultar instrucciones sin escena 3D</summary><ol><li><strong>Objetivos:</strong> identifica el propósito de la actividad y los resultados de aprendizaje.</li><li><strong>Exploración:</strong> examina el aula y relaciona lo observado con las instrucciones.</li><li><strong>Reflexión:</strong> comparte un hallazgo o una pregunta en la comunidad de aprendizaje.</li></ol></details><p id="xr-route-progress" role="status" aria-live="polite">Recorrido guiado: 0 de 3 estaciones consultadas. Selecciona Objetivos para comenzar.</p><p id="xr-learning-station" role="status">Estaciones de aprendizaje: Objetivos, Exploración y Reflexión. Apunta y selecciona una mesa para consultar su indicación. También puedes leerlas aquí: identifica los objetivos, explora la escena y comparte una reflexión en la comunidad.</p><p id="xr-classroom-status" role="status">Si no aparece el aula, comprueba WebGL y la carga del motor A-Frame. El texto de la actividad permanece disponible.</p>
 <script>
 (function () {{
