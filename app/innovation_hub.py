@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from app.admin_console import audit, db, database_url, execute, page, require_admin, rows, utcnow
+from app.admin_console import audit, db, database_url, execute, page, require_admin, rows, session_user, utcnow
 from app.unified_authoring import (
     ACTIVITY_TYPES,
     PREFIX,
@@ -202,7 +202,7 @@ def register_innovation_hub(app: FastAPI) -> None:
 
     @app.get(HUB_PREFIX, response_class=HTMLResponse, response_model=None)
     async def innovation_home(request: Request):
-        if not request.cookies.get("nexus_admin_session"):
+        if not session_user(request):
             return RedirectResponse("/admin/login", status_code=303)
         user = require_admin(request, {"course_admin"})
         with db() as conn:
