@@ -188,6 +188,7 @@ def register_student_portal(app: FastAPI) -> None:
   let sessionSelections = 0;
   const stationTimeline = [];
   const selectionSources = {{scene: 0, button: 0, shortcut: 0}};
+  let controllerSelectionsInVr = 0;
   let controllerSelections = 0;
   const interactionCount = document.getElementById('xr-interaction-count');
   let immersiveEntries = 0;
@@ -219,6 +220,7 @@ def register_student_portal(app: FastAPI) -> None:
       'Estaciones distintas en recorrido actual: ' + visited.size + '/3',
       'Escena 3D: ' + selectionSources.scene,
       'Selecciones atribuidas a controlador XR: ' + controllerSelections,
+      'Selecciones con controlador durante modo VR: ' + controllerSelectionsInVr,
       'Botones accesibles: ' + selectionSources.button,
       'Atajos de teclado: ' + selectionSources.shortcut,
       'Estaciones consultadas: ' + (Array.from(visited).sort().map((index) => ['Objetivos', 'Exploracion', 'Reflexion'][index]).join(', ') || 'ninguna'),
@@ -343,7 +345,10 @@ def register_student_portal(app: FastAPI) -> None:
       selectStation(station);
       const cursor = event.detail && event.detail.cursorEl;
       const controller = cursor && cursor.components && cursor.components['laser-controls'];
-      if (controller) controllerSelections += 1;
+      if (controller) {{
+        controllerSelections += 1;
+        if (scene.is('vr-mode')) controllerSelectionsInVr += 1;
+      }}
       const diagnostic = document.getElementById('xr-selection-diagnostic');
       if (!diagnostic) return;
       const origin = controller ? 'controlador XR' : (cursor ? 'cursor de la escena' : 'origen no identificado');
