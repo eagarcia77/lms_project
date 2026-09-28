@@ -341,11 +341,11 @@ def register_student_portal(app: FastAPI) -> None:
     }});
     station.addEventListener('click', (event) => {{
       selectStation(station);
-      const diagnostic = document.getElementById('xr-selection-diagnostic');
-      if (!diagnostic) return;
       const cursor = event.detail && event.detail.cursorEl;
       const controller = cursor && cursor.components && cursor.components['laser-controls'];
       if (controller) controllerSelections += 1;
+      const diagnostic = document.getElementById('xr-selection-diagnostic');
+      if (!diagnostic) return;
       const origin = controller ? 'controlador XR' : (cursor ? 'cursor de la escena' : 'origen no identificado');
       diagnostic.textContent = 'Selección registrada: ' + (station.getAttribute('data-topic') || 'estación') + ' | Origen: ' + origin + '.';
     }});
