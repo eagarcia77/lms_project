@@ -1,50 +1,64 @@
-# NEXUS EDU XR
+# NUVEDRA
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/eagarcia77/lms_project)
 
-**Repositorio:** https://github.com/eagarcia77/lms_project  
-**Aplicación:** https://nexus-edu-xr-eagarcia77.onrender.com
+**Repository:** https://github.com/eagarcia77/lms_project  
+**Current application:** https://nexus-edu-xr-eagarcia77.onrender.com
 
-Plataforma de educación en línea inspirada en Blackboard Ultra, integrada con Google Workspace y preparada para realidad virtual, realidad aumentada y contenido 3D.
+NUVEDRA is an intelligent, bilingual and immersive online-learning ecosystem. It is inspired by modern LMS platforms while extending course management with Google Workspace, accessible visual authoring, learning analytics, artificial intelligence and XR-ready learning experiences.
 
-## Acceso y seguridad
+## Current capabilities
 
-- Inicio de sesión con Google OAuth 2.0.
-- Registro e inicio de sesión con una cuenta NEXUS local.
-- Cierre de sesión visible y cierre de todas las sesiones.
-- Recuperación y restablecimiento de contraseña mediante enlace seguro.
-- Contraseñas locales protegidas mediante `scrypt` con sal aleatoria.
-- Protección de rutas académicas, controles de sesión y registro de eventos de seguridad.
+### Access and security
 
-## Course Studio
+- Google OAuth 2.0 sign-in.
+- Local NUVEDRA registration and authentication.
+- Password recovery and secure session controls.
+- Local passwords protected with `scrypt` and random salt.
+- Protected academic routes and security-event logging.
 
-El área **Diseñador de cursos** permite:
+### Visual Course Studio
 
-- crear cursos propios;
-- crear y ordenar módulos;
-- crear Google Docs y Google Slides desde un módulo;
-- guardar en la base de datos el identificador y enlace del archivo dentro del módulo donde se creó;
-- crear asignaciones con instrucciones, puntuación y fecha límite;
-- crear foros de discusión y publicar respuestas;
-- crear exámenes de Google Forms con preguntas de selección múltiple y respuesta corta;
-- crear eventos de Google Calendar con videoconferencia de Google Meet;
-- mantener todos los recursos organizados dentro del curso.
+Faculty can:
 
-Los archivos de Docs, Slides y Forms permanecen en el Google Drive del usuario conectado. El editor de Google se abre en una pestaña segura y NEXUS conserva el enlace en el módulo.
+- create courses and organize modules;
+- add pages, documents, videos and links;
+- create assignments, discussions and assessments;
+- connect Google Docs, Slides, Forms, Drive and Calendar;
+- add H5P, simulations, AR, VR, WebXR and 360-degree resources;
+- reorder, duplicate, preview, save and publish instructional content;
+- use bilingual authoring views and accessible interface controls.
 
-## Otras funciones
+Google files remain in the connected user's Drive, while NUVEDRA stores the authorized link and course relationship.
 
-- Panel académico, anuncios, progreso y analítica.
-- Google Classroom, Drive y Calendar.
-- Laboratorios AR con `<model-viewer>`.
-- Laboratorios VR con A-Frame y WebXR.
-- PWA, diseño adaptable y navegación accesible.
-- FastAPI, SQLite para desarrollo y PostgreSQL en Render.
-- Docker y pruebas automáticas con GitHub Actions.
+### Platform services
 
-## Google Cloud requerido
+- Academic, faculty, student and administrative portals.
+- Announcements, progress and initial analytics.
+- Google Classroom, Drive and Calendar integrations.
+- AR laboratories with `<model-viewer>`.
+- VR laboratories with A-Frame and WebXR.
+- Responsive interface, accessibility support and automated tests.
+- FastAPI, SQLite for development and PostgreSQL on Render.
+- Docker and GitHub Actions deployment validation.
 
-Activa estas APIs:
+## Innovation roadmap
+
+The next NUVEDRA development program adds:
+
+1. **NUVEDRA AI Studio** for supervised course, objective, activity and rubric generation.
+2. **Course-grounded intelligent tutors** that use faculty-approved materials.
+3. **Adaptive learning pathways** based on diagnostic and mastery evidence.
+4. **Explainable learning analytics and early alerts** with human intervention workflows.
+5. **Competency tracking, microlearning and Open Badges credentials.**
+6. **LTI 1.3, xAPI, SCORM, Common Cartridge and OneRoster interoperability.**
+7. **Managed XR learning objects, digital simulations and accessible WebXR alternatives.**
+
+See [`docs/NUVEDRA_INNOVATION_ARCHITECTURE.md`](docs/NUVEDRA_INNOVATION_ARCHITECTURE.md) for the architecture and phased delivery plan. The machine-readable feature registry is stored in [`config/innovation_features.json`](config/innovation_features.json).
+
+## Google Cloud requirements
+
+Enable:
 
 1. Google Classroom API.
 2. Google Drive API.
@@ -53,34 +67,26 @@ Activa estas APIs:
 5. Google Forms API.
 6. Google Calendar API.
 
-URI OAuth autorizada para Render:
+Current authorized Render callback:
 
 ```text
 https://nexus-edu-xr-eagarcia77.onrender.com/auth/google/callback
 ```
 
-Variables en Render:
+Required Render variables:
 
 ```text
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 ```
 
-Los usuarios que ya habían conectado Google deben cerrar sesión y autorizar nuevamente la aplicación para aceptar los permisos de Docs, Slides y Forms. Consulta `docs/GOOGLE_SETUP.md`.
+Users who connected Google before new scopes were added must sign out and authorize the application again. See `docs/GOOGLE_SETUP.md`.
 
-## Construcción y despliegue
+## Build and deployment
 
-El Dockerfile aplica, en orden:
+The Docker build applies the source and runtime patch packages in the sequence defined by the current `Dockerfile`. Render deploys changes from `main`. The health endpoint is `/healthz`.
 
-```text
-tools/apply_v3.py
-tools/apply_course_studio_package.py
-tools/apply_course_studio.py
-```
-
-Render despliega automáticamente los cambios de `main`. El endpoint de salud es `/healthz`.
-
-## Desarrollo local
+## Local development
 
 ```powershell
 Copy-Item .env.example .env
@@ -88,11 +94,14 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python tools/apply_v3.py
 python tools/apply_course_studio_package.py
-python tools/apply_course_studio.py
 pip install -r requirements.txt
-uvicorn app.course_studio_entry:app --reload
+uvicorn app.production_entry:app --reload
 ```
 
-## Estado del proyecto
+Use the exact patch sequence in the `Dockerfile` when local source packages have changed.
 
-NEXUS EDU XR continúa siendo un MVP. Antes de manejar información académica institucional deben completarse administración avanzada de roles, migraciones formales, copias de seguridad, cifrado persistente de tokens, centro de calificaciones, auditoría institucional, revisión de privacidad, verificación OAuth y pruebas de accesibilidad.
+## Production-readiness status
+
+NUVEDRA remains an MVP. Institutional use requires completion of advanced role governance, formal database migrations, tested backup and recovery, persistent token encryption, gradebook controls, privacy review, OAuth verification, accessibility testing and security validation.
+
+AI capabilities must not be activated for institutional data until provider governance, consent, retention, audit and faculty-approval controls are implemented.

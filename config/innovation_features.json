@@ -1,0 +1,83 @@
+{
+  "schema_version": "1.0",
+  "product": "NUVEDRA",
+  "default_policy": {
+    "human_approval_required": true,
+    "accessibility_target": "WCAG 2.2 AA",
+    "languages": ["en", "es"]
+  },
+  "features": [
+    {
+      "id": "ai_course_architect",
+      "name": "NUVEDRA Course Architect",
+      "domain": "ai_studio",
+      "phase": 2,
+      "status": "planned",
+      "requires": ["role_controls", "audit_log", "approved_ai_provider"]
+    },
+    {
+      "id": "course_grounded_tutor",
+      "name": "Course-grounded intelligent tutor",
+      "domain": "intelligent_tutoring",
+      "phase": 2,
+      "status": "planned",
+      "requires": ["approved_course_sources", "retrieval_index", "faculty_controls"]
+    },
+    {
+      "id": "explainable_early_alerts",
+      "name": "Explainable early alerts",
+      "domain": "learning_analytics",
+      "phase": 3,
+      "status": "planned",
+      "requires": ["analytics_events", "intervention_workflow", "privacy_review"]
+    },
+    {
+      "id": "competency_tracking",
+      "name": "Competency tracking",
+      "domain": "competency_learning",
+      "phase": 3,
+      "status": "planned",
+      "requires": ["outcome_mapping", "mastery_rules"]
+    },
+    {
+      "id": "lti_13",
+      "name": "LTI 1.3 integration",
+      "domain": "interoperability",
+      "phase": 4,
+      "status": "planned",
+      "requires": ["platform_keys", "deployment_registration", "security_review"]
+    },
+    {
+      "id": "xapi_events",
+      "name": "xAPI learning events",
+      "domain": "interoperability",
+      "phase": 4,
+      "status": "planned",
+      "requires": ["event_taxonomy", "learning_record_store"]
+    },
+    {
+      "id": "open_badges",
+      "name": "Open Badges credentials",
+      "domain": "credentials",
+      "phase": 4,
+      "status": "planned",
+      "requires": ["issuer_profile", "credential_governance"]
+    },
+    {
+      "id": "xr_catalog",
+      "name": "Managed XR learning-object catalog",
+      "domain": "xr_lab",
+      "phase": 5,
+      "status": "planned",
+      "requires": ["asset_storage", "accessible_fallbacks", "device_testing"]
+    },
+    {
+      "id": "adaptive_pathways",
+      "name": "Adaptive learning pathways",
+      "domain": "adaptive_learning",
+      "phase": 5,
+      "status": "planned",
+      "requires": ["diagnostic_evidence", "mastery_rules", "faculty_override"]
+    }
+  ]
+}
