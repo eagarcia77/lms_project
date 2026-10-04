@@ -249,7 +249,7 @@ def register_student_portal(app: FastAPI) -> None:
   }});
 
   const syncInteractionCount = () => {{
-    if (interactionCount) interactionCount.textContent = 'Interacciones de esta sesión: ' + sessionSelections + ' selecciones; ' + visited.size + ' estaciones distintas. Escena 3D: ' + selectionSources.scene + '; botones: ' + selectionSources.button + '; atajos: ' + selectionSources.shortcut + '.';
+    if (interactionCount) interactionCount.textContent = 'Interacciones de esta sesión: ' + sessionSelections + ' selecciones; ' + visited.size + ' estaciones distintas. Escena 3D: ' + selectionSources.scene + '; controlador XR: ' + controllerSelections + '; controlador en VR: ' + controllerSelectionsInVr + '; botones: ' + selectionSources.button + '; atajos: ' + selectionSources.shortcut + '.';
   }};
   const stationNames = ['Objetivos', 'Exploración', 'Reflexión'];
   const inWorldStationLabels = Array.from(scene.querySelectorAll('.xr-station-label'));
@@ -349,6 +349,7 @@ def register_student_portal(app: FastAPI) -> None:
         controllerSelections += 1;
         if (scene.is('vr-mode')) controllerSelectionsInVr += 1;
       }}
+      syncInteractionCount();
       const diagnostic = document.getElementById('xr-selection-diagnostic');
       if (!diagnostic) return;
       const origin = controller ? 'controlador XR' : (cursor ? 'cursor de la escena' : 'origen no identificado');
