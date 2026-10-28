@@ -109,11 +109,12 @@ def register_student_portal(app: FastAPI) -> None:
     }}
   }}
   if (!scene || !status) return;
+  const isImmersive = () => typeof scene.is === 'function' && scene.is('vr-mode');
+  // Keep the accessible station buttons and shortcuts working without A-Frame/WebGL.
   if (!window.AFRAME) {{
-    status.textContent = 'El motor 3D no está disponible. Comprueba la conexión o utiliza la alternativa textual.';
-    return;
+    status.textContent = 'El motor 3D no está disponible. Usa los botones, atajos o instrucciones textuales.';
   }}
-  window.setTimeout(() => {{
+  if (window.AFRAME) window.setTimeout(() => {{
     if (!scene.hasLoaded) {{
       status.textContent = 'La escena 3D tarda en cargar. Comprueba la conexión y WebGL; la actividad textual sigue disponible.';
     }}
@@ -229,7 +230,7 @@ def register_student_portal(app: FastAPI) -> None:
       'Estado de controladores: ' + (document.getElementById('xr-controller-status')?.textContent || 'no disponible'),
       'Estado del aula: ' + (status?.textContent || 'no disponible'),
       'Diagnostico de seleccion: ' + (document.getElementById('xr-selection-diagnostic')?.textContent || 'no disponible'),
-      'Modo inmersivo activo al exportar: ' + (scene?.is('vr-mode') ? 'si' : 'no'),
+      'Modo inmersivo activo al exportar: ' + (isImmersive() ? 'si' : 'no'),
       'Entradas a modo VR: ' + immersiveEntries,
       'Salidas de modo VR: ' + immersiveExits,
       'Tiempo inmersivo aproximado (segundos): ' + Math.round((immersiveElapsedMs + (immersiveStartedAt !== null ? performance.now() - immersiveStartedAt : 0)) / 1000),
@@ -292,7 +293,7 @@ def register_student_portal(app: FastAPI) -> None:
     }}
   }};
 
-  const selectStation = (station, source = 'scene') => {{
+  const selectStation = (station, source = 'scene', viaController = false) => {{
     if (stationStatus) stationStatus.textContent = station.getAttribute('data-topic') || 'Estación seleccionada.';
     if (inWorldTopic) {{
       const topic = station.getAttribute('data-topic') || 'Estación seleccionada.';
@@ -302,7 +303,12 @@ def register_student_portal(app: FastAPI) -> None:
     if (index < 0) return;
     visited.add(index);
     sessionSelections += 1;
-    if (stationTimeline.length < 100) stationTimeline.push(new Date().toISOString() + ' | ' + ['Objetivos', 'Exploracion', 'Reflexion'][index] + ' | ' + source + ' | ' + (scene.is('vr-mode') ? 'inmersivo' : 'pantalla'));
+    const immersive = isImmersive();
+    if (source === 'scene' && viaController) {{
+      controllerSelections += 1;
+      if (immersive) controllerSelectionsInVr += 1;
+    }}
+    if (stationTimeline.length < 100) stationTimeline.push(new Date().toISOString() + ' | ' + ['Objetivos', 'Exploracion', 'Reflexion'][index] + ' | ' + source + (viaController ? ' (controlador XR)' : '') + ' | ' + (immersive ? 'inmersivo' : 'pantalla'));
     if (Object.prototype.hasOwnProperty.call(selectionSources, source)) selectionSources[source] += 1;
     syncInteractionCount();
     syncInWorldStationLabels();
@@ -342,14 +348,9 @@ def register_student_portal(app: FastAPI) -> None:
       station.setAttribute('scale', '1 1 1');
     }});
     station.addEventListener('click', (event) => {{
-      selectStation(station);
       const cursor = event.detail && event.detail.cursorEl;
-      const controller = cursor && cursor.components && cursor.components['laser-controls'];
-      if (controller) {{
-        controllerSelections += 1;
-        if (scene.is('vr-mode')) controllerSelectionsInVr += 1;
-      }}
-      syncInteractionCount();
+      const controller = !!(cursor && cursor.components && cursor.components['laser-controls']);
+      selectStation(station, 'scene', controller);
       const diagnostic = document.getElementById('xr-selection-diagnostic');
       if (!diagnostic) return;
       const origin = controller ? 'controlador XR' : (cursor ? 'cursor de la escena' : 'origen no identificado');
@@ -408,7 +409,7 @@ def register_student_portal(app: FastAPI) -> None:
     status.textContent = 'Has salido del modo VR. Puedes continuar en pantalla y consultar la comunidad.';
   }});
   scene.addEventListener('render-target-loaded', () => {{
-    if (scene.hasLoaded && !scene.is('vr-mode')) {{
+    if (scene.hasLoaded && !isImmersive()) {{
       status.textContent = 'Escena lista para explorar. El acceso inmersivo depende de los permisos del navegador.';
     }}
   }});
